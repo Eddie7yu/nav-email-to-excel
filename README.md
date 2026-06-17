@@ -58,6 +58,16 @@ python run_weekly.py --commit   # 正式
 
 `senders` 里的格式键（`gtht`/`citics`/`csc`/`yiyuan`…）对应 `navlib.py` 与 `phase2.py` 里的解析器；接入新来源 = 写一个解析器 + 在 config 里登记，无需改主流程。
 
+### 邮箱密钥（授权码）放哪、怎么填
+
+密钥**永不入库**（`config.json` 已在 `.gitignore` 里）。`navlib.get_password()` 按下面顺序查找，命中即用——从最简到更安全，按需选一种即可：
+
+1. **最简：直接填进 `config.json`** —— 把邮箱授权码写到 `imap.password`，复制整个目录到目标机就能跑。适合个人机/隔离环境。
+2. **环境变量 `NAV_QQ_PW`** —— 不落盘到配置文件，适合定时任务里用系统/任务计划的环境变量注入。
+3. **机器本地密钥文件（Windows）** —— 放到同步盘之外的 `%LOCALAPPDATA%\nav_tool\secret.json`（形如 `{"password": "授权码"}`）。当配置目录本身会被 OneDrive 等同步时，用它把密钥留在本机。
+
+查找优先级：环境变量 → 本地密钥文件 → `config.json`（兜底）。三者都没有则以空密码尝试登录（通常会失败）。
+
 ## 关键设计（详见方法论）
 
 - **预览/提交两挡**，提交前自动备份带时间戳的副本。
