@@ -1,0 +1,27 @@
+{
+  "基金01": {
+    "header_row": 2, "data_start": 3, "last_data_row": 27, "max_col": 10,
+    "codes": ["DEMO04"], "names": ["示例指数增强1号"],
+    "return_base": "D", "last_date_serial": 46178, "last_date": "2026-06-05"
+  },
+  "基金11": {
+    "header_row": 2, "data_start": 3, "last_data_row": 30, "max_col": 8,
+    "codes": ["DEMO05"], "names": ["示例中性500指增"],
+    "return_base": "C", "last_date_serial": 46178, "last_date": "2026-06-05"
+  },
+  "基金16": {
+    "header_row": 2, "data_start": 3, "last_data_row": 22, "max_col": 8,
+    "codes": ["DEMO06"], "names": ["示例日频CTA"],
+    "return_base": "C", "last_date_serial": 46178, "last_date": "2026-06-05"
+  },
+  "基金20": {
+    "header_row": 3, "data_start": 4, "last_data_row": 18, "max_col": 8,
+    "codes": ["DEMO07"], "names": ["示例附件净值产品"],
+    "return_base": "C", "last_date_serial": 46178, "last_date": "2026-06-05"
+  },
+  "基金27": {
+    "header_row": 3, "data_start": 4, "last_data_row": 5, "max_col": 6,
+    "codes": ["DEMOA"], "names": ["示例PDF周报产品A类"],
+    "return_base": "C", "last_date_serial": 46178, "last_date": "2026-06-05"
+  }
+}

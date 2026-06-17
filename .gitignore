@@ -1,0 +1,26 @@
+# ---- 真实数据 / 密钥：永不入库 ----
+src/config.json
+src/registry.json
+secret.json
+*.xlsx
+*.xls
+
+# ---- 运行时产物 ----
+src/index.json
+src/index_cache.json
+src/last_run.json
+src/validation.json
+src/proposed_updates.csv
+src/changelog.csv
+logs/
+backups/
+**/logs/
+**/backups/
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 注意：config.example.json / registry.example.json 是模板，需要入库（不在忽略之列）

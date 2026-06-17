@@ -1,0 +1,34 @@
+{
+  "imap": {
+    "host": "imap.example.com",
+    "port": 993,
+    "user": "you@example.com",
+    "password": "",
+    "_password_note": "把邮箱授权码直接填到上面 password 即可，复制整个目录到目标机就能跑。也可改读环境变量 NAV_QQ_PW（见 navlib.get_password）。",
+    "mailbox": "INBOX"
+  },
+  "_master_note": "净值表文件名（放在本目录的上一级即可），也可填绝对路径；留空则自动识别上级目录里唯一/含『净值』的 .xlsx。",
+  "master_path": "示例净值表.xlsx",
+  "_senders_note": "发件人地址 -> 解析格式。格式键对应 navlib.py / phase2.py 里的 parser；换成你自己的托管/券商发件邮箱。",
+  "senders": {
+    "nav@custodian-a.example.com": "gtht",
+    "nav@custodian-b.example.com": "citics",
+    "nav@custodian-c.example.com": "htsc_glrfw",
+    "nav@custodian-d.example.com": "csc",
+    "nav@custodian-e.example.com": "yiyuan"
+  },
+  "scope_sheets": [
+    "基金01", "基金11", "基金16"
+  ],
+  "scope_sheets_p2": [
+    "基金20", "基金27"
+  ],
+  "notify": {
+    "enabled": true,
+    "_to_note": "汇总邮件收件人列表",
+    "to": ["you@example.com"],
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 465,
+    "stale_days": 12
+  }
+}

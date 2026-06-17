@@ -1,0 +1,7 @@
+openpyxl>=3.1
+requests>=2.28
+# xlrd: 解析 .xls 附件（部分托管方以 .xls 发送）
+xlrd>=2.0
+# pypdf: 解析以 PDF 周报形式发送的净值
+pypdf>=4.0
+# pandas 仅在个别 .xls 读取回退时用到，可选
