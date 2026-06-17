@@ -37,7 +37,12 @@ def last_recorded(ws, info):
     return last_d, last_u, last_cum
 
 def compute_proposals():
-    idx = json.load(open(os.path.join(L.HERE, "index.json"), encoding="utf-8"))["index"]
+    ipath = os.path.join(L.HERE, "index.json")
+    if not os.path.exists(ipath):
+        print("[提示] 未找到 index.json。请先在 config.json 配好邮箱，再运行 build_index.py 抓取邮件索引。本次无可处理数据。")
+        return dict(proposals=[], anomalies=[], preview=[], summary=[],
+                    dormant=[], excluded=[], held=[])
+    idx = json.load(open(ipath, encoding="utf-8"))["index"]
     by_sheet = {}
     for r in idx:
         if r["date"]:

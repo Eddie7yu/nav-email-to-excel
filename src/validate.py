@@ -26,7 +26,11 @@ def approx(a, b):
     return abs(round(a, 4) - round(b, 4)) <= TOL
 
 def main():
-    idx = json.load(open(os.path.join(L.HERE, "index.json"), encoding="utf-8"))["index"]
+    ipath = os.path.join(L.HERE, "index.json")
+    if not os.path.exists(ipath):
+        print("[提示] 未找到 index.json，请先运行 build_index.py。跳过校验。")
+        return
+    idx = json.load(open(ipath, encoding="utf-8"))["index"]
     # group index by (sheet, date)
     by = {}
     for r in idx:
