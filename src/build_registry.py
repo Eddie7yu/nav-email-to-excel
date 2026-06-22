@@ -6,12 +6,24 @@ import os, json, datetime, re
 import openpyxl
 import navlib as L
 
+EPOCH = datetime.date(1899, 12, 30)
+
 def serial_to_date(v):
     if isinstance(v, (int, float)):
-        return (datetime.date(1899, 12, 30) + datetime.timedelta(days=int(v))).isoformat()
+        return (EPOCH + datetime.timedelta(days=int(v))).isoformat()
     if isinstance(v, datetime.datetime):
         return v.date().isoformat()
     return str(v)
+
+def to_serial(v):
+    """Make the E-column value JSON-safe. Some workbooks store the NAV date as a
+    real date object (not an Excel serial int) -> json.dump would crash. Normalize
+    any date/datetime to an Excel serial int; leave numbers as-is."""
+    if isinstance(v, datetime.datetime):
+        v = v.date()
+    if isinstance(v, datetime.date):
+        return (v - EPOCH).days
+    return v
 
 def clean(v):
     return v.strip() if isinstance(v, str) else v
@@ -44,7 +56,7 @@ def main():
                 elif re.search(r"\bD\d", fv): fbase = "D"
         reg[ws.title] = dict(header_row=header_row, data_start=data_start, last_data_row=last_dr,
                              max_col=ws.max_column, codes=sorted(codes), names=sorted(names),
-                             return_base=fbase, last_date_serial=last_date,
+                             return_base=fbase, last_date_serial=to_serial(last_date),
                              last_date=serial_to_date(last_date) if last_date is not None else None)
     out = os.path.join(L.HERE, "registry.json")
     json.dump(reg, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
