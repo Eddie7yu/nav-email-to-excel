@@ -1,7 +1,9 @@
 openpyxl>=3.1
 requests>=2.28
-# xlrd: 解析 .xls 附件（部分托管方以 .xls 发送）
+# pywin32: com_sync 用 COM 驱动真实 Excel 写正式表(保留手工格式、不复活主题色)。必需。
+pywin32>=305
+# xlrd: 解析 .xls 附件（第二期：东吴/招商/中信建投/华泰 leap）
 xlrd>=2.0
-# pypdf: 解析以 PDF 周报形式发送的净值
+# pypdf: 解析钇远周报 PDF（ir@yiyuaninvest.com）
 pypdf>=4.0
 # pandas 仅在个别 .xls 读取回退时用到，可选

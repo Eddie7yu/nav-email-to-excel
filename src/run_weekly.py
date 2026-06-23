@@ -22,10 +22,12 @@ def main():
     steps = [["build_index.py"], ["fill_index.py"]]
     if datetime.date.today().isocalendar()[1] % 2 == 0:   # 双周回归校验
         steps.append(["validate.py"])
-    steps.append(["write.py"] + (["--commit"] if commit else []))
+    # 新链路: write/obs 只把新行算进一次性预览副本, 再由 com_sync 用 COM 移植进正式表
+    # (不再用 openpyxl 直接写正式表 -> 不毁手工格式、不复活主题色)。apply.py 串起这三步。
+    steps.append(["apply.py", "--weekly", "--obs"] + (["--commit"] if commit else []))
     if not no_notify:
         steps.append(["notify.py"] + ([] if commit else ["--dry"]))  # 预览模式只打印不发信
-    NONFATAL = {"fill_index.py", "validate.py", "notify.py"}
+    NONFATAL = {"fill_index.py", "validate.py", "notify.py", "apply.py"}
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     with open(logf, "w", encoding="utf-8") as log:
         for step in steps:

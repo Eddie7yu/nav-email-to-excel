@@ -12,6 +12,7 @@ import os, sys, re, json, csv, shutil, datetime
 from copy import copy
 import openpyxl
 from openpyxl.styles import Font
+from openpyxl.styles.colors import Color
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.worksheet.formula import ArrayFormula
 import navlib as L
@@ -19,7 +20,24 @@ from propose import compute_proposals
 
 EPOCH = datetime.date(1899, 12, 30)
 IDX_RE = re.compile(r"中证\s*(500|1000|2000)|北证")
-RED_RGB, GREEN_RGB = "FFFF0000", "FF008000"   # 盈利红 / 亏损绿
+# 盈利=深红(标准色 C00000); 亏损=绿 着色6 深色50%(主题 Accent6, Darker 50%)。
+# 绿用主题引用, 与 Excel 调色板里"着色6 深色50%"那一格完全一致(随主题), 不写死 RGB。
+RED_COL = Color(rgb="FFC00000")
+GREEN_COL = Color(theme=9, tint=-0.4999847412109375)
+BLACK = Color(theme=1, tint=0.0)                      # 黑(默认文字色); 指数列保持黑白不上红绿
+# 指数列表头特征: 含 指数/中证/沪深/北证 -> 这类列(及累计)不上红绿, 用户要黑白
+IDX_HDR = re.compile(r"指数|中证|沪深|北证")
+
+
+def _index_cols(ws, maxc):
+    """返回"指数列"列号集合(表头含 指数/中证/沪深/北证, 从F列第6起)。"""
+    cols = set()
+    for c in range(6, maxc + 1):
+        for r in range(1, 4):
+            if IDX_HDR.search(str(ws.cell(r, c).value or "")):
+                cols.add(c)
+                break
+    return cols
 
 
 def _font_kind(cell):
@@ -37,10 +55,12 @@ def _font_kind(cell):
     return "red" if (r >= 0x80 and g < 0x80) else ("green" if (g >= 0x80 and r < 0x80) else None)
 
 
-def _set_font_color(cell, rgb):
+def _set_font_color(cell, color, bold=True):
+    """给单元格设字体色(默认加粗, 涨跌色要醒目)。color 可为 rgb 字符串或 Color 对象(主题色)。
+    指数列用 BLACK + bold=False 还原黑白。"""
     f = cell.font
-    cell.font = Font(name=f.name, size=f.size, bold=f.bold, italic=f.italic,
-                     vertAlign=f.vertAlign, underline=f.underline, strike=f.strike, color=rgb)
+    cell.font = Font(name=f.name, size=f.size, bold=bold, italic=f.italic,
+                     vertAlign=f.vertAlign, underline=f.underline, strike=f.strike, color=color)
 
 
 def _cellnum(ws, ref):
@@ -71,8 +91,11 @@ def _eval_accum(ws, val):
     if m:
         def side(ref):
             mm = re.match(r"([A-Z]+)(\d+)", ref)
-            c = ws.cell(int(mm.group(2)), column_index_from_string(mm.group(1)))
-            return _eval_accum(ws, c.value) if (isinstance(c.value, str) and c.value.startswith("=")) else _cellnum(ws, ref)
+            cv = ws.cell(int(mm.group(2)), column_index_from_string(mm.group(1))).value
+            # 引用格本身可能又是公式(=...)或数组公式(PRODUCT 累计指数)->递归求值, 否则取字面数值
+            if isinstance(cv, ArrayFormula) or (isinstance(cv, str) and cv.startswith("=")):
+                return _eval_accum(ws, cv)
+            return _cellnum(ws, ref)
         a, b = side(m.group(1)), side(m.group(2))
         return (a - b) if (a is not None and b is not None) else None
     return None
@@ -81,20 +104,24 @@ def _eval_accum(ws, val):
 def _recolor_accum(ws, accr, maxc):
     """累计行所有"可计算的收益率"格统一按正负上色：盈利红、亏损绿（整表统一）。
     只动累计行；无法计算的格(如跨表引用的指数累计)跳过，保持原样。"""
+    idx = _index_cols(ws, maxc)
     for c in range(6, maxc + 1):
         cell = ws.cell(accr, c)
         if cell.value in (None, ""):
             continue
+        if c in idx:                                  # 指数列累计: 黑白(保留加粗), 不红绿
+            _set_font_color(cell, BLACK, bold=cell.font.bold)
+            continue
         v = _eval_accum(ws, cell.value)
         if v is None:
             continue
-        _set_font_color(cell, GREEN_RGB if v < 0 else RED_RGB)
+        _set_font_color(cell, GREEN_COL if v < 0 else RED_COL)
 
 
 # ---- 类型B指数列(表头形如"500指数/1000指数/2000指数",列里直接放周收益) ----
 # 这类列是跨表引用对应"中证XXX"源表(Type A)的 H(指数周收益)列。源表已被 fill_index/
 # write 自动填好，这里把空缺单元格按日期补上引用，免去每周手工。
-INDEX_RET_SRC = {"中证500": "基金11", "中证1000": "基金10", "中证2000": "基金03"}
+INDEX_RET_SRC = {"中证500": "半鞅", "中证1000": "正合", "中证2000": "千衍"}
 TYPEB_RE = re.compile(r"^(500|1000|2000)指数$")
 
 
@@ -177,6 +204,10 @@ def detect_index(ws, info):
 
 def main():
     commit = "--commit" in sys.argv
+    # --book PATH: 就地在指定工作簿(预览副本)上读写, 不备份、不碰正式表。
+    # 供新链路用(write 只算进预览, 再由 com_sync 用 COM 把新行搬进正式表)。
+    book = sys.argv[sys.argv.index("--book") + 1] if "--book" in sys.argv else None
+    src_path = book or L.CFG["master_path"]
     R = compute_proposals()
     props = R["proposals"]
     by_sheet = {}
@@ -191,7 +222,7 @@ def main():
     closes_map = _cache.get("closes", {})
     rejected = set(_cache.get("rejected", []))
 
-    wb = openpyxl.load_workbook(L.CFG["master_path"], data_only=False)
+    wb = openpyxl.load_workbook(src_path, data_only=False)
 
     written, deferred, skipped, blank_idx = [], [], [], []
     for sheet, rows in by_sheet.items():
@@ -204,7 +235,7 @@ def main():
         if str(ws.cell(sum_row, 1).value).strip() != "累计":
             skipped.append((sheet, "结构异常(末行不是累计行)，跳过"))
             continue
-        # 累计行后必须为空才安全追加；空白/纯空格视为空(忽略残留空格,如基金27B10)
+        # 累计行后必须为空才安全追加；空白/纯空格视为空(忽略残留空格,如钇远B10)
         def _blank(v):
             return v is None or (isinstance(v, str) and v.strip() == "")
         tail_dirty = any(not _blank(ws.cell(r, c).value)
@@ -277,7 +308,7 @@ def main():
                 if c not in set_cols:
                     put(RR, c, None)
             # flag a sheet whose G column is actually used (index / cross-sheet ref) but
-            # we couldn't auto-fill (rejected index, or 跨表引用 like 基金26/基金15/基金13)
+            # we couldn't auto-fill (rejected index, or 跨表引用 like 爱凡哲/大麓/和美)
             if idx_mode != "fill" and maxc >= 7 and ws.cell(src, 7).value not in (None, ""):
                 if not any(b[0] == sheet for b in blank_idx):
                     blank_idx.append((sheet, index_name or "G列(跨表引用)需手工"))
@@ -306,14 +337,18 @@ def main():
         # 累计行收益配色随正负维护(盈红亏绿), 防自动写入后颜色陈旧; 仅动已染色的格
         _recolor_accum(ws, new_sum, maxc)
 
-    # 类型B指数列(基金15/基金13 500指数, 基金26 2000/1000指数)空缺格 -> 自动按日期引用源表
+    # 类型B指数列(大麓/和美 500指数, 爱凡哲 2000/1000指数)空缺格 -> 自动按日期引用源表
     idx_filled, idx_blank = fill_crossref_index(wb, reg)
     if idx_filled:
         _filled_sheets = {f.split("!")[0] for f in idx_filled}
         blank_idx = [b for b in blank_idx if b[0] not in _filled_sheets]
 
     # output
-    if commit:
+    if book:
+        wb.save(book)
+        target = book
+        print(f"[--book] 已就地写入工作簿(预览副本) -> {book}\n(正式表未改动; 由 com_sync 用 COM 移植新行)")
+    elif commit:
         os.makedirs(os.path.join(L.HERE, "backups"), exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         stem = os.path.splitext(os.path.basename(L.CFG["master_path"]))[0]

@@ -18,10 +18,10 @@
 ## 流水线
 
 ```
-build_index → fill_index → validate → write → notify
-  抓取索引     拉指数(可选)   回归校验    写入(备份)  汇总邮件
+build_index → fill_index → validate → apply ┌ write → 预览副本 ┐ → notify
+  抓取索引     拉指数(可选)   回归校验    编排 └ com_sync(COM) → 主表 ┘  汇总邮件
 ```
-每一步都是独立脚本，可单独运行、单独调试。
+每一步都是独立脚本，可单独运行、单独调试。写入分两段：`write` 先把新行算进**一次性预览副本**（不碰主表），`com_sync` 再用 **Excel COM** 把新行移植进真主表——手工格式 100% 保留、不复活主题色（详见 [CLAUDE.md](CLAUDE.md) §4.1）。
 
 ## 快速开始
 

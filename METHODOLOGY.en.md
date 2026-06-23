@@ -53,6 +53,21 @@ A new row copies the **style of the previous row** (font, color, border, number 
 formatting by editing the last few rows in the file, and the next run continues it —
 **presentation belongs to the human, data belongs to the code.**
 
+To actually pull this off on a **hand-formatted** file, two hard-won rules:
+
+- **Write the real file with a "real program," not a pure library rewrite.** Libraries like
+  openpyxl `load+save` silently **drop charts/pivots/some formatting** and re-emit hand-set
+  colors as **theme colors** — which render as **different colors and broken layout on someone
+  else's machine** (you won't see it on yours). For a human-maintained master, drive **real Excel
+  (COM / `win32com`)** and act like a person: copy the row above → insert → overwrite only
+  values/formulas, so formatting is inherited for free.
+- **Separate compute from write:** use the pure library to compute new rows into a **throwaway
+  preview copy** (master untouched), then use COM to transplant only the rows the preview has
+  beyond the master back into the real master. You get the library's convenience without ever
+  letting it touch the file you can't afford to corrupt.
+- **Pin colors to explicit RGB, never "theme" colors**, for cross-machine consistency — and
+  verify by opening it once **on the target machine** (theme drift is invisible on your own).
+
 ### ⑥ Idempotency + resilience: one bad sheet must not sink the whole run
 - Target name doesn't match / temporarily missing → **skip and log**, don't throw and crash the whole batch.
 - Any script must be safe to re-run (idempotent).
