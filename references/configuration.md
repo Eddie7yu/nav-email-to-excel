@@ -1,32 +1,32 @@
-# Runtime configuration
+# 运行配置说明
 
-## Contents
+## 目录
 
-- [Top-level fields](#top-level-fields)
-- [Route fields](#route-fields)
-- [Column discovery](#column-discovery)
-- [Benchmark mapping](#benchmark-mapping)
-- [Scheduling](#scheduling)
-- [Local sensitive files](#local-sensitive-files)
+- [顶层字段](#顶层字段)
+- [路由字段](#路由字段)
+- [列识别](#列识别)
+- [基准映射](#基准映射)
+- [定时任务](#定时任务)
+- [本地敏感文件](#本地敏感文件)
 
-## Top-level fields
+## 顶层字段
 
-`config.json` is generated in the runtime and must never be committed.
+`config.json` 由本地运行实例生成，绝不能提交到 Git。
 
-| Field | Meaning |
+| 字段 | 含义 |
 | --- | --- |
-| `schema_version` | Configuration schema; currently `1` |
-| `runtime_id` | Random deployment identifier used to isolate secrets and tasks |
-| `workbook_path` | Absolute `.xlsx` or `.xlsm` master path |
-| `imap` | Host, port, user, mailbox, lookback and message-size/count limits; never a password |
-| `routes` | Authorized sender/product-to-sheet mappings |
-| `column_overrides` | Optional semantic column mappings per sheet |
-| `style` | Preserve-first return formatting settings |
-| `schedule` | Optional Windows task definitions |
-| `validation` | Historical sample count and numeric tolerance |
-| `retention` | Maximum local backup/preview counts and log age |
+| `schema_version` | 配置结构版本，当前为 `1` |
+| `runtime_id` | 随机的部署实例标识，用于隔离密钥和定时任务 |
+| `workbook_path` | 正式 `.xlsx` 或 `.xlsm` 工作簿的绝对路径 |
+| `imap` | 服务器、端口、用户、邮箱文件夹、回看天数、邮件大小和数量限制；不得包含密码 |
+| `routes` | 已授权的“发件人/产品 → 工作表”映射 |
+| `column_overrides` | 可选的逐工作表语义列映射 |
+| `style` | 优先保留原样式的收益率格式设置 |
+| `schedule` | 可选的 Windows 任务定义 |
+| `validation` | 历史样本数量和数值容差 |
+| `retention` | 本地备份、预览最大数量及日志保留天数 |
 
-## Route fields
+## 路由字段
 
 ```json
 {
@@ -46,23 +46,23 @@
 }
 ```
 
-- Normalize codes case-insensitively but require exact equality after normalization.
-- Store product codes as quoted JSON strings. Numeric JSON values are rejected so leading zeros cannot disappear.
-- Use `subject_contains` when an authorized sender also sends non-NAV mail. Every in-scope message must parse; failures block preview instead of being skipped.
-- Set `allow_sender_only` only when the sender is permanently dedicated to one product and messages contain no stable code.
-- Use `cumulative_policy: require` when cumulative NAV must come from the email.
-- Use `unit` only when historical samples prove unit NAV always equals cumulative NAV.
-- Use `offset` only with an explicit `cumulative_offset` proven across historical samples.
-- Use `series_start` to prevent observation, simulation, or pre-purchase history from entering a new held-position series.
-- Choose `daily` or `weekly` return frequency explicitly.
-- Set `max_staleness_days` to the product's actual publication cadence plus a conservative holiday buffer. Stale feeds block preview instead of succeeding as a no-op.
-- Automatic catch-up appends only dates later than the workbook's latest NAV. A missing internal historical date blocks the run for supervised repair so rows and cross-sheet formulas cannot be silently reordered.
+- 产品代码按不区分大小写的方式标准化，但标准化后必须完全相等。
+- 产品代码必须保存为带引号的 JSON 字符串。系统拒绝数字类型，避免前导零消失。
+- 若获准发件人也会发送非净值邮件，应配置 `subject_contains`。范围内的每一封邮件都必须成功解析；解析失败会阻止预览，不能静默跳过。
+- 只有发件人长期专用于单一产品、且邮件中不存在稳定产品代码时，才可设置 `allow_sender_only`。
+- 累计净值必须来自邮件时，使用 `cumulative_policy: require`。
+- 只有历史样本证明单位净值始终等于累计净值时，才可使用 `unit`。
+- 只有固定差值已在历史样本中得到证明，并明确设置 `cumulative_offset` 时，才可使用 `offset`。
+- 使用 `series_start`，防止观察期、模拟期或买入前历史进入新的持仓序列。
+- 必须明确选择 `daily` 或 `weekly` 收益频率。
+- `max_staleness_days` 应等于产品实际披露周期，再加上审慎的节假日缓冲。数据源过期时应阻止预览，而不是把“没有新数据”当作成功。
+- 自动补录只会追加晚于工作簿最新净值的日期。若历史中间缺少日期，程序会停止并要求人工修复，避免静默重排其他行或跨表公式。
 
-## Column discovery
+## 列识别
 
-The runtime scans early workbook rows for semantic headers such as date, product code, product name, unit NAV, cumulative NAV, return, benchmark return/level, and excess. Column order is not fixed.
+运行程序会扫描工作簿前部的行，按表头含义识别日期、产品代码、产品名称、单位净值、累计净值、收益、基准收益/点位及超额收益。列顺序不固定。
 
-When headers remain ambiguous, configure a 1-based number or Excel column letter:
+表头仍有歧义时，可以配置从 1 开始的列号或 Excel 列字母：
 
 ```json
 {
@@ -82,11 +82,11 @@ When headers remain ambiguous, configure a 1-based number or Excel column letter
 }
 ```
 
-Do not use an override to force an uncertain interpretation. Stop and inspect the workbook locally.
+不得用显式列映射强行确认不确定的理解；应停止并在本机检查工作簿。
 
-## Benchmark mapping
+## 基准映射
 
-Map only to a workbook sheet whose historical dates and values have been verified:
+只能映射到已经核对过历史日期和数值的工作簿工作表：
 
 ```json
 {
@@ -99,9 +99,9 @@ Map only to a workbook sheet whose historical dates and values have been verifie
 }
 ```
 
-Use `source_type: aligned_return` only when the source column is already aligned to the product's daily or weekly observation dates. A daily index-return column is not a weekly benchmark. Prefer `level` for index levels; the runtime then calculates between matching product-period anchors. Missing required source dates block formal commit.
+仅当来源列已经与产品的日度或周度观察日期对齐时，才使用 `source_type: aligned_return`。日度指数收益列不是周度基准。指数点位应优先使用 `level`；运行程序会在匹配的产品周期锚点之间计算收益。缺少必需的来源日期时，必须阻止正式写入。
 
-## Scheduling
+## 定时任务
 
 ```json
 {
@@ -111,16 +111,16 @@ Use `source_type: aligned_return` only when the source column is already aligned
 }
 ```
 
-Times use the target machine's local timezone. Scheduling is Windows-only, requires a local path and a logged-in user session, and generates previews only. It never writes the master or sends email.
+时间使用目标电脑的本地时区。定时任务仅支持 Windows，要求本地路径和已登录的用户会话，并且只生成预览；绝不写入正式工作簿或发送邮件。
 
-## Validation and retention
+## 验证与保留
 
-`validation.minimum_history_dates` cannot be lower than `2`. `max_future_days` blocks future-dated values, and `max_period_change` blocks implausible unit-NAV jumps before a preview is created. Tune these only from documented product behavior, never merely to make a failing run pass.
+`validation.minimum_history_dates` 不得低于 `2`。`max_future_days` 用于阻止未来日期，`max_period_change` 用于在创建预览前拦截不合理的单位净值跳变。只能依据有记录的产品行为调整这些值，不能为了让失败的运行通过而放宽。
 
-`retention.backup_count`, `preview_count`, and `log_days` bound sensitive local artifacts. The runtime prunes only files under its own `backups/`, `previews/`, and `logs/` directories.
+`retention.backup_count`、`preview_count` 和 `log_days` 用于限制本地敏感文件。运行程序只会清理自身 `backups/`、`previews/` 和 `logs/` 目录中的文件。
 
-## Local sensitive files
+## 本地敏感文件
 
-Keep these runtime-only and Git-ignored: `config.json`, `route-report.json`, `validation-report.json`, `plan.json`, previews, workbooks, `logs/`, `backups/`, and `scheduled_tasks.json`. The Windows secret is stored under the current user's local application data and encrypted with DPAPI.
+以下文件仅能存在于本地运行目录，并应被 Git 忽略：`config.json`、`route-report.json`、`validation-report.json`、`plan.json`、预览工作簿、正式工作簿、`logs/`、`backups/` 和 `scheduled_tasks.json`。Windows 密钥保存在当前用户的本地应用数据目录，并使用 DPAPI 加密。
 
-The exact parsed `From` address is checked after IMAP search, but this is routing validation, not cryptographic sender authentication. Where spoofing is a material threat, require provider-side DKIM/DMARC controls or a dedicated mailbox rule before enabling the workflow.
+程序会在 IMAP 搜索后再次精确检查解析出的 `From` 地址，但这只是路由验证，并非加密级发件人认证。若伪造邮件构成实质风险，应先在邮箱服务商侧强制执行 DKIM/DMARC，或使用专用邮箱规则，再启用此流程。

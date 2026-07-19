@@ -1,52 +1,52 @@
-# Portable AI handoff
+# 交给其他本地 AI 使用
 
-Give the repository URL and the local workbook path to an AI that can read files and run Python. Never include the IMAP authorization code.
+把公开仓库地址和本机工作簿绝对路径交给能够读取文件、运行 Python 的 AI。绝不要提供 IMAP 授权码。
 
-Use this request:
+可以直接使用以下提示词：
 
 ```text
-Read SKILL.md and references/configuration.md completely. Use the bundled scripts to create a local NAV email automation for my existing workbook.
+请完整阅读 SKILL.md 和 references/configuration.md，并使用仓库自带脚本，为我的现有工作簿创建一套净值邮件自动化。
 
-Start read-only. Do not write the master workbook, send messages, or install scheduled tasks without my explicit approval. Do not ask me to paste an authorization code into chat; tell me when to run the hidden local secret command myself.
+全程从只读开始。未经我明确同意，不得写入正式工作簿、发送邮件或安装定时任务。不要让我把授权码粘贴到聊天里；需要密钥时，告诉我如何亲自在本机运行隐藏输入命令。
 
-Configure only the senders and sheets I authorize. Discover columns semantically, validate at least two historical dates per route, fail closed on ambiguity or value conflict, and produce a preview plus a sanitized acceptance report. Formal writing must use the guarded Excel/WPS COM commit path after I approve the preview.
+只配置我授权的发件人和工作表。按表头含义识别列；每条路由至少核对两个不同的历史日期；产品、日期或数值存在歧义或冲突时必须停止；先生成预览和脱敏验收报告。只有我检查并批准预览后，才能通过受控的 Excel/WPS COM 流程正式写入。
 ```
 
-Clone only the clean public repository. Do not copy an already configured runtime.
+只克隆干净的公开仓库，不要复制已经配置过的运行目录。
 
-Codex on Windows:
+## Codex（Windows）
 
 ```powershell
-git clone <repo-url> "$env:USERPROFILE\.codex\skills\nav-email-to-excel"
+git clone <仓库地址> "$env:USERPROFILE\.codex\skills\nav-email-to-excel"
 codex
 ```
 
-Then ask Codex: `Use $nav-email-to-excel to deploy a preview-first runtime for this workbook: <absolute-path>`.
+然后告诉 Codex：`请使用 $nav-email-to-excel，为这个工作簿部署一套预览优先的本地运行环境：<绝对路径>`。
 
-Claude Code on Windows:
+## Claude Code（Windows）
 
 ```powershell
-git clone <repo-url> "$env:USERPROFILE\.claude\skills\nav-email-to-excel"
+git clone <仓库地址> "$env:USERPROFILE\.claude\skills\nav-email-to-excel"
 claude
 ```
 
-Then ask Claude Code to use the `nav-email-to-excel` skill and provide the workbook's absolute local path.
+然后让 Claude Code 使用 `nav-email-to-excel` Skill，并提供工作簿的本机绝对路径。
 
-Cursor:
+## Cursor
 
 ```powershell
-git clone <repo-url> "D:\tools\nav-email-to-excel"
+git clone <仓库地址> "D:\tools\nav-email-to-excel"
 cursor "D:\tools\nav-email-to-excel"
 ```
 
-Tell Cursor Agent to read the absolute `SKILL.md` path and to operate only on the separately supplied absolute workbook path. Confirm that the workspace permission includes the workbook's directory before discovery; otherwise Cursor cannot inspect it.
+让 Cursor Agent 完整阅读绝对路径下的 `SKILL.md`，并且只处理另行提供的工作簿绝对路径。开始发现前，确认 Cursor 的工作区权限包含工作簿所在目录，否则它无法检查文件。
 
-Default installation locations:
+## 默认安装位置
 
-- Codex personal skill: `%USERPROFILE%\.codex\skills\nav-email-to-excel`
-- Claude Code personal skill: `%USERPROFILE%\.claude\skills\nav-email-to-excel`
-- Cursor: any dedicated local tools directory; direct Agent to the cloned `SKILL.md`.
+- Codex 个人 Skill：`%USERPROFILE%\.codex\skills\nav-email-to-excel`
+- Claude Code 个人 Skill：`%USERPROFILE%\.claude\skills\nav-email-to-excel`
+- Cursor：任意独立的本地工具目录；明确要求 Agent 读取克隆目录中的 `SKILL.md`
 
-Update an existing clean installation with `git -C <skill-directory> pull --ff-only`. Keep runtimes elsewhere so an update cannot overwrite local configuration.
+更新干净安装时运行 `git -C <Skill目录> pull --ff-only`。本地运行目录应放在其他位置，避免更新 Skill 时覆盖配置。
 
-Do not copy a configured runtime into an AI skill directory. Share only the clean skill repository.
+不要把已配置的运行目录放进 AI Skill 目录或分享给别人。只分享干净的 Skill 仓库。

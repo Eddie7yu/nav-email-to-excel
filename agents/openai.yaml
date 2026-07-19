@@ -1,4 +1,4 @@
 interface:
-  display_name: "NAV Email to Excel"
-  short_description: "Safely deploy email-to-Excel NAV automation"
-  default_prompt: "Use $nav-email-to-excel to configure and validate a preview-first NAV automation for my workbook."
+  display_name: "净值邮件写入 Excel"
+  short_description: "安全部署、验证并维护净值邮件到 Excel 的自动化流程"
+  default_prompt: "请使用 $nav-email-to-excel，为我的工作簿配置并验证一套预览优先的净值邮件自动化。"
