@@ -1,0 +1,4 @@
+interface:
+  display_name: "NAV Email to Excel"
+  short_description: "Safely deploy email-to-Excel NAV automation"
+  default_prompt: "Use $nav-email-to-excel to configure and validate a preview-first NAV automation for my workbook."

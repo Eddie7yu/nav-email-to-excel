@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.lock
+            assets/runtime-template/requirements.lock
+      - name: Install locked dependencies
+        run: python -m pip install -r assets/runtime-template/requirements.lock -r requirements-dev.lock
+      - name: Validate package metadata
+        run: python -X utf8 scripts/package_check.py
+      - name: Scan for sensitive material
+        run: python -X utf8 scripts/privacy_audit.py --history
+      - name: Compile and lint
+        run: |
+          python -X utf8 -m compileall -q .
+          python -X utf8 -m ruff format --check .
+          python -X utf8 -m ruff check .
+      - name: Run sanitized offline regression
+        run: python -X utf8 scripts/selftest.py

@@ -1,0 +1,5 @@
+openpyxl==3.1.5
+et_xmlfile==2.0.0
+pypdf==6.13.2
+xlrd==2.0.2
+pywin32==312; sys_platform == "win32"
