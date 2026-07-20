@@ -161,6 +161,7 @@ def command_doctor(config: dict[str, Any], _args: argparse.Namespace) -> int:
 def command_secret(config: dict[str, Any], args: argparse.Namespace) -> int:
     if args.secret_action == "set":
         path = set_password(str(config["runtime_id"]))
+        print("已加密保存", file=sys.stderr, flush=True)
         emit({"stored": True, "location": str(path.parent), "value_echoed": False})
         return 0
     if args.secret_action == "remove":

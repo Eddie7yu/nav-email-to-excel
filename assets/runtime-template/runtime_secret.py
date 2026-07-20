@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import base64
 import ctypes
-import getpass
 import json
 import os
+import sys
 from ctypes import wintypes
 from pathlib import Path
+from typing import Callable, TextIO
+
+
+MASKED_INPUT_PROMPT = "请右键粘贴授权码，屏幕只显示星号，粘贴后回车"
 
 
 class DATA_BLOB(ctypes.Structure):
@@ -46,11 +50,7 @@ def set_password(runtime_id: str, password: str | None = None) -> Path:
         raise RuntimeError(
             "Set NAV_EMAIL_PASSWORD in the current shell on non-Windows systems"
         )
-    value = (
-        password
-        if password is not None
-        else getpass.getpass("IMAP authorization code (hidden): ")
-    )
+    value = password if password is not None else _read_windows_secret()
     if not value:
         raise ValueError("Authorization code cannot be empty")
     path = secret_path(runtime_id)
@@ -63,6 +63,41 @@ def set_password(runtime_id: str, password: str | None = None) -> Path:
     temporary.write_text(json.dumps(payload), encoding="utf-8")
     temporary.replace(path)
     return path
+
+
+def _read_windows_secret() -> str:
+    import msvcrt
+
+    return _read_masked(msvcrt.getwch, sys.stderr)
+
+
+def _read_masked(get_character: Callable[[], str], output: TextIO) -> str:
+    print(MASKED_INPUT_PROMPT, file=output, flush=True)
+    characters: list[str] = []
+    while True:
+        character = get_character()
+        if character in {"\r", "\n"}:
+            output.write("\n")
+            output.flush()
+            return "".join(characters)
+        if character == "\x03":
+            output.write("\n")
+            output.flush()
+            raise KeyboardInterrupt
+        if character in {"\x00", "\xe0"}:
+            get_character()
+            continue
+        if character == "\b":
+            if characters:
+                characters.pop()
+                output.write("\b \b")
+                output.flush()
+            continue
+        if len(character) != 1 or ord(character) < 32:
+            continue
+        characters.append(character)
+        output.write("*")
+        output.flush()
 
 
 def remove_password(runtime_id: str) -> bool:

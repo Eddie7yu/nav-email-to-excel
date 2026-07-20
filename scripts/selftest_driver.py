@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import gc
+import io
 import json
 import shutil
 import subprocess
@@ -141,6 +142,7 @@ def config_for(runtime: Path, book: Path) -> dict:
 def parser_tests(runtime: Path) -> None:
     sys.path.insert(0, str(runtime))
     import nav_mail
+    import navctl
     from nav_parse import (
         ParseError,
         choose_route_rows,
@@ -155,6 +157,37 @@ def parser_tests(runtime: Path) -> None:
         imap_date,
         needs_imap_id,
         single_from_address,
+    )
+    from runtime_secret import MASKED_INPUT_PROMPT, _read_masked
+
+    keys = iter(["a", "b", "\b", "C", "\x00", "K", "\r"])
+    masked_output = io.StringIO()
+    masked_value = _read_masked(lambda: next(keys), masked_output)
+    check(
+        masked_value == "aC"
+        and masked_output.getvalue().startswith(f"{MASKED_INPUT_PROMPT}\n")
+        and masked_output.getvalue().endswith("**\b \b*\n"),
+        "Windows masked secret input did not echo stars or handle backspace",
+    )
+    original_set_password = navctl.set_password
+    navctl.set_password = lambda _runtime_id: runtime / "secret.json"
+    secret_stdout = io.StringIO()
+    secret_stderr = io.StringIO()
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    try:
+        sys.stdout, sys.stderr = secret_stdout, secret_stderr
+        result = navctl.command_secret(
+            {"runtime_id": "00000000-0000-4000-8000-000000000001"},
+            argparse.Namespace(secret_action="set"),
+        )
+    finally:
+        sys.stdout, sys.stderr = original_stdout, original_stderr
+        navctl.set_password = original_set_password
+    check(
+        result == 0
+        and secret_stderr.getvalue() == "已加密保存\n"
+        and json.loads(secret_stdout.getvalue())["stored"],
+        "secret set did not print the encrypted-save confirmation",
     )
 
     check(
@@ -312,8 +345,6 @@ def parser_tests(runtime: Path) -> None:
         data.append(["Note"])
     data.append(["Product Code", "NAV Date", "Cumulative NAV", "Unit NAV"])
     data.append(["DEMO01", "2026-01-16", 1.02, 1.02])
-    import io
-
     buffer = io.BytesIO()
     attachment.save(buffer)
     message = EmailMessage()
