@@ -10,6 +10,10 @@ from typing import Any, Iterator
 
 from nav_commit import commit
 from nav_config import CONFIG_PATH, ConfigError, ROOT, load_config
+from nav_demo import commit as commit_demo
+from nav_demo import list_runs as list_demo_runs
+from nav_demo import prepare as prepare_demo
+from nav_demo import remove as remove_demo
 from nav_schedule import install as install_schedule
 from nav_schedule import remove as remove_schedule
 from nav_schedule import status as schedule_status
@@ -157,6 +161,22 @@ def command_schedule(config: dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
+def command_demo(args: argparse.Namespace) -> int:
+    if args.demo_action == "prepare":
+        emit(prepare_demo())
+    elif args.demo_action == "commit":
+        if not args.yes_reviewed_preview:
+            raise RuntimeError(
+                "拒绝演练写入；检查虚构预览后添加 --yes-reviewed-preview"
+            )
+        emit(commit_demo(args.run_id))
+    elif args.demo_action == "remove":
+        emit(remove_demo(args.run_id))
+    else:
+        emit(list_demo_runs())
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description="Safe local IMAP-to-Excel NAV automation"
@@ -175,12 +195,27 @@ def parser() -> argparse.ArgumentParser:
     commit_parser.add_argument("--yes-reviewed-preview", action="store_true")
     schedule = commands.add_parser("schedule")
     schedule.add_argument("schedule_action", choices=("install", "remove", "status"))
+    demo = commands.add_parser(
+        "demo", help="使用虚构邮箱和工作簿进行完全离线的安全演练"
+    )
+    demo_actions = demo.add_subparsers(dest="demo_action", required=True)
+    demo_actions.add_parser("prepare", help="生成虚构预览并停下来等待检查")
+    demo_actions.add_parser("list", help="列出本运行目录中的离线演练")
+    demo_commit = demo_actions.add_parser(
+        "commit", help="对已检查的虚构预览执行 Excel/WPS COM 演练"
+    )
+    demo_commit.add_argument("--run-id", required=True)
+    demo_commit.add_argument("--yes-reviewed-preview", action="store_true")
+    demo_remove = demo_actions.add_parser("remove", help="删除指定的虚构演练")
+    demo_remove.add_argument("--run-id", required=True)
     return result
 
 
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.command == "demo":
+            return command_demo(args)
         config = load_config(Path(args.config).resolve())
         prune_logs(config)
         commands = {

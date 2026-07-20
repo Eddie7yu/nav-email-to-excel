@@ -20,6 +20,8 @@ RUNTIME_FILES = (
     "navctl.py",
     "nav_commit.py",
     "nav_config.py",
+    "nav_demo.py",
+    "nav_demo_worker.py",
     "nav_mail.py",
     "nav_parse.py",
     "nav_schedule.py",

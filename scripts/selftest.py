@@ -17,7 +17,7 @@ DRIVER = ROOT / "scripts" / "selftest_driver.py"
 BOOTSTRAP = ROOT / "scripts" / "bootstrap.py"
 
 
-def bootstrap_test(temporary: Path) -> None:
+def bootstrap_test(temporary: Path, use_com: bool) -> None:
     import openpyxl
 
     workbook_path = temporary / "输入 工作簿.xlsx"
@@ -85,7 +85,9 @@ def bootstrap_test(temporary: Path) -> None:
     ]
     if unwanted:
         raise AssertionError("bootstrap copied build caches into the deployed runtime")
-    config = json.loads((destination / "config.json").read_text(encoding="utf-8"))
+    config_path = destination / "config.json"
+    original_config = config_path.read_bytes()
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     if config["workbook_path"] != str(workbook_path.resolve()) or config["routes"]:
         raise AssertionError("bootstrap generated an unsafe initial configuration")
     runtime_python = (
@@ -118,14 +120,106 @@ def bootstrap_test(temporary: Path) -> None:
         raise AssertionError(
             f"bootstrapped runtime readiness report is wrong: {doctor.stdout}"
         )
+    demo = subprocess.run(
+        [str(runtime_python), "-X", "utf8", "navctl.py", "demo", "prepare"],
+        cwd=destination,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+    )
+    try:
+        demo_report = json.loads(demo.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"offline demo returned invalid JSON: {demo.stdout}"
+        ) from exc
+    if (
+        demo.returncode
+        or not demo_report["passed"]
+        or demo_report["real_data_used"]
+        or not Path(demo_report["preview_path"]).is_file()
+    ):
+        raise AssertionError(f"offline demo preparation failed: {demo.stdout}")
+    run_id = str(demo_report["run_id"])
+    try:
+        refused = subprocess.run(
+            [
+                str(runtime_python),
+                "-X",
+                "utf8",
+                "navctl.py",
+                "demo",
+                "commit",
+                "--run-id",
+                run_id,
+            ],
+            cwd=destination,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=environment,
+        )
+        if refused.returncode != 2:
+            raise AssertionError("offline demo commit did not require preview approval")
+        if use_com:
+            committed = subprocess.run(
+                [
+                    str(runtime_python),
+                    "-X",
+                    "utf8",
+                    "navctl.py",
+                    "demo",
+                    "commit",
+                    "--run-id",
+                    run_id,
+                    "--yes-reviewed-preview",
+                ],
+                cwd=destination,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=environment,
+            )
+            commit_report = json.loads(committed.stdout)
+            if (
+                committed.returncode
+                or not commit_report["passed"]
+                or commit_report["rows_written"] != 1
+            ):
+                raise AssertionError(
+                    f"offline demo COM commit failed: {committed.stdout}"
+                )
+    finally:
+        removed = subprocess.run(
+            [
+                str(runtime_python),
+                "-X",
+                "utf8",
+                "navctl.py",
+                "demo",
+                "remove",
+                "--run-id",
+                run_id,
+            ],
+            cwd=destination,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=environment,
+        )
+        if removed.returncode:
+            raise AssertionError(f"offline demo cleanup failed: {removed.stdout}")
+    if config_path.read_bytes() != original_config:
+        raise AssertionError("offline demo changed the real runtime configuration")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Offline sanitized regression test")
+    parser = argparse.ArgumentParser(description="完全使用虚构数据的离线回归测试")
     parser.add_argument(
         "--com",
         action="store_true",
-        help="Also test a temporary Excel/WPS formal commit",
+        help="同时使用临时工作簿验证 Excel/WPS COM 正式写入",
     )
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="nav-skill-") as temporary:
@@ -135,13 +229,15 @@ def main() -> int:
         command = [sys.executable, "-X", "utf8", str(DRIVER), "--runtime", str(runtime)]
         if args.com:
             command.append("--com")
+        print("开始核心离线回归；不会读取真实邮箱、密钥或工作簿。", flush=True)
         result = subprocess.run(
             command, cwd=runtime, env=dict(os.environ, PYTHONUTF8="1")
         )
         if result.returncode:
             return result.returncode
-        bootstrap_test(Path(temporary))
-    print("selftest: PASS")
+        print("检查全新部署、就绪状态和 navctl 离线演练命令。", flush=True)
+        bootstrap_test(Path(temporary), args.com)
+    print("selftest: PASS（临时文件已清理，未使用真实资料）")
     return 0
 
 

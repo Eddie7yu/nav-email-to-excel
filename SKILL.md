@@ -25,6 +25,22 @@ python scripts/bootstrap.py --destination "D:\nav-runtime" --workbook "D:\data\n
 
 引导程序会创建隔离的虚拟环境、安装锁定版本的依赖，并生成本地配置。
 
+在接入真实邮箱前，先运行完全离线的虚构演练：
+
+```powershell
+cd D:\nav-runtime
+.\.venv\Scripts\python.exe navctl.py demo prepare
+```
+
+该命令不读取真实配置、密钥或工作簿。它返回 `run_id` 和虚构预览路径，并停下来等待检查。Windows 用户检查后，可继续验证只作用于虚构工作簿的 COM 写入：
+
+```powershell
+.\.venv\Scripts\python.exe navctl.py demo commit --run-id <run_id> --yes-reviewed-preview
+.\.venv\Scripts\python.exe navctl.py demo remove --run-id <run_id>
+```
+
+演练通过只证明目标电脑和通用流程可用，不代表真实发件人、产品路由或业务口径已经核实。
+
 让用户亲自在本机保存邮箱密钥：
 
 ```powershell
@@ -76,6 +92,8 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 5. 日收益使用上一个有效日期；周收益只出现在已完成自然周的最后一个可用日期。
 6. 基准收益与超额收益必须同时有值或同时留空。
 7. 预览保留工作簿结构，包含全部拟新增日期，并通过内置公式和幂等性回归测试。
+
+如果没有新增日期，`preview` 不生成工作簿副本，也不保留可提交的 `plan.json`。
 
 `doctor` 会分别报告 `bootstrap_ready`、`preview_ready`、`commit_ready` 和 `schedule_ready`。依赖安装成功不等于已经获准读取邮箱或写入工作簿。
 
@@ -129,7 +147,8 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 ```powershell
 python -X utf8 scripts/privacy_audit.py
 python -X utf8 scripts/selftest.py
+python -X utf8 scripts/selftest.py --com
 python -X utf8 scripts/package_check.py
 ```
 
-如果目标 AI 环境提供官方 Skill 校验器，也要一并运行。
+`--com` 仅在装有 Excel/WPS 的 Windows 上运行，用临时虚构工作簿验证正式写入和公式缓存值。所有自测都会分阶段报告内容并自动清理临时文件。如果目标 AI 环境提供官方 Skill 校验器，也要一并运行。

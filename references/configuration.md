@@ -123,4 +123,6 @@
 
 以下文件仅能存在于本地运行目录，并应被 Git 忽略：`config.json`、`route-report.json`、`validation-report.json`、`plan.json`、预览工作簿、正式工作簿、`logs/`、`backups/` 和 `scheduled_tasks.json`。Windows 密钥保存在当前用户的本地应用数据目录，并使用 DPAPI 加密。
 
+`demo-runs/` 只包含 `navctl.py demo` 生成的虚构邮件状态、虚构工作簿和预览，不会复制真实配置或密钥。检查完成后使用 `navctl.py demo remove --run-id <run_id>` 删除指定演练。
+
 程序会在 IMAP 搜索后再次精确检查解析出的 `From` 地址，但这只是路由验证，并非加密级发件人认证。若伪造邮件构成实质风险，应先在邮箱服务商侧强制执行 DKIM/DMARC，或使用专用邮箱规则，再启用此流程。

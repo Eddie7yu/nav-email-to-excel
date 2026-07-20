@@ -222,7 +222,7 @@ def parser_tests(runtime: Path) -> None:
         raise AssertionError("repeated labelled fields must fail closed")
 
 
-def workbook_tests(runtime: Path, use_com: bool) -> None:
+def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     sys.path.insert(0, str(runtime))
     from nav_commit import CommitError, commit
     from nav_config import ConfigError, load_config, validate_config
@@ -331,8 +331,10 @@ def workbook_tests(runtime: Path, use_com: bool) -> None:
 
     plan = build_preview(config, rows)
 
+    application = None
     if use_com:
         result = commit(config)
+        application = str(result["application"])
         check(
             result["changed"] and result["rows"] == 2,
             "COM commit did not apply both rows",
@@ -363,6 +365,10 @@ def workbook_tests(runtime: Path, use_com: bool) -> None:
     check(
         not second["sheets"] and second["preview_path"] is None,
         "second run must be idempotent and leave no workbook copy",
+    )
+    check(
+        not (runtime / "plan.json").exists(),
+        "a no-op preview must not leave a committable plan",
     )
 
     level_book = runtime / "level-benchmark.xlsx"
@@ -397,6 +403,7 @@ def workbook_tests(runtime: Path, use_com: bool) -> None:
         )
     finally:
         level_preview.close()
+    return application
 
 
 def main() -> int:
@@ -405,9 +412,18 @@ def main() -> int:
     parser.add_argument("--com", action="store_true")
     args = parser.parse_args()
     runtime = Path(args.runtime).resolve()
+    print("[1/3] 检查虚构邮件解析、精确发件人和冲突拦截")
     parser_tests(runtime)
-    workbook_tests(runtime, args.com)
-    print("selftest_driver: PASS")
+    print("      PASS")
+    print("[2/3] 检查历史核验、补录、公式、基准、预览保护和幂等性")
+    application = workbook_tests(runtime, args.com)
+    print("      PASS")
+    if args.com:
+        print("[3/3] 检查 Excel/WPS COM 正式写入及缓存数值")
+        print(f"      PASS（{application}）")
+    else:
+        print("[3/3] 跳过 COM；如需验证正式写入，请添加 --com")
+    print("selftest_driver: PASS（全程仅使用虚构数据）")
     return 0
 
 

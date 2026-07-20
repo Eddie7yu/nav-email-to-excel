@@ -5,7 +5,7 @@
 可以直接使用以下提示词：
 
 ```text
-请完整阅读 SKILL.md 和 references/configuration.md，并使用仓库自带脚本，为我的现有工作簿创建一套净值邮件自动化。
+请完整阅读 SKILL.md 和 references/configuration.md，并使用仓库自带脚本，为我的现有工作簿创建一套净值邮件自动化。创建运行目录后，先运行完全虚构的 navctl 离线演练；演练通过后再接入真实邮箱和工作簿配置。
 
 全程从只读开始。未经我明确同意，不得写入正式工作簿、发送邮件或安装定时任务。不要让我把授权码粘贴到聊天里；需要密钥时，告诉我如何亲自在本机运行隐藏输入命令。
 
@@ -50,3 +50,5 @@ cursor "D:\tools\nav-email-to-excel"
 更新干净安装时运行 `git -C <Skill目录> pull --ff-only`。本地运行目录应放在其他位置，避免更新 Skill 时覆盖配置。
 
 不要把已配置的运行目录放进 AI Skill 目录或分享给别人。只分享干净的 Skill 仓库。
+
+在 Windows PowerShell 中手动读取中文 Skill 时使用 `Get-Content -Raw -Encoding utf8 SKILL.md`，避免旧版 PowerShell 按系统代码页显示乱码。

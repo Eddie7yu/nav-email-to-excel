@@ -707,7 +707,7 @@ def build_preview(
     }
     if not plan_sheets:
         preview.unlink(missing_ok=True)
-        write_json_atomic(ROOT / "plan.json", plan)
+        (ROOT / "plan.json").unlink(missing_ok=True)
         return plan
     try:
         validate_preview(config, plan)
