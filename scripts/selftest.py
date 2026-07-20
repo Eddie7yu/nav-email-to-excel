@@ -139,11 +139,14 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
         env=environment,
     )
     report = json.loads(doctor.stdout)
+    checks = {item["name"]: item["passed"] for item in report["checks"]}
     if (
         doctor.returncode != 2
         or not report["bootstrap_ready"]
         or report["mail_discovery_ready"]
         or report["preview_ready"]
+        or report["schedule_ready"]
+        or checks.get("schedule-config") is not False
     ):
         raise AssertionError(
             f"bootstrapped runtime readiness report is wrong: {doctor.stdout}"

@@ -313,6 +313,16 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
         local_path,
         "local" if local_path else "UNC paths cannot be scheduled",
     )
+    schedules = config.get("schedule") or []
+    add(
+        "schedule-config",
+        bool(schedules),
+        (
+            f"{len(schedules)} configured time(s)"
+            if schedules
+            else "not configured; ask the user for update frequency and local time"
+        ),
+    )
     by_name = {item["name"]: item["passed"] for item in checks}
     base_names = {
         "python",
@@ -323,7 +333,9 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
     mail_discovery_ready = bootstrap_ready and by_name["imap-secret"]
     preview_ready = bootstrap_ready and by_name["routes"] and by_name["imap-secret"]
     commit_ready = preview_ready and by_name["spreadsheet-com"]
-    schedule_ready = commit_ready and by_name["schedule-path"]
+    schedule_ready = (
+        commit_ready and by_name["schedule-path"] and by_name["schedule-config"]
+    )
     blockers = [item["name"] for item in checks if not item["passed"]]
     return {
         "passed": preview_ready,
