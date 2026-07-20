@@ -33,6 +33,8 @@ MONTHS = (
     "Nov",
     "Dec",
 )
+NETEASE_IMAP_SUFFIXES = ("163.com", "126.com", "yeah.net")
+IMAP_CLIENT_ID = '("name" "nav-email-to-excel" "version" "1")'
 
 
 def imap_date(value: dt.date) -> str:
@@ -55,26 +57,63 @@ def decoded(value: Any) -> str:
         return str(value or "")
 
 
+def needs_imap_id(host: str) -> bool:
+    normalized = str(host).strip().rstrip(".").casefold()
+    return any(
+        normalized == suffix or normalized.endswith(f".{suffix}")
+        for suffix in NETEASE_IMAP_SUFFIXES
+    )
+
+
+def _send_required_imap_id(client: imaplib.IMAP4_SSL, host: str) -> None:
+    if not needs_imap_id(host):
+        return
+    try:
+        status, _ = client.xatom("ID", IMAP_CLIENT_ID)
+    except imaplib.IMAP4.error as exc:
+        raise MailError(
+            "NetEase IMAP ID handshake failed before mailbox selection"
+        ) from exc
+    if status != "OK":
+        raise MailError("NetEase IMAP ID handshake was rejected")
+
+
+def _logout_safely(client: imaplib.IMAP4_SSL | None) -> None:
+    if client is None:
+        return
+    try:
+        client.logout()
+    except (imaplib.IMAP4.error, OSError):
+        pass
+
+
 def connect(config: dict[str, Any]) -> imaplib.IMAP4_SSL:
     imap = config["imap"]
+    host = str(imap["host"])
     password = read_password(str(config["runtime_id"]))
     if not password:
         raise MailError(
             "No local IMAP secret. Run `navctl.py secret set` or set NAV_EMAIL_PASSWORD."
         )
+    client = None
     try:
         client = imaplib.IMAP4_SSL(
-            str(imap["host"]),
+            host,
             int(imap.get("port", 993)),
             ssl_context=ssl.create_default_context(),
             timeout=30,
         )
         client.login(str(imap["user"]), password)
+        _send_required_imap_id(client, host)
         status, _ = client.select(str(imap.get("mailbox") or "INBOX"), readonly=True)
         if status != "OK":
             raise MailError("Could not open the configured mailbox read-only")
         return client
+    except MailError:
+        _logout_safely(client)
+        raise
     except (imaplib.IMAP4.error, OSError, ssl.SSLError) as exc:
+        _logout_safely(client)
         raise MailError("Could not connect to the configured IMAP mailbox") from exc
 
 

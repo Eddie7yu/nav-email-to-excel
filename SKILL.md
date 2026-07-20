@@ -57,7 +57,7 @@ cd /opt/nav-runtime
 read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PASSWORD && printf '\n'
 ```
 
-当前版本支持通过 SSL 连接 IMAP，并使用应用专用密码或授权码；暂不支持仅限 OAuth 的邮箱登录。PDF 仅解析文本，不提供 OCR。
+当前版本支持通过 SSL 连接 IMAP，并使用应用专用密码或授权码；对 163、126、yeah.net 和网易企业邮主机会在登录后、选择邮箱前发送不含账号信息的 IMAP ID。暂不支持仅限 OAuth 的邮箱登录。PDF 仅解析文本，不提供 OCR。
 
 ## 按业务含义配置路由
 

@@ -28,9 +28,11 @@
 
 它不能保证从未见过的邮件格式都自动兼容，也不能替代对业务口径的人工确认。遇到无法证明的情况，正确行为是停止并给出原因；如确需新增特殊解析器，可以使用运行目录中的受信任 `parsers/` 扩展点，但必须先用完全脱敏的样例回归，绝不能从邮件或附件加载代码。
 
+第一次部署可先阅读面向非程序员的[中文使用流程](使用流程.md)。
+
 ## 适用范围与限制
 
-- 邮箱：IMAP over SSL，使用应用专用密码或授权码；暂不支持仅限 OAuth 的登录。
+- 邮箱：IMAP over SSL，使用应用专用密码或授权码；支持标准 IMAP，以及需要登录后发送 ID 的 163、126、yeah.net 和网易企业邮主机；暂不支持仅限 OAuth 的登录。
 - 附件：Excel、CSV 和文本型 PDF；扫描 PDF 暂不提供 OCR。
 - 预览：Windows、Linux、macOS 均可运行 Python 流程；持续集成覆盖 Windows、Linux，并对 macOS 做预览 smoke test。
 - 正式写入：仅支持 Windows，并要求 Microsoft Excel 或 WPS 表格的 COM 接口可用。

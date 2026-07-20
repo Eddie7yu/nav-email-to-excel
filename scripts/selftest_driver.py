@@ -10,6 +10,7 @@ import subprocess
 import sys
 from email.message import EmailMessage
 from pathlib import Path
+from typing import Any
 
 import openpyxl
 from openpyxl.styles import Font
@@ -139,6 +140,7 @@ def config_for(runtime: Path, book: Path) -> dict:
 
 def parser_tests(runtime: Path) -> None:
     sys.path.insert(0, str(runtime))
+    import nav_mail
     from nav_parse import (
         ParseError,
         choose_route_rows,
@@ -146,12 +148,95 @@ def parser_tests(runtime: Path) -> None:
         rows_from_message,
         rows_from_text,
     )
-    from nav_mail import exact_from_matches, imap_date
+    from nav_mail import MailError, exact_from_matches, imap_date, needs_imap_id
 
     check(
         imap_date(dt.date(2026, 7, 9)) == "09-Jul-2026",
         "IMAP dates must use fixed English month names",
     )
+    check(
+        needs_imap_id("IMAP.163.COM.")
+        and needs_imap_id("imap.126.com")
+        and needs_imap_id("imap.yeah.net")
+        and not needs_imap_id("imap.qq.com"),
+        "NetEase IMAP host detection is incorrect",
+    )
+
+    original_ssl = nav_mail.imaplib.IMAP4_SSL
+    original_read_password = nav_mail.read_password
+    events: list[tuple[Any, ...]] = []
+
+    class FakeIMAP:
+        id_status = "OK"
+
+        def __init__(self, host, port, **_kwargs):
+            events.append(("connect", host, port))
+
+        def login(self, user, _password):
+            events.append(("login", user))
+            return "OK", [b""]
+
+        def xatom(self, name, payload):
+            events.append((name, payload))
+            return self.id_status, [b""]
+
+        def select(self, mailbox, readonly=False):
+            events.append(("select", mailbox, readonly))
+            return "OK", [b""]
+
+        def logout(self):
+            events.append(("logout",))
+            return "BYE", [b""]
+
+    mail_config = {
+        "runtime_id": "00000000-0000-4000-8000-000000000001",
+        "imap": {
+            "host": "imap.163.com",
+            "port": 993,
+            "user": "user@example.invalid",
+            "mailbox": "INBOX",
+        },
+    }
+    try:
+        nav_mail.imaplib.IMAP4_SSL = FakeIMAP
+        nav_mail.read_password = lambda _runtime_id: "fixture-secret"
+        nav_mail.connect(mail_config)
+        check(
+            [event[0] for event in events] == ["connect", "login", "ID", "select"],
+            "NetEase IMAP ID must run after login and before mailbox selection",
+        )
+        check(
+            "user@example.invalid" not in str(events[2])
+            and "fixture-secret" not in str(events[2]),
+            "IMAP ID leaked account information",
+        )
+
+        events.clear()
+        mail_config["imap"]["host"] = "imap.qq.com"
+        nav_mail.connect(mail_config)
+        check(
+            [event[0] for event in events] == ["connect", "login", "select"],
+            "Non-NetEase IMAP received an unnecessary ID command",
+        )
+
+        events.clear()
+        mail_config["imap"]["host"] = "imap.126.com"
+        FakeIMAP.id_status = "BAD"
+        try:
+            nav_mail.connect(mail_config)
+        except MailError as exc:
+            check(
+                "ID handshake" in str(exc),
+                "Rejected NetEase IMAP ID did not return a specific error",
+            )
+        else:
+            raise AssertionError("Rejected NetEase IMAP ID was accepted")
+        check(events[-1][0] == "logout", "Failed IMAP connection was not closed")
+    finally:
+        FakeIMAP.id_status = "OK"
+        nav_mail.imaplib.IMAP4_SSL = original_ssl
+        nav_mail.read_password = original_read_password
+
     sender_message = EmailMessage()
     sender_message["From"] = "Example Sender <sender@example.invalid>"
     check(
