@@ -7,12 +7,18 @@ import importlib.util
 import importlib.metadata
 import platform
 import sys
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
 from nav_commit import ensure_process_exit, spreadsheet_app
 from nav_config import ROOT, active_routes, normalize_code, write_json_atomic
-from nav_mail import decoded, fetch_authorized_messages
+from nav_mail import (
+    decoded,
+    fetch_authorized_messages,
+    fetch_candidate_messages,
+    single_from_address,
+)
 from nav_parse import (
     NavRow,
     ParseError,
@@ -26,6 +32,94 @@ from runtime_secret import read_password
 
 def _sender_id(sender: str) -> str:
     return hashlib.sha256(sender.lower().encode("utf-8")).hexdigest()[:12]
+
+
+def propose_routes(config: dict[str, Any]) -> dict[str, Any]:
+    messages, scan = fetch_candidate_messages(config)
+    groups: dict[str, dict[str, Any]] = {}
+    ignored = 0
+    for message in messages:
+        sender = single_from_address(message)
+        if not sender:
+            ignored += 1
+            continue
+        try:
+            rows = rows_from_message(message, "auto")
+        except ParseError:
+            rows = []
+        if not rows:
+            ignored += 1
+            continue
+        group = groups.setdefault(
+            sender,
+            {
+                "subjects": [],
+                "message_dates": [],
+                "messages": 0,
+                "observations": {},
+            },
+        )
+        group["messages"] += 1
+        subject = decoded(message.get("Subject")).strip()
+        if subject and subject not in group["subjects"]:
+            group["subjects"].append(subject)
+        try:
+            message_date = parsedate_to_datetime(str(message.get("Date"))).isoformat()
+        except (TypeError, ValueError, OverflowError):
+            message_date = None
+        if message_date and message_date not in group["message_dates"]:
+            group["message_dates"].append(message_date)
+        for row in rows:
+            key = (
+                row.date.isoformat(),
+                row.code or "",
+                round(row.unit, 10),
+                None if row.cumulative is None else round(row.cumulative, 10),
+            )
+            group["observations"][key] = {
+                "date": row.date.isoformat(),
+                "code": row.code,
+                "unit": row.unit,
+                "cumulative": row.cumulative,
+                "source": row.source,
+            }
+    candidates: list[dict[str, Any]] = []
+    for sender, group in sorted(groups.items()):
+        observations = sorted(
+            group["observations"].values(),
+            key=lambda item: (item["date"], item["code"] or "", item["unit"]),
+        )
+        dates = sorted({item["date"] for item in observations})
+        candidates.append(
+            {
+                "sender": sender,
+                "message_count": group["messages"],
+                "recent_message_times": group["message_dates"][:20],
+                "subject_examples": group["subjects"][:10],
+                "detected_codes": sorted(
+                    {item["code"] for item in observations if item["code"]}
+                ),
+                "first_date": dates[0],
+                "latest_date": dates[-1],
+                "observations": observations[-100:],
+            }
+        )
+    warnings: list[str] = []
+    if scan["truncated"]:
+        warnings.append(
+            "邮箱候选扫描受到数量或总大小上限限制；AI 应在需要时缩小时间范围后重试"
+        )
+    if scan["skipped_oversize"]:
+        warnings.append(f"已跳过 {scan['skipped_oversize']} 封超过单封大小上限的邮件")
+    report = {
+        "passed": bool(candidates),
+        "scan": {**scan, "messages_ignored_as_non_nav": ignored},
+        "candidates": candidates,
+        "warnings": warnings,
+        "errors": [] if candidates else ["没有发现可自动解析的净值邮件候选"],
+    }
+    write_json_atomic(ROOT / "route-proposals.json", report)
+    return report
 
 
 def collect_route_rows(
@@ -226,6 +320,7 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
         *{f"package:{name}" for name in expected_packages},
     }
     bootstrap_ready = all(by_name.get(name, False) for name in base_names)
+    mail_discovery_ready = bootstrap_ready and by_name["imap-secret"]
     preview_ready = bootstrap_ready and by_name["routes"] and by_name["imap-secret"]
     commit_ready = preview_ready and by_name["spreadsheet-com"]
     schedule_ready = commit_ready and by_name["schedule-path"]
@@ -233,6 +328,7 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "passed": preview_ready,
         "bootstrap_ready": bootstrap_ready,
+        "mail_discovery_ready": mail_discovery_ready,
         "preview_ready": preview_ready,
         "commit_ready": commit_ready,
         "schedule_ready": schedule_ready,

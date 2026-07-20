@@ -148,7 +148,14 @@ def parser_tests(runtime: Path) -> None:
         rows_from_message,
         rows_from_text,
     )
-    from nav_mail import MailError, exact_from_matches, imap_date, needs_imap_id
+    from nav_mail import (
+        MailError,
+        exact_from_matches,
+        fetch_candidate_messages,
+        imap_date,
+        needs_imap_id,
+        single_from_address,
+    )
 
     check(
         imap_date(dt.date(2026, 7, 9)) == "09-Jul-2026",
@@ -249,6 +256,42 @@ def parser_tests(runtime: Path) -> None:
         not exact_from_matches(spoofed_message, "sender@example.invalid"),
         "substring From matching was accepted",
     )
+    candidate_message = EmailMessage()
+    candidate_message["From"] = "NAV Desk <sender@example.invalid>"
+    candidate_message["Subject"] = "NAV update"
+    candidate_message.set_content(
+        "Product Code | NAV Date | Unit NAV | Cumulative NAV\n"
+        "DEMO01 | 2026-01-09 | 1.01 | 1.01"
+    )
+    candidate_payload = candidate_message.as_bytes()
+
+    class CandidateIMAP:
+        def uid(self, command, *_args):
+            if command == "search":
+                return "OK", [b"1"]
+            query = str(_args[-1])
+            if "RFC822.SIZE" in query:
+                return "OK", [f"1 (RFC822.SIZE {len(candidate_payload)})".encode()]
+            return "OK", [(b"1 (BODY[])", candidate_payload), b")"]
+
+        def close(self):
+            return "OK", [b""]
+
+        def logout(self):
+            return "BYE", [b""]
+
+    original_connect = nav_mail.connect
+    nav_mail.connect = lambda _config: CandidateIMAP()
+    try:
+        candidates, scan = fetch_candidate_messages(mail_config)
+    finally:
+        nav_mail.connect = original_connect
+    check(
+        len(candidates) == 1
+        and single_from_address(candidates[0]) == "sender@example.invalid"
+        and scan["messages_fetched"] == 1,
+        "mailbox-wide sender discovery did not return the local NAV candidate",
+    )
     check(
         parse_number("1.02%") is None, "percentage text must not be accepted as a NAV"
     )
@@ -333,6 +376,34 @@ def route_state_tests(runtime: Path) -> None:
     config = config_for(runtime, book)
     empty = json.loads(json.dumps(config))
     empty["routes"] = []
+    proposal_message = EmailMessage()
+    proposal_message["From"] = "NAV Desk <sender@example.invalid>"
+    proposal_message["Subject"] = "Weekly NAV"
+    proposal_message.set_content(
+        "Product Code | NAV Date | Unit NAV | Cumulative NAV\n"
+        "DEMO01 | 2026-01-09 | 1.01 | 1.01"
+    )
+    original_candidates = nav_service.fetch_candidate_messages
+    nav_service.fetch_candidate_messages = lambda _config: (
+        [proposal_message],
+        {
+            "messages_found": 1,
+            "messages_fetched": 1,
+            "bytes_fetched": 100,
+            "skipped_oversize": 0,
+            "truncated": False,
+        },
+    )
+    try:
+        proposal = nav_service.propose_routes(empty)
+    finally:
+        nav_service.fetch_candidate_messages = original_candidates
+    check(
+        proposal["passed"]
+        and proposal["candidates"][0]["sender"] == "sender@example.invalid"
+        and proposal["candidates"][0]["detected_codes"] == ["DEMO01"],
+        "AI route proposal did not discover the sender and product code",
+    )
     _, report = nav_service.collect_route_rows(empty)
     check(
         not report["passed"] and "No active routes" in report["errors"][0],
@@ -457,14 +528,20 @@ def lock_tests(runtime: Path) -> None:
         "schedule status did not expose the latest run result",
     )
     check(
-        "scheduled-preview"
-        in (runtime / "run-preview.cmd").read_text(encoding="utf-8"),
-        "scheduled wrapper does not record preview outcomes",
+        "scheduled-update" in (runtime / "run-update.cmd").read_text(encoding="utf-8"),
+        "scheduled wrapper does not run automatic updates",
     )
 
 
 def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     sys.path.insert(0, str(runtime))
+    from nav_automation import (
+        AutomationError,
+        approve,
+        automatic_update,
+        revoke,
+        status as automation_status,
+    )
     from nav_commit import CommitError, _process_id, commit, ensure_process_exit
     from nav_config import ConfigError, load_config, validate_config
     from nav_parse import NavRow
@@ -474,6 +551,23 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     book = runtime / "脱敏 示例.xlsx"
     create_book(book)
     config = config_for(runtime, book)
+    revoke()
+    check(
+        not automation_status(config)["approved"],
+        "automatic updates started approved before the first reviewed commit",
+    )
+    approve(config)
+    check(
+        automation_status(config)["approved"],
+        "reviewed configuration could not approve future automatic updates",
+    )
+    changed_config = json.loads(json.dumps(config))
+    changed_config["routes"][0]["return_frequency"] = "daily"
+    check(
+        not automation_status(changed_config)["approved"],
+        "automatic approval survived a write-rule configuration change",
+    )
+    revoke()
     invalid = json.loads(json.dumps(config))
     invalid["routes"][0]["series_start"] = "2026-99-99"
     invalid["routes"][0]["parser"] = "local:../unsafe"
@@ -895,6 +989,11 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         )
     else:
         shutil.copy2(append_plan["preview_path"], append_book)
+    approve(append_config)
+    check(
+        automation_status(append_config)["approved"],
+        "first reviewed append commit did not enable automatic updates",
+    )
     committed_append = openpyxl.load_workbook(append_book, data_only=False)
     try:
         check(
@@ -922,16 +1021,32 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         append_next_validation["passed"] and not append_next_validation["warnings"],
         "existing append table did not validate before a later update",
     )
-    append_next = build_preview(append_config, append_rows)
-    check(
-        append_next["sheets"][0]["new_dates"] == ["2026-01-16"]
-        and append_next["sheets"][0]["copy_template_rows"],
-        "existing append table did not plan exactly one later date",
-    )
     if use_com:
-        append_next_result = commit(append_config)
+        altered = json.loads(json.dumps(append_config))
+        altered["routes"][0]["product_name"] = "Changed Name"
+        try:
+            automatic_update(altered, append_rows)
+        except AutomationError:
+            pass
+        else:
+            raise AssertionError(
+                "automatic update accepted a configuration changed after approval"
+            )
+        append_next_result = automatic_update(append_config, append_rows)
         application = str(append_next_result["application"])
+        check(
+            append_next_result["changed"]
+            and append_next_result["rows"] == 1
+            and not (runtime / "plan.json").exists(),
+            "automatic update did not write one row and remove its staging plan",
+        )
     else:
+        append_next = build_preview(append_config, append_rows)
+        check(
+            append_next["sheets"][0]["new_dates"] == ["2026-01-16"]
+            and append_next["sheets"][0]["copy_template_rows"],
+            "existing append table did not plan exactly one later date",
+        )
         shutil.copy2(append_next["preview_path"], append_book)
     append_updated = openpyxl.load_workbook(append_book, data_only=False)
     try:

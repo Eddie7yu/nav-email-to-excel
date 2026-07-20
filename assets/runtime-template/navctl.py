@@ -9,6 +9,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from nav_automation import (
+    approve as approve_automation,
+    automatic_update,
+    revoke as revoke_automation,
+    status as automation_status,
+)
 from nav_commit import commit
 from nav_config import CONFIG_PATH, ConfigError, ROOT, load_config
 from nav_demo import commit as commit_demo
@@ -19,7 +25,7 @@ from nav_schedule import install as install_schedule
 from nav_schedule import record_scheduled_run
 from nav_schedule import remove as remove_schedule
 from nav_schedule import status as schedule_status
-from nav_service import discover, doctor, preview, validate
+from nav_service import discover, doctor, preview, propose_routes, validate
 from runtime_secret import read_password, remove_password, set_password
 
 
@@ -182,6 +188,13 @@ def command_discover(config: dict[str, Any], _args: argparse.Namespace) -> int:
     return 0 if report["passed"] else 2
 
 
+def command_propose(config: dict[str, Any], _args: argparse.Namespace) -> int:
+    with run_lock():
+        report = propose_routes(config)
+    emit(report)
+    return 0 if report["passed"] else 2
+
+
 def command_validate(config: dict[str, Any], _args: argparse.Namespace) -> int:
     with run_lock():
         report = validate(config)
@@ -206,18 +219,19 @@ def command_preview(config: dict[str, Any], _args: argparse.Namespace) -> int:
     return 0
 
 
-def command_scheduled_preview(config: dict[str, Any], args: argparse.Namespace) -> int:
+def command_scheduled_update(config: dict[str, Any], args: argparse.Namespace) -> int:
     with run_lock():
-        plan = preview(config)
+        result = automatic_update(config)
     payload = {
         "started": args.scheduled_started,
         "finished": dt.datetime.now().isoformat(timespec="seconds"),
         "passed": True,
         "exit_code": 0,
-        "plan_id": plan["plan_id"],
-        "sheets": len(plan["sheets"]),
-        "new_rows": sum(len(item["new_dates"]) for item in plan["sheets"]),
-        "warnings": plan.get("warnings") or [],
+        "changed": bool(result.get("changed")),
+        "sheets": int(result.get("sheets", 0)),
+        "new_rows": int(result.get("rows", 0)),
+        "backup": result.get("backup"),
+        "warnings": result.get("warnings") or [],
     }
     record_scheduled_run_safely(payload)
     emit(payload)
@@ -228,7 +242,17 @@ def command_commit(config: dict[str, Any], args: argparse.Namespace) -> int:
     if not args.yes_reviewed_preview:
         raise RuntimeError("Refusing commit without --yes-reviewed-preview")
     with run_lock():
-        emit(commit(config))
+        result = commit(config)
+        result["automatic_updates"] = approve_automation(config)
+        emit(result)
+    return 0
+
+
+def command_automation(config: dict[str, Any], args: argparse.Namespace) -> int:
+    if args.automation_action == "revoke":
+        emit(revoke_automation())
+    else:
+        emit(automation_status(config))
     return 0
 
 
@@ -238,7 +262,9 @@ def command_schedule(config: dict[str, Any], args: argparse.Namespace) -> int:
     elif args.schedule_action == "remove":
         emit(remove_schedule())
     else:
-        emit(schedule_status())
+        report = schedule_status()
+        report["automatic_updates"] = automation_status(config)
+        emit(report)
     return 0
 
 
@@ -259,9 +285,7 @@ def command_demo(args: argparse.Namespace) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(
-        description="Safe local IMAP-to-Excel NAV automation"
-    )
+    result = argparse.ArgumentParser(description="Local IMAP-to-Excel NAV automation")
     result.add_argument(
         "--config", default=str(CONFIG_PATH), help="Runtime config.json path"
     )
@@ -269,14 +293,17 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("doctor")
     secret = commands.add_parser("secret")
     secret.add_argument("secret_action", choices=("set", "status", "remove"))
+    commands.add_parser("propose")
     commands.add_parser("discover")
     commands.add_parser("validate")
     commands.add_parser("preview")
-    commands.add_parser("scheduled-preview", help=argparse.SUPPRESS)
+    commands.add_parser("scheduled-update", help=argparse.SUPPRESS)
     commit_parser = commands.add_parser("commit")
     commit_parser.add_argument("--yes-reviewed-preview", action="store_true")
     schedule = commands.add_parser("schedule")
     schedule.add_argument("schedule_action", choices=("install", "remove", "status"))
+    automation = commands.add_parser("automation")
+    automation.add_argument("automation_action", choices=("status", "revoke"))
     demo = commands.add_parser(
         "demo", help="使用虚构邮箱和工作簿进行完全离线的安全演练"
     )
@@ -305,12 +332,14 @@ def main() -> int:
         commands = {
             "doctor": command_doctor,
             "secret": command_secret,
+            "propose": command_propose,
             "discover": command_discover,
             "validate": command_validate,
             "preview": command_preview,
-            "scheduled-preview": command_scheduled_preview,
+            "scheduled-update": command_scheduled_update,
             "commit": command_commit,
             "schedule": command_schedule,
+            "automation": command_automation,
         }
         return commands[args.command](config, args)
     except (ConfigError, RuntimeError, ValueError, OSError) as exc:
@@ -319,7 +348,7 @@ def main() -> int:
             if not isinstance(exc, OSError)
             else f"系统操作失败：{exc.strerror or type(exc).__name__}"
         )
-        if args.command == "scheduled-preview":
+        if args.command == "scheduled-update":
             record_scheduled_run_safely(
                 {
                     "started": args.scheduled_started,

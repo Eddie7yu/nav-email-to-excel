@@ -142,21 +142,22 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     if (
         doctor.returncode != 2
         or not report["bootstrap_ready"]
+        or report["mail_discovery_ready"]
         or report["preview_ready"]
     ):
         raise AssertionError(
             f"bootstrapped runtime readiness report is wrong: {doctor.stdout}"
         )
-    scheduled_preview = subprocess.run(
-        [str(runtime_python), "-X", "utf8", "navctl.py", "scheduled-preview"],
+    scheduled_update = subprocess.run(
+        [str(runtime_python), "-X", "utf8", "navctl.py", "scheduled-update"],
         cwd=destination,
         capture_output=True,
         text=True,
         encoding="utf-8",
         env=environment,
     )
-    if scheduled_preview.returncode != 2:
-        raise AssertionError("empty scheduled preview did not fail closed")
+    if scheduled_update.returncode != 2:
+        raise AssertionError("unapproved scheduled update did not fail closed")
     schedule_status = subprocess.run(
         [str(runtime_python), "-X", "utf8", "navctl.py", "schedule", "status"],
         cwd=destination,
@@ -172,7 +173,7 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
         or status_report.get("last_run", {}).get("exit_code") != 2
     ):
         raise AssertionError(
-            "schedule status did not report the latest preview failure"
+            "schedule status did not report the latest automatic-update failure"
         )
     demo = subprocess.run(
         [str(runtime_python), "-X", "utf8", "navctl.py", "demo", "prepare"],

@@ -18,6 +18,7 @@ TEMPLATE = ROOT / "assets" / "runtime-template"
 RUNTIME_FILES = (
     ".gitignore",
     "navctl.py",
+    "nav_automation.py",
     "nav_commit.py",
     "nav_config.py",
     "nav_demo.py",
@@ -28,7 +29,7 @@ RUNTIME_FILES = (
     "nav_service.py",
     "nav_workbook.py",
     "requirements.lock",
-    "run-preview.cmd",
+    "run-update.cmd",
     "runtime_secret.py",
 )
 MAX_WINDOWS_DESTINATION_CHARS = 120
@@ -209,7 +210,10 @@ def main() -> int:
             return 0
         create_runtime(args, destination, workbook)
         print(f"Runtime created: {destination}")
-        print("Next: configure authorized routes, then run navctl.py doctor.")
+        print(
+            "Next: run navctl.py secret set, then let the AI run navctl.py propose "
+            "to discover sender routes automatically."
+        )
         return 0
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

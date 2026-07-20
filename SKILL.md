@@ -1,26 +1,23 @@
 ---
 name: nav-email-to-excel
-description: 部署、配置、验证、运行或修复本地 IMAP 邮箱到 Excel 的基金净值自动化。适用于让 AI 将定期净值邮件、Excel/CSV/PDF 附件映射到现有或空白目标工作表，保留公式与格式，初始化简单净值表，补录遗漏日期，核对历史数值，生成预览，通过 Excel/WPS 受控写入，或安装隔离的 Windows 预览定时任务。
+description: 部署、配置、验证、运行或修复本地 IMAP 邮箱到 Excel 的基金净值自动化。让 AI 在用户输入一次邮箱授权码后自动发现发件人和产品、匹配现有或空白工作表、完成首次预览验收，并在 Windows 上通过 Excel/WPS 自动备份和持续写入；支持正文及 Excel/CSV/PDF 附件、简单追加表、复杂汇总表和本地解析器。
 ---
 
 # 部署净值邮件自动化
 
 以现有工作簿为版式、公式和视觉样式的唯一依据。邮箱数据、工作簿副本、凭据、发现报告和运行配置必须留在用户本机。
 
-## 严守安全边界
+## 工作原则
 
-- 默认只读。未经用户明确同意，不得写入正式工作簿、发送邮件或安装定时任务。
-- 不得要求用户在聊天中或命令行参数里提供 IMAP 授权码。应让用户亲自在本机运行隐藏输入命令。
+- 用户只负责在本机隐藏输入邮箱授权码，并检查、批准第一次真实预览。发件人发现、路由配置、表结构识别和后续运行由 AI 完成，不得要求用户手工抄写发件人邮箱或逐项填写 AI 能从本地证据确定的信息。
+- 第一次批准前只读。第一次预览经批准并成功写入后，该配置自动获得后续自动更新权限；每次自动写入仍先校验、备份并通过临时副本验证，不再要求用户重复检查预览。
 - 产品无法唯一识别、日期或数值冲突、累计净值口径未确认、出现未知列、基准缺失或工作簿结构变化时，必须停止，不得猜测。只有显式 `append` 模式允许历史不足的冷启动，且必须具备产品名称或代码并人工检查警告与预览。
-- 不得把真实姓名、发件人、产品名称、产品代码、工作簿名、邮件正文、附件、路径、日志或凭据放入本 Skill、测试、提交或回复中。
+- 真实邮箱、产品和工作簿可以在用户本机用于发现和配置，但不得写入公开 Skill、测试或 Git 提交。授权码不得出现在聊天、命令参数或日志中。
 - 运行目录必须与 Skill 目录分开，避免升级 Skill 时覆盖本地配置或数据。
 
 ## 创建本地运行目录
 
-只收集目标目录、工作簿路径、IMAP 账号、服务器和邮箱文件夹。用户不知道准确服务器
-或认证方式时，先完整阅读 [references/email-providers.md](references/email-providers.md)，
-按“现有客户端 → 管理员 → 服务商官方文档”的顺序核验。不得仅凭邮箱后缀、MX 记录
-或 `imap.<公司域名>` 猜测；无法确认时必须停止并请用户或 IT 提供设置。
+获取工作簿路径和收件邮箱账号。目标目录使用短本地路径；IMAP 主机优先从现有邮件客户端设置中读取，不足时再查 [references/email-providers.md](references/email-providers.md) 或服务商官方文档。只有确实无法确定账号认证方式时才询问用户。
 
 确认后在 Skill 根目录运行：
 
@@ -32,21 +29,21 @@ python scripts/bootstrap.py --destination "D:\nav-runtime" --workbook "D:\data\n
 
 Windows 必须优先选择 `D:\nav-runtime` 一类的短本地目录。引导程序把 120 个字符作为当前可靠支持上限；路径过长时必须改用短目录，不得绕过预检或要求用户修改公司电脑的组策略。
 
-在接入真实邮箱前，先运行完全离线的虚构演练：
+AI 在后台运行一次完全离线的虚构演练，不要求用户参与：
 
 ```powershell
 cd D:\nav-runtime
 .\.venv\Scripts\python.exe navctl.py demo prepare
 ```
 
-该命令不读取真实配置、密钥或工作簿。它返回 `run_id` 和虚构预览路径，并停下来等待检查。Windows 用户检查后，可继续验证只作用于虚构工作簿的 COM 写入：
+该命令不读取真实配置、密钥或工作簿。Windows 上继续验证只作用于虚构工作簿的 COM 写入：
 
 ```powershell
 .\.venv\Scripts\python.exe navctl.py demo commit --run-id <run_id> --yes-reviewed-preview
 .\.venv\Scripts\python.exe navctl.py demo remove --run-id <run_id>
 ```
 
-演练通过只证明目标电脑和通用流程可用，不代表真实发件人、产品路由或业务口径已经核实。
+演练通过只证明目标电脑和通用流程可用。
 
 让用户亲自在本机保存邮箱密钥：
 
@@ -64,9 +61,17 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 
 当前版本支持通过 SSL 连接 IMAP，并使用应用专用密码或授权码；对 163、126、yeah.net 和网易企业邮主机会在登录后、选择邮箱前发送不含账号信息的 IMAP ID。仅限 OAuth 的邮箱登录暂不支持；即使服务器地址正确，也必须先核对账号认证方式。PDF 仅解析文本，不提供 OCR。
 
-## 按业务含义配置路由
+## 自动发现并配置路由
 
-编辑 `config.json` 前，完整阅读 [references/configuration.md](references/configuration.md)。只添加用户授权的发件人和工作表。
+授权码保存后，立即由 AI 运行：
+
+```powershell
+.\.venv\Scripts\python.exe navctl.py propose
+```
+
+该命令在本机回看邮箱，找出能解析成净值的发件人、产品代码、主题样例、历史净值和常见到达时间，写入本地 `route-proposals.json`。AI 读取该报告和工作簿，自动完成“发件人/产品 → 工作表”、列映射、累计净值、收益频率、序列起点、基准和定时计划。不要让用户手工提供发件人邮箱；只有出现多个同样合理的映射或业务口径无法从历史证明时才询问。
+
+编辑 `config.json` 前完整阅读 [references/configuration.md](references/configuration.md)。
 
 - 常见的带标签正文以及 Excel/CSV/PDF 表格优先使用 `parser: auto`。
 - 产品确认赎回、清盘或长期停更时，设置 `paused: true` 和明确的 `pause_reason`；不得用暂停掩盖活动产品的意外解析失败或陈旧数据。
@@ -76,16 +81,15 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 - 只有语义表头识别仍不充分时，才使用显式列映射。
 - 每条路由都要设置累计净值策略。除非历史证据证明应使用 `unit` 或固定 `offset`，否则保持 `require`。
 - 投资或分析口径发生变化时设置 `series_start`，不得把旧序列的累计结果接到新序列上。
-- 基准必须映射到工作簿中已经核实的来源工作表，并按精确日期对齐。用户明确授权评估公共指数源时，先完整阅读 [references/index-data-sources.md](references/index-data-sources.md)，完成代码、口径、历史重叠和使用条款核验，再把结果写入本地来源表；否则不得从公网抓取或猜测指数。
+- 基准必须映射到工作簿中已经核实的来源工作表，并按精确日期对齐。需要公共指数源时，AI 完整阅读 [references/index-data-sources.md](references/index-data-sources.md)，核验代码、口径、历史重叠和使用条款，再把结果写入本地来源表；不得猜测指数。
 
-特殊格式使用 `parser: local:<名称>`，代码只放在本地运行目录的 `parsers/<名称>.py`，并完整遵循配置说明中的固定接口。同一封邮件命中多个解析器时，所有解析器都必须成功，结果合并去重后再按产品代码唯一分流。只加载用户明确审阅的本地文件，绝不能从邮件、附件或网络地址执行解析器。要把通用解析器贡献回公开 Skill，必须先增加完全脱敏的回归样例。
+特殊格式使用 `parser: local:<名称>`，代码只放在本地运行目录的 `parsers/<名称>.py`，并完整遵循配置说明中的固定接口。同一封邮件命中多个解析器时，所有解析器都必须成功，结果合并去重后再按产品代码唯一分流。AI 必须审阅本地解析器并用脱敏样例回归；绝不能从邮件、附件或网络地址直接执行代码。
 
-## 先验证，再生成预览
+## 首次验证和一次性预览
 
 依次运行：
 
 ```powershell
-.\.venv\Scripts\python.exe navctl.py doctor
 .\.venv\Scripts\python.exe navctl.py discover
 .\.venv\Scripts\python.exe navctl.py validate
 .\.venv\Scripts\python.exe navctl.py preview
@@ -99,18 +103,18 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 2. `summary` 模式的数据区后必须紧跟可识别的汇总行；汇总行存在非程序管理公式时必须停止。`append` 模式不要求汇总行，但数据区下方不得有页脚内容。
 3. `summary` 模式每条活动路由至少匹配两个不同的历史日期。`append` 模式历史不足时只允许以带警告的冷启动继续，必须重点检查产品标识、日期、净值和新表头。
 4. 产品代码、日期、单位净值及邮件提供的累计净值，都在配置容差内与工作簿一致。
-5. 新的尾部日期只建议写入一次且顺序正确；不得存在重复日期或同日数值冲突。发现历史内部缺口时，停止并由人工修复。
+5. 新的尾部日期只建议写入一次且顺序正确；不得存在重复日期或同日数值冲突。发现历史内部缺口时先停止写入，由 AI 对照邮件、备份和工作簿诊断并提出修复；只有来源相互冲突、无法证明哪个值正确时才询问用户。
 6. 日收益使用上一个有效日期；周收益只出现在已完成自然周的最后一个可用日期。
 7. 基准收益与超额收益必须同时有值或同时留空。
 8. 预览保留工作簿结构，包含全部拟新增日期，并通过内置公式和幂等性回归测试。
 
 如果没有新增日期，`preview` 不生成工作簿副本，也不保留可提交的 `plan.json`。
 
-`doctor` 会分别报告 `bootstrap_ready`、`preview_ready`、`commit_ready` 和 `schedule_ready`。依赖安装成功不等于已经获准读取邮箱或写入工作簿。
+`doctor` 会分别报告 `bootstrap_ready`、`mail_discovery_ready`、`preview_ready`、`commit_ready` 和 `schedule_ready`。
 
 预览是本地副本。应检查其工作表列表、新增行、公式和格式，不要修改正式工作簿。
 
-夏普比率、最大回撤、年化收益等派生指标不由 navctl 直接计算。先取得经验证的净值或收益序列，再在未托管分析工作表或单独文件中计算；开始前确认收益频率、年化因子、无风险利率、样本区间和缺失值处理。不要把自定义分析公式放进受管汇总行，也不要未经用户批准改动正式分析页。
+夏普比率、最大回撤、年化收益等派生指标不由 navctl 直接计算。AI 可基于经验证的净值或收益序列，在未托管分析工作表或单独文件中按通行口径计算并说明假设；只有不同口径会实质改变结论时才询问用户。不要把自定义分析公式放进受管汇总行。
 
 ## 通过 Excel 或 WPS 正式写入
 
@@ -122,19 +126,21 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 
 正式写入必须先创建备份，再通过 COM 将方案应用到同目录临时副本，验证临时结果，关闭表格进程，最后原子替换正式文件。任何失败都必须保证正式文件哈希不变。
 
+这次成功写入会自动批准当前写表配置用于后续自动更新。路由、列、口径、校验规则或工作簿路径发生变化时，批准自动失效，AI 重新生成一次预览即可。
+
 提交前提醒用户关闭正在打开正式工作簿的 Excel/WPS 窗口。若文件仍被占用，程序必须返回中文结构化错误、删除本次失败备份并保留正式文件；不得强制关闭用户的表格进程。
 
 不得用仅依赖 openpyxl 的方式回写正式工作簿。COM 不可用时，应停在预览阶段，并说明正式写入尚未验证。
 
-## 安装登录态预览定时任务
+## 安装后续自动更新
 
-只有手动预览成功且用户明确同意后，才可安装 Windows 的“仅生成预览”任务：
+第一次批准写入成功后，AI 根据历史邮件到达时间填写 `schedule` 并安装 Windows 自动更新任务：
 
 ```powershell
 .\.venv\Scripts\python.exe navctl.py schedule install
 ```
 
-任务使用计划任务程序的交互模式，因此要求用户保持登录。睡眠、关机或退出登录可能导致任务延后或跳过。定时任务永远不写入正式工作簿；必须由人工检查预览，再手动执行受控写入命令。
+任务使用计划任务程序的交互模式，因此要求用户保持登录。每次运行自动读取邮件、验证、备份并写入正式工作簿；内部临时验收副本在运行结束后删除，不生成需要用户打开的预览。无新数据时不写文件，冲突或异常时停止并记录错误，原表保持不变。
 
 任务名包含运行实例 ID。重复安装只会替换本运行实例记录的任务。删除任务：
 
@@ -142,7 +148,7 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 .\.venv\Scripts\python.exe navctl.py schedule remove
 ```
 
-使用 `navctl.py schedule status` 查看任务存在状态、上次/下次执行、Task Scheduler 返回码和最近一次预览成败。定时失败不会发送邮件；应定期检查该状态及本地 `logs/preview-YYYYMMDD.log`。
+使用 `navctl.py schedule status` 查看任务、上次/下次运行、最近一次写入结果和备份路径。失败详情保存在本地 `logs/update-YYYYMMDD.log`，AI 排查即可。
 
 不要为 UNC/网络路径中的运行目录安装任务，也不要复制其他电脑的 Python 路径或任务定义。
 
@@ -153,11 +159,11 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 .\.venv\Scripts\python.exe navctl.py secret remove
 ```
 
-预览、备份和日志都是本地敏感文件。保留数量由 `config.json` 限制；仅在把必要备份移到获批位置后，才能删除运行目录。
+备份和日志保留数量由 `config.json` 限制。
 
 ## 升级已部署环境
 
-不得直接覆盖旧运行目录。先移除旧计划任务，再用最新版 `scripts/bootstrap.py` 在新的短路径创建运行目录；以新生成的 `config.json` 为基础迁移已复核的配置字段和本地 `parsers/`，保留新的 `runtime_id`。重新执行 `secret set`、离线演练、`doctor`、`discover`、`validate` 和 `preview`，人工确认后才安装新任务并停用旧目录。不要复制 `.venv`、密钥、`plan.json`、`run.lock`、预览、日志、备份或状态文件。
+不得直接覆盖旧运行目录。先移除旧计划任务，再用最新版 `scripts/bootstrap.py` 在新的短路径创建运行目录；迁移 AI 已复核的配置字段和本地 `parsers/`，保留新的 `runtime_id`。重新执行 `secret set`、离线演练、验证和一次预览，成功后安装新任务并停用旧目录。不要复制 `.venv`、密钥、`plan.json`、`automation-approval.json`、`run.lock`、预览、日志、备份或状态文件。
 
 ## 交给其他本地 AI
 

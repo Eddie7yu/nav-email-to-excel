@@ -50,6 +50,15 @@ def exact_from_matches(message: Message, sender: str) -> bool:
     return addresses == {sender.casefold()}
 
 
+def single_from_address(message: Message) -> str | None:
+    addresses = {
+        address.strip().casefold()
+        for _, address in getaddresses(message.get_all("From", []))
+        if address.strip()
+    }
+    return next(iter(addresses)) if len(addresses) == 1 else None
+
+
 def decoded(value: Any) -> str:
     try:
         return str(make_header(decode_header(str(value or ""))))
@@ -117,20 +126,102 @@ def connect(config: dict[str, Any]) -> imaplib.IMAP4_SSL:
         raise MailError("Could not connect to the configured IMAP mailbox") from exc
 
 
+def _limits(config: dict[str, Any]) -> tuple[int, int, int, int]:
+    imap = config.get("imap") or {}
+    return (
+        int(imap.get("lookback_days", 180)),
+        int(imap.get("max_messages", 2000)),
+        int(imap.get("max_message_bytes", 25 * 1024 * 1024)),
+        int(imap.get("max_total_bytes", 100 * 1024 * 1024)),
+    )
+
+
+def _message_size(client: imaplib.IMAP4_SSL, uid: bytes) -> int:
+    status, size_parts = client.uid("fetch", uid, "(RFC822.SIZE)")
+    if status != "OK":
+        raise MailError("Could not read the size of a mailbox message")
+    metadata = b" ".join(part for part in size_parts if isinstance(part, bytes))
+    match = re.search(rb"RFC822\.SIZE\s+(\d+)", metadata)
+    if not match:
+        raise MailError("The IMAP server did not report a mailbox message size")
+    return int(match.group(1))
+
+
+def _message_payload(client: imaplib.IMAP4_SSL, uid: bytes) -> Message:
+    status, parts = client.uid("fetch", uid, "(BODY.PEEK[])")
+    if status != "OK":
+        raise MailError("Could not fetch a mailbox message")
+    payload = next(
+        (
+            item[1]
+            for item in parts
+            if isinstance(item, tuple) and isinstance(item[1], bytes)
+        ),
+        None,
+    )
+    if not payload:
+        raise MailError("A mailbox message had no readable payload")
+    return BytesParser(policy=default).parsebytes(payload)
+
+
+def _close(client: imaplib.IMAP4_SSL) -> None:
+    try:
+        client.close()
+    except (imaplib.IMAP4.error, OSError):
+        pass
+    try:
+        client.logout()
+    except (imaplib.IMAP4.error, OSError):
+        pass
+
+
+def fetch_candidate_messages(
+    config: dict[str, Any],
+) -> tuple[list[Message], dict[str, Any]]:
+    lookback, max_messages, max_message_bytes, max_total_bytes = _limits(config)
+    since = imap_date(dt.date.today() - dt.timedelta(days=lookback))
+    client = connect(config)
+    messages: list[Message] = []
+    total_bytes = 0
+    skipped_oversize = 0
+    truncated = False
+    found = 0
+    try:
+        status, data = client.uid("search", None, f"(SINCE {since})")
+        if status != "OK":
+            raise MailError("IMAP search failed while discovering NAV senders")
+        all_uids = (data[0] or b"").split()
+        found = len(all_uids)
+        if len(all_uids) > max_messages:
+            truncated = True
+        for uid in reversed(all_uids[-max_messages:]):
+            size = _message_size(client, uid)
+            if size > max_message_bytes:
+                skipped_oversize += 1
+                continue
+            if total_bytes + size > max_total_bytes:
+                truncated = True
+                break
+            messages.append(_message_payload(client, uid))
+            total_bytes += size
+    finally:
+        _close(client)
+    return messages, {
+        "messages_found": found,
+        "messages_fetched": len(messages),
+        "bytes_fetched": total_bytes,
+        "skipped_oversize": skipped_oversize,
+        "truncated": truncated,
+    }
+
+
 def fetch_authorized_messages(config: dict[str, Any]) -> dict[str, list[Message]]:
     senders = sorted(
         {str(route["sender"]).strip().lower() for route in active_routes(config)}
     )
     if not senders:
         return {}
-    lookback = int((config.get("imap") or {}).get("lookback_days", 180))
-    max_messages = int((config.get("imap") or {}).get("max_messages", 2000))
-    max_message_bytes = int(
-        (config.get("imap") or {}).get("max_message_bytes", 25 * 1024 * 1024)
-    )
-    max_total_bytes = int(
-        (config.get("imap") or {}).get("max_total_bytes", 100 * 1024 * 1024)
-    )
+    lookback, max_messages, max_message_bytes, max_total_bytes = _limits(config)
     since = imap_date(dt.date.today() - dt.timedelta(days=lookback))
     client = connect(config)
     output: dict[str, list[Message]] = {sender: [] for sender in senders}
@@ -148,18 +239,7 @@ def fetch_authorized_messages(config: dict[str, Any]) -> dict[str, list[Message]
                     "Authorized-message count exceeds imap.max_messages; narrow the lookback window"
                 )
             for uid in uids:
-                status, size_parts = client.uid("fetch", uid, "(RFC822.SIZE)")
-                if status != "OK":
-                    raise MailError("Could not read the size of an authorized message")
-                metadata = b" ".join(
-                    part for part in size_parts if isinstance(part, bytes)
-                )
-                match = re.search(rb"RFC822\.SIZE\s+(\d+)", metadata)
-                if not match:
-                    raise MailError(
-                        "The IMAP server did not report an authorized message size"
-                    )
-                size = int(match.group(1))
+                size = _message_size(client, uid)
                 if size > max_message_bytes:
                     raise MailError(
                         "An authorized message exceeds imap.max_message_bytes"
@@ -168,20 +248,7 @@ def fetch_authorized_messages(config: dict[str, Any]) -> dict[str, list[Message]
                     raise MailError(
                         "Authorized messages exceed imap.max_total_bytes; narrow the lookback window"
                     )
-                status, parts = client.uid("fetch", uid, "(BODY.PEEK[])")
-                if status != "OK":
-                    raise MailError("Could not fetch an authorized message")
-                payload = next(
-                    (
-                        item[1]
-                        for item in parts
-                        if isinstance(item, tuple) and isinstance(item[1], bytes)
-                    ),
-                    None,
-                )
-                if not payload:
-                    raise MailError("An authorized message had no readable payload")
-                message = BytesParser(policy=default).parsebytes(payload)
+                message = _message_payload(client, uid)
                 if not exact_from_matches(message, sender):
                     raise MailError(
                         "An IMAP sender-search result did not have the exact authorized From address"
@@ -190,12 +257,5 @@ def fetch_authorized_messages(config: dict[str, Any]) -> dict[str, list[Message]
                 message_count += 1
                 total_bytes += size
     finally:
-        try:
-            client.close()
-        except imaplib.IMAP4.error:
-            pass
-        try:
-            client.logout()
-        except imaplib.IMAP4.error:
-            pass
+        _close(client)
     return output

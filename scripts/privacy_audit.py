@@ -40,6 +40,8 @@ DENIED_NAMES = {
     "route-report.json",
     "validation-report.json",
     "plan.json",
+    "route-proposals.json",
+    "automation-approval.json",
     "scheduled_tasks.json",
     "last-scheduled-run.json",
     "run.lock",

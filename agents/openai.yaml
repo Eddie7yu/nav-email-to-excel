@@ -1,4 +1,4 @@
 interface:
   display_name: "净值邮件写入 Excel"
-  short_description: "安全部署、初始化并维护净值邮件到 Excel 的自动化流程"
-  default_prompt: "请使用 $nav-email-to-excel，为我的工作簿配置并验证一套预览优先的净值邮件自动化；根据实际表结构明确选择严格汇总或简单追加模式。"
+  short_description: "授权一次，由 AI 自动发现、配置并持续更新净值表"
+  default_prompt: "请使用 $nav-email-to-excel，为我的工作簿部署净值邮件自动化；不要让我手工整理发件人，第一次给我验收，之后自动备份写入。"

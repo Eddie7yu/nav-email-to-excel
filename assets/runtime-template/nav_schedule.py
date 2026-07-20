@@ -6,6 +6,7 @@ import os
 import subprocess
 from typing import Any
 
+from nav_automation import require_approved
 from nav_config import ROOT, write_json_atomic
 
 
@@ -72,15 +73,16 @@ def install(config: dict[str, Any]) -> dict[str, Any]:
         raise ScheduleError("Windows Task Scheduler is required")
     if str(ROOT.resolve()).startswith("\\\\"):
         raise ScheduleError("Scheduled runtimes must use a local path, not UNC")
+    require_approved(config)
     schedules = config.get("schedule") or []
     if not schedules:
         raise ScheduleError("config.schedule is empty")
     previous = [str(name) for name in _state().get("tasks") or []]
-    wrapper = ROOT / "run-preview.cmd"
+    wrapper = ROOT / "run-update.cmd"
     if not wrapper.is_file():
-        raise ScheduleError("run-preview.cmd is missing")
+        raise ScheduleError("run-update.cmd is missing")
     generation = dt.datetime.now().strftime("%Y%m%d%H%M%S")
-    prefix = f"NAV-{str(config['runtime_id'])[:8]}-{generation}"
+    prefix = f"NAV-AUTO-{str(config['runtime_id'])[:8]}-{generation}"
     created: list[str] = []
     try:
         for index, item in enumerate(schedules, 1):
@@ -123,12 +125,12 @@ def install(config: dict[str, Any]) -> dict[str, Any]:
     except ScheduleError:
         write_json_atomic(STATE, {"tasks": list(dict.fromkeys(previous + created))})
         raise ScheduleError(
-            "New preview tasks were created, but old tasks could not all be removed; combined state was preserved"
+            "New automatic-update tasks were created, but old tasks could not all be removed; combined state was preserved"
         )
-    write_json_atomic(STATE, {"tasks": created})
+    write_json_atomic(STATE, {"tasks": created, "mode": "automatic-update"})
     return {
         "created": created,
-        "mode": "preview-only",
+        "mode": "automatic-update-with-backup",
         "requires_logged_in_session": True,
     }
 
@@ -136,7 +138,12 @@ def install(config: dict[str, Any]) -> dict[str, Any]:
 def status() -> dict[str, Any]:
     names = [str(name) for name in _state().get("tasks") or []]
     if os.name != "nt":
-        return {"tasks": names, "available": False, "last_run": _last_run()}
+        return {
+            "tasks": names,
+            "available": False,
+            "last_run": _last_run(),
+            "mode": _state().get("mode"),
+        }
     service = None
     folder = None
     try:
@@ -180,7 +187,12 @@ def status() -> dict[str, Any]:
             text=True,
         )
         results.append({"name": name, "exists": result.returncode == 0})
-    return {"tasks": results, "available": True, "last_run": _last_run()}
+    return {
+        "tasks": results,
+        "available": True,
+        "last_run": _last_run(),
+        "mode": _state().get("mode"),
+    }
 
 
 def _task_time(value: Any) -> str | None:
