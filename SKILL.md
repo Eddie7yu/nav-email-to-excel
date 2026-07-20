@@ -17,7 +17,12 @@ description: 部署、配置、验证、运行或修复本地 IMAP 邮箱到 Exc
 
 ## 创建本地运行目录
 
-只收集目标目录、工作簿路径、IMAP 账号、服务器和邮箱文件夹，然后在 Skill 根目录运行：
+只收集目标目录、工作簿路径、IMAP 账号、服务器和邮箱文件夹。用户不知道准确服务器
+或认证方式时，先完整阅读 [references/email-providers.md](references/email-providers.md)，
+按“现有客户端 → 管理员 → 服务商官方文档”的顺序核验。不得仅凭邮箱后缀、MX 记录
+或 `imap.<公司域名>` 猜测；无法确认时必须停止并请用户或 IT 提供设置。
+
+确认后在 Skill 根目录运行：
 
 ```powershell
 python scripts/bootstrap.py --destination "D:\nav-runtime" --workbook "D:\data\nav.xlsx" --email "user@example.com" --imap-host "imap.example.com"
@@ -57,7 +62,7 @@ cd /opt/nav-runtime
 read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PASSWORD && printf '\n'
 ```
 
-当前版本支持通过 SSL 连接 IMAP，并使用应用专用密码或授权码；对 163、126、yeah.net 和网易企业邮主机会在登录后、选择邮箱前发送不含账号信息的 IMAP ID。暂不支持仅限 OAuth 的邮箱登录。PDF 仅解析文本，不提供 OCR。
+当前版本支持通过 SSL 连接 IMAP，并使用应用专用密码或授权码；对 163、126、yeah.net 和网易企业邮主机会在登录后、选择邮箱前发送不含账号信息的 IMAP ID。仅限 OAuth 的邮箱登录暂不支持；即使服务器地址正确，也必须先核对账号认证方式。PDF 仅解析文本，不提供 OCR。
 
 ## 按业务含义配置路由
 

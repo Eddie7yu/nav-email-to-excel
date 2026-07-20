@@ -32,7 +32,7 @@
 
 ## 适用范围与限制
 
-- 邮箱：IMAP over SSL，使用应用专用密码或授权码；支持标准 IMAP，以及需要登录后发送 ID 的 163、126、yeah.net 和网易企业邮主机；暂不支持仅限 OAuth 的登录。
+- 邮箱：IMAP over SSL，使用应用专用密码或授权码；支持标准 IMAP，以及需要登录后发送 ID 的 163、126、yeah.net 和网易企业邮主机；暂不支持仅限 OAuth 的登录。常见服务商地址、认证限制和核验方法见 [IMAP 服务商参考](references/email-providers.md)。
 - 附件：Excel、CSV 和文本型 PDF；扫描 PDF 暂不提供 OCR。
 - 预览：Windows、Linux、macOS 均可运行 Python 流程；持续集成覆盖 Windows、Linux，并对 macOS 做预览 smoke test。
 - 正式写入：仅支持 Windows，并要求 Microsoft Excel 或 WPS 表格的 COM 接口可用。
@@ -89,7 +89,7 @@ Get-Content -Raw -Encoding utf8 SKILL.md
 ## 首次部署大致流程
 
 1. AI 完整阅读 [SKILL.md](SKILL.md) 和[配置说明](references/configuration.md)。
-2. 用户只提供本机目标目录、工作簿路径、邮箱账号、IMAP 服务器和邮箱文件夹。
+2. 用户提供本机目标目录、工作簿路径、邮箱账号、IMAP 服务器和邮箱文件夹；不知道服务器时，AI 按 [IMAP 服务商参考](references/email-providers.md) 核验，不能凭邮箱后缀猜测。
 3. 运行 `scripts/bootstrap.py`，创建独立运行目录和锁定依赖的虚拟环境。
 4. 运行 `navctl.py demo prepare`；Windows 可继续完成虚构 COM 写入演练。
 5. 用户亲自在本机运行 `navctl.py secret set`，隐藏输入邮箱授权码。
