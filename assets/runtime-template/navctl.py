@@ -195,6 +195,7 @@ def command_preview(config: dict[str, Any], _args: argparse.Namespace) -> int:
     emit(
         {
             "preview_path": plan["preview_path"],
+            "warnings": plan.get("warnings") or [],
             "sheets": [
                 {"sheet": item["sheet"], "new_dates": item["new_dates"]}
                 for item in plan["sheets"]
@@ -216,6 +217,7 @@ def command_scheduled_preview(config: dict[str, Any], args: argparse.Namespace) 
         "plan_id": plan["plan_id"],
         "sheets": len(plan["sheets"]),
         "new_rows": sum(len(item["new_dates"]) for item in plan["sheets"]),
+        "warnings": plan.get("warnings") or [],
     }
     record_scheduled_run_safely(payload)
     emit(payload)

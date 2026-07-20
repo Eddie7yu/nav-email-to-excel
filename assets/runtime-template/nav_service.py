@@ -265,13 +265,16 @@ def preview(
 ) -> dict[str, Any]:
     # A failed preview must never leave an older commit plan looking current.
     (ROOT / "plan.json").unlink(missing_ok=True)
+    warnings: list[str] = []
     if rows is None:
         rows, discovery = collect_route_rows(config)
         if not discovery["passed"]:
             raise RuntimeError("Discovery failed; inspect route-report.json")
+        warnings.extend(discovery.get("warnings") or [])
     validation = validate_history(config, rows)
     if not validation["passed"]:
         raise RuntimeError(
             "Historical validation failed; inspect validation-report.json"
         )
-    return build_preview(config, rows)
+    warnings.extend(validation.get("warnings") or [])
+    return build_preview(config, rows, warnings)

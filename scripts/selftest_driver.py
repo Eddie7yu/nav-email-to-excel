@@ -468,6 +468,7 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     from nav_commit import CommitError, _process_id, commit, ensure_process_exit
     from nav_config import ConfigError, load_config, validate_config
     from nav_parse import NavRow
+    from nav_service import preview as service_preview
     from nav_workbook import WorkbookError, build_preview, validate_history
 
     book = runtime / "脱敏 示例.xlsx"
@@ -497,6 +498,26 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     paused_config["routes"][0]["paused"] = True
     paused_config["routes"][0]["pause_reason"] = "fixture pause"
     validate_config(paused_config)
+    invalid_append = json.loads(json.dumps(config))
+    invalid_append["routes"][0].update(
+        {"sheet_mode": "append", "code": None, "product_name": None}
+    )
+    try:
+        validate_config(invalid_append)
+    except ConfigError:
+        pass
+    else:
+        raise AssertionError("append mode accepted a route without product identity")
+    invalid_formula_name = json.loads(json.dumps(config))
+    invalid_formula_name["routes"][0]["product_name"] = (
+        '=HYPERLINK("https://example.invalid")'
+    )
+    try:
+        validate_config(invalid_formula_name)
+    except ConfigError:
+        pass
+    else:
+        raise AssertionError("route accepted a formula-like product name")
     (runtime / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -752,6 +773,176 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         plain_plan["sheets"][0]["new_dates"] == ["2026-01-16"],
         "workbook without a return column could not produce a preview",
     )
+
+    header_book = runtime / "append-header-only.xlsx"
+    header_workbook = openpyxl.Workbook()
+    header_sheet = header_workbook.active
+    header_sheet.title = "Header Fund"
+    header_sheet.append(["净值日期", "产品名称", "单位净值"])
+    header_workbook.save(header_book)
+    header_workbook.close()
+    header_config = config_for(runtime, header_book)
+    header_config["routes"][0].update(
+        {
+            "sheet": "Header Fund",
+            "sheet_mode": "append",
+            "code": None,
+            "product_name": "Example Name Only Fund",
+            "benchmark": None,
+            "return_basis": "unit",
+        }
+    )
+    header_config["column_overrides"] = {}
+    header_rows = {
+        "Header Fund": [NavRow(dt.date(2026, 1, 2), 1.0, None, None, "fixture")]
+    }
+    header_validation = validate_history(header_config, header_rows)
+    check(
+        header_validation["passed"] and header_validation["warnings"],
+        "name-only header sheet could not enter append cold start",
+    )
+    header_plan = build_preview(
+        header_config, header_rows, header_validation["warnings"]
+    )
+    header_preview = openpyxl.load_workbook(
+        header_plan["preview_path"], data_only=False
+    )
+    try:
+        check(
+            header_preview["Header Fund"]["B2"].value == "Example Name Only Fund"
+            and header_preview["Header Fund"]["C2"].value == 1.0,
+            "name-only header sheet did not receive the minimum record",
+        )
+    finally:
+        header_preview.close()
+
+    append_book = runtime / "append-cold-start.xlsx"
+    append_workbook = openpyxl.Workbook()
+    append_sheet = append_workbook.active
+    append_sheet.title = "New Fund"
+    analysis_sheet = append_workbook.create_sheet("Analysis")
+    analysis_sheet["A1"] = "Example metric"
+    analysis_sheet["B1"] = "=MAX('New Fund'!D:D)"
+    append_workbook.save(append_book)
+    append_workbook.close()
+    append_config = config_for(runtime, append_book)
+    append_config["routes"][0].update(
+        {
+            "sheet": "New Fund",
+            "sheet_mode": "append",
+            "code": "NEW01",
+            "product_name": "Example New Fund",
+            "benchmark": None,
+            "cumulative_policy": "unit",
+            "return_basis": "unit",
+        }
+    )
+    append_config["column_overrides"] = {}
+    validate_config(append_config)
+    append_rows = {
+        "New Fund": [
+            NavRow(dt.date(2026, 1, 2), 1.0, None, "NEW01", "fixture"),
+            NavRow(dt.date(2026, 1, 9), 1.01, None, "NEW01", "fixture"),
+        ]
+    }
+    append_validation = validate_history(append_config, append_rows)
+    check(
+        append_validation["passed"]
+        and append_validation["warnings"]
+        and append_validation["routes"][0]["cold_start"],
+        "append cold start did not downgrade missing history to a visible warning",
+    )
+    append_plan = service_preview(append_config, append_rows)
+    check(
+        append_plan["sheets"][0]["sheet_mode"] == "append"
+        and append_plan["sheets"][0]["new_dates"] == ["2026-01-02", "2026-01-09"],
+        "append cold start plan is incomplete",
+    )
+    check(
+        append_plan["warnings"],
+        "append cold start warning was not preserved in the preview plan",
+    )
+    append_preview = openpyxl.load_workbook(
+        append_plan["preview_path"], data_only=False
+    )
+    try:
+        new_sheet = append_preview["New Fund"]
+        check(
+            [new_sheet.cell(1, column).value for column in range(1, 6)]
+            == ["净值日期", "产品代码", "产品名称", "单位净值", "累计单位净值"],
+            "blank append sheet did not receive canonical headers",
+        )
+        check(
+            new_sheet["B2"].value == "NEW01"
+            and new_sheet["C2"].value == "Example New Fund"
+            and new_sheet["D3"].value == 1.01
+            and new_sheet["E3"].value == 1.01,
+            "append preview did not write product identity and NAV values",
+        )
+        check(
+            new_sheet["A4"].value is None
+            and append_preview["Analysis"]["B1"].value == "=MAX('New Fund'!D:D)",
+            "append preview added a summary row or changed an analysis sheet",
+        )
+    finally:
+        append_preview.close()
+    if use_com:
+        append_result = commit(append_config)
+        application = str(append_result["application"])
+        check(
+            append_result["changed"] and append_result["rows"] == 2,
+            "COM append commit did not apply both cold-start rows",
+        )
+    else:
+        shutil.copy2(append_plan["preview_path"], append_book)
+    committed_append = openpyxl.load_workbook(append_book, data_only=False)
+    try:
+        check(
+            committed_append["New Fund"]["A4"].value is None
+            and committed_append["Analysis"]["B1"].value == "=MAX('New Fund'!D:D)",
+            "append commit added a summary row or changed the analysis sheet",
+        )
+    finally:
+        committed_append.close()
+    append_second_validation = validate_history(append_config, append_rows)
+    check(
+        append_second_validation["passed"] and not append_second_validation["warnings"],
+        "append mode did not leave a verifiable history after first commit",
+    )
+    append_second = build_preview(append_config, append_rows)
+    check(
+        not append_second["sheets"] and append_second["preview_path"] is None,
+        "append mode is not idempotent after first commit",
+    )
+    append_rows["New Fund"].append(
+        NavRow(dt.date(2026, 1, 16), 1.02, None, "NEW01", "fixture")
+    )
+    append_next_validation = validate_history(append_config, append_rows)
+    check(
+        append_next_validation["passed"] and not append_next_validation["warnings"],
+        "existing append table did not validate before a later update",
+    )
+    append_next = build_preview(append_config, append_rows)
+    check(
+        append_next["sheets"][0]["new_dates"] == ["2026-01-16"]
+        and append_next["sheets"][0]["copy_template_rows"],
+        "existing append table did not plan exactly one later date",
+    )
+    if use_com:
+        append_next_result = commit(append_config)
+        application = str(append_next_result["application"])
+    else:
+        shutil.copy2(append_next["preview_path"], append_book)
+    append_updated = openpyxl.load_workbook(append_book, data_only=False)
+    try:
+        check(
+            append_updated["New Fund"]["D4"].value == 1.02
+            and append_updated["New Fund"]["A5"].value is None
+            and append_updated["Analysis"]["B1"].value == "=MAX('New Fund'!D:D)",
+            "later append update added a footer or changed the analysis sheet",
+        )
+    finally:
+        append_updated.close()
     return application
 
 
@@ -770,7 +961,7 @@ def main() -> int:
     print("[3/4] 检查崩溃恢复和并发运行锁")
     lock_tests(runtime)
     print("      PASS")
-    print("[4/4] 检查历史核验、汇总公式、补录、基准和幂等性")
+    print("[4/4] 检查严格表、空表冷启动、分析页保留、补录、基准和幂等性")
     application = workbook_tests(runtime, args.com)
     print("      PASS")
     if args.com:

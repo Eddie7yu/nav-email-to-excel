@@ -198,9 +198,24 @@ def _apply_plan_with_com(
                 target.Rows(f"{insert_before}:{insert_before + count - 1}").Insert(
                     -4121
                 )
-                for row in range(insert_before, insert_before + count):
-                    target.Rows(insert_before - 1).Copy(Destination=target.Rows(row))
+                if bool(sheet_plan.get("copy_template_rows", True)):
+                    for row in range(insert_before, insert_before + count):
+                        target.Rows(insert_before - 1).Copy(
+                            Destination=target.Rows(row)
+                        )
             max_column = int(source.UsedRange.Columns.Count)
+            for row in sheet_plan.get("format_rows") or []:
+                row = int(row)
+                source_range = source.Range(
+                    source.Cells(row, 1), source.Cells(row, max_column)
+                )
+                target_range = target.Range(
+                    target.Cells(row, 1), target.Cells(row, max_column)
+                )
+                source_range.Copy()
+                target_range.PasteSpecial(Paste=-4122)
+                target.Rows(row).RowHeight = source.Rows(row).RowHeight
+                app.CutCopyMode = False
             for row in sheet_plan["new_rows"]:
                 for column in range(1, max_column + 1):
                     _copy_value(
@@ -281,6 +296,13 @@ def _same_cell(left: Any, right: Any) -> bool:
     return left == right
 
 
+def _same_number_format(left: str, right: str) -> bool:
+    def normalized(value: str) -> str:
+        return str(value).replace("\\-", "-").replace("\\/", "/")
+
+    return normalized(left) == normalized(right)
+
+
 def _verify_temp(temp: Path, preview: Path, plan: dict[str, Any]) -> None:
     keep_vba = temp.suffix.lower() == ".xlsm"
     target = openpyxl.load_workbook(temp, data_only=False, keep_vba=keep_vba)
@@ -314,6 +336,19 @@ def _verify_temp(temp: Path, preview: Path, plan: dict[str, Any]) -> None:
                             raise CommitError(
                                 f"COM calculation failed at {name}!{target[name].cell(row, column).coordinate}"
                             )
+            for row in (int(value) for value in sheet_plan.get("format_rows") or []):
+                for column in range(1, expected[name].max_column + 1):
+                    target_cell = target[name].cell(row, column)
+                    expected_cell = expected[name].cell(row, column)
+                    if (
+                        not _same_number_format(
+                            target_cell.number_format, expected_cell.number_format
+                        )
+                        or target_cell.font.bold != expected_cell.font.bold
+                    ):
+                        raise CommitError(
+                            f"COM format verification failed at {name}!{target_cell.coordinate}"
+                        )
     finally:
         target.close()
         expected.close()
@@ -366,21 +401,31 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
             "The reviewed preview is missing or changed; regenerate the preview"
         )
     allowed_sheets = {str(route["sheet"]) for route in active_routes(config)}
+    allowed_modes = {
+        str(route["sheet"]): str(route.get("sheet_mode", "summary"))
+        for route in active_routes(config)
+    }
     planned_sheets = {str(item.get("sheet") or "") for item in plan["sheets"]}
     if not planned_sheets or not planned_sheets <= allowed_sheets:
         raise CommitError(
             "The plan contains a sheet not authorized by the current configuration"
         )
     for item in plan["sheets"]:
+        sheet_name = str(item.get("sheet") or "")
+        if str(item.get("sheet_mode", "summary")) != allowed_modes.get(sheet_name):
+            raise CommitError("The plan sheet mode does not match the configuration")
         try:
+            header_row = int(item["header_row"])
             insert_before = int(item["insert_before"])
             insert_count = int(item["insert_count"])
             summary_row = int(item["summary_row"])
             new_rows = [int(row) for row in item["new_rows"]]
+            format_rows = [int(row) for row in item.get("format_rows") or []]
         except (KeyError, TypeError, ValueError) as exc:
             raise CommitError("The plan row structure is invalid") from exc
         if (
-            insert_before < 2
+            header_row < 1
+            or insert_before <= header_row
             or insert_count < 1
             or new_rows != list(range(insert_before, insert_before + insert_count))
         ):
@@ -390,6 +435,10 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
             or len(item.get("new_dates") or []) != insert_count
         ):
             raise CommitError("The plan summary row or new-date count is invalid")
+        if not set(format_rows) <= {*new_rows, header_row}:
+            raise CommitError("The plan format range is invalid")
+        if not isinstance(item.get("copy_template_rows", True), bool):
+            raise CommitError("The plan template-copy flag is invalid")
     validate_preview(config, plan)
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     backup_dir = ROOT / "backups"

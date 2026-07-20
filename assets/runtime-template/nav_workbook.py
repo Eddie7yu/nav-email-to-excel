@@ -29,6 +29,7 @@ HEADER_WORDS = {
     "benchmark_return": ("指数收益", "基准收益", "benchmark return", "index return"),
     "excess": ("超额", "excess", "alpha"),
 }
+APPEND_HEADER_LABELS = {field: words[0] for field, words in HEADER_WORDS.items()}
 TOTAL_WORDS = {"累计", "合计", "total", "cumulative"}
 
 
@@ -44,6 +45,8 @@ class Layout:
     summary_row: int
     last_data_row: int
     columns: dict[str, int]
+    mode: str = "summary"
+    headers_to_write: dict[int, str] | None = None
 
 
 def _norm(value: Any) -> str:
@@ -84,13 +87,89 @@ def _column(value: Any) -> int:
     raise WorkbookError(f"Invalid column override: {value!r}")
 
 
+def _has_values(
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    start_row: int = 1,
+    end_row: int | None = None,
+) -> bool:
+    end = sheet.max_row if end_row is None else end_row
+    for row in range(start_row, end + 1):
+        for column in range(1, sheet.max_column + 1):
+            value = sheet.cell(row, column).value
+            if value is not None and value != "":
+                return True
+    return False
+
+
+def _append_columns(route: dict[str, Any], override: dict[str, Any]) -> dict[str, int]:
+    explicit = {
+        field: _column(override[field]) for field in HEADER_WORDS if field in override
+    }
+    if explicit:
+        return explicit
+    fields = ["date"]
+    if normalize_code(route.get("code")):
+        fields.append("code")
+    if str(route.get("product_name") or "").strip():
+        fields.append("name")
+    fields.extend(("unit", "cumulative"))
+    if route.get("benchmark"):
+        fields.append("return")
+        if str(route["benchmark"].get("source_type", "level")) == "level":
+            fields.append("benchmark_level")
+        fields.extend(("benchmark_return", "excess"))
+    return {field: index for index, field in enumerate(fields, 1)}
+
+
+def _require_append_identity(
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    columns: dict[str, int],
+    route: dict[str, Any],
+) -> None:
+    code_identity = bool(columns.get("code") and normalize_code(route.get("code")))
+    name_identity = bool(
+        columns.get("name") and str(route.get("product_name") or "").strip()
+    )
+    if not code_identity and not name_identity:
+        raise WorkbookError(
+            f"{sheet.title}: append mode needs a writable product code or product name column"
+        )
+
+
 def discover_layout(
     sheet: openpyxl.worksheet.worksheet.Worksheet,
     override: dict[str, Any] | None = None,
+    route: dict[str, Any] | None = None,
 ) -> Layout:
     override = override or {}
+    route = route or {}
+    mode = str(route.get("sheet_mode", "summary"))
+    if mode not in {"summary", "append"}:
+        raise WorkbookError(f"{sheet.title}: unsupported sheet mode {mode}")
     header_row = int(override.get("header_row") or 0)
     columns: dict[str, int] = {}
+    sheet_is_blank = not _has_values(sheet)
+    if mode == "append" and sheet_is_blank:
+        header_row = header_row or 1
+        columns = _append_columns(route, override)
+        if not {"date", "unit"} <= columns.keys():
+            raise WorkbookError(
+                f"{sheet.title}: append mode requires explicit date and unit NAV columns"
+            )
+        _require_append_identity(sheet, columns, route)
+        headers = {
+            column: APPEND_HEADER_LABELS[field] for field, column in columns.items()
+        }
+        return Layout(
+            sheet.title,
+            header_row,
+            header_row + 1,
+            header_row + 1,
+            header_row,
+            columns,
+            mode,
+            headers,
+        )
     if header_row:
         for field in HEADER_WORDS:
             if field in override:
@@ -117,13 +196,51 @@ def discover_layout(
             f"{sheet.title}: date and unit NAV columns are not unambiguous"
         )
     data_start = header_row + 1
+    headers_to_write: dict[int, str] = {}
+    if mode == "append":
+        _require_append_identity(sheet, columns, route)
+        headers_to_write = {
+            column: APPEND_HEADER_LABELS[field]
+            for field, column in columns.items()
+            if sheet.cell(header_row, column).value in {None, ""}
+        }
     dated_rows: list[int] = []
     for row in range(data_start, sheet.max_row + 1):
         if parse_date(sheet.cell(row, columns["date"]).value):
             dated_rows.append(row)
     if not dated_rows:
-        raise WorkbookError(f"{sheet.title}: no dated NAV rows found")
+        if mode == "summary":
+            raise WorkbookError(f"{sheet.title}: no dated NAV rows found")
+        if _has_values(sheet, data_start):
+            raise WorkbookError(
+                f"{sheet.title}: append mode found content below the header but no dated NAV rows"
+            )
+        return Layout(
+            sheet.title,
+            header_row,
+            data_start,
+            data_start,
+            header_row,
+            columns,
+            mode,
+            headers_to_write,
+        )
     last_data_row = max(dated_rows)
+    if mode == "append":
+        if _has_values(sheet, last_data_row + 1):
+            raise WorkbookError(
+                f"{sheet.title}: append mode requires no footer content below the last dated row"
+            )
+        return Layout(
+            sheet.title,
+            header_row,
+            data_start,
+            last_data_row + 1,
+            last_data_row,
+            columns,
+            mode,
+            headers_to_write,
+        )
     summary_row = 0
     for row in range(last_data_row + 1, sheet.max_row + 2):
         values = {
@@ -140,7 +257,14 @@ def discover_layout(
             f"{sheet.title}: summary row must immediately follow the last dated row"
         )
     return Layout(
-        sheet.title, header_row, data_start, summary_row, last_data_row, columns
+        sheet.title,
+        header_row,
+        data_start,
+        summary_row,
+        last_data_row,
+        columns,
+        mode,
+        headers_to_write,
     )
 
 
@@ -201,6 +325,7 @@ def validate_history(
     )
     reports: list[dict[str, Any]] = []
     errors: list[str] = []
+    warnings: list[str] = []
     try:
         for route in active_routes(config):
             sheet_name = str(route["sheet"])
@@ -210,6 +335,7 @@ def validate_history(
             layout = discover_layout(
                 workbook[sheet_name],
                 (config.get("column_overrides") or {}).get(sheet_name),
+                route,
             )
             existing = existing_rows(workbook[sheet_name], layout)
             matches = 0
@@ -259,13 +385,13 @@ def validate_history(
                 if candidate.date < start or candidate.date not in existing:
                     continue
                 observed = existing[candidate.date]
-                expected_cumulative = effective_cumulative(candidate, route)
                 unit_ok = (
                     observed["unit"] is not None
                     and abs(float(observed["unit"]) - candidate.unit) <= tolerance
                 )
                 cumulative_ok = True
                 if layout.columns.get("cumulative"):
+                    expected_cumulative = effective_cumulative(candidate, route)
                     cumulative_ok = (
                         observed["cumulative"] is not None
                         and abs(float(observed["cumulative"]) - expected_cumulative)
@@ -284,19 +410,30 @@ def validate_history(
                         f"{sheet_name}: historical value conflict on {candidate.date.isoformat()}"
                     )
             if matches < minimum:
-                errors.append(
-                    f"{sheet_name}: only {matches} verified historical dates; {minimum} required"
-                )
+                message = f"{sheet_name}: only {matches} verified historical dates; {minimum} required"
+                if layout.mode == "append":
+                    warnings.append(
+                        f"{message}; append-mode cold start requires review"
+                    )
+                else:
+                    errors.append(message)
             reports.append(
                 {
                     "sheet": sheet_name,
+                    "sheet_mode": layout.mode,
+                    "cold_start": layout.mode == "append" and matches < minimum,
                     "matched_history_dates": matches,
                     "conflicts": conflicts,
                 }
             )
     finally:
         workbook.close()
-    report = {"passed": not errors, "routes": reports, "errors": errors}
+    report = {
+        "passed": not errors,
+        "routes": reports,
+        "warnings": warnings,
+        "errors": errors,
+    }
     write_json_atomic(ROOT / "validation-report.json", report)
     return report
 
@@ -350,6 +487,7 @@ def _set_return_formulas(
     summary_row: int,
     new_rows: set[int],
     changed: set[tuple[int, int]],
+    write_summary: bool = True,
 ) -> tuple[list[int], set[int]]:
     return_column = layout.columns.get("return")
     if not return_column:
@@ -418,13 +556,14 @@ def _set_return_formulas(
                 if sheet.cell(row, return_column).value != value:
                     sheet.cell(row, return_column).value = value
                     changed.add((row, return_column))
-    summary_value = None
-    if frequency == "daily" and period_rows:
-        summary_value = f"={letter}{period_rows[-1]}/{letter}{period_rows[0]}-1"
-    elif frequency == "weekly" and period_rows:
-        summary_value = f"={letter}{period_rows[-1]}/{letter}{period_rows[0]}-1"
-    sheet.cell(summary_row, return_column).value = summary_value
-    changed.add((summary_row, return_column))
+    if write_summary:
+        summary_value = None
+        if frequency == "daily" and period_rows:
+            summary_value = f"={letter}{period_rows[-1]}/{letter}{period_rows[0]}-1"
+        elif frequency == "weekly" and period_rows:
+            summary_value = f"={letter}{period_rows[-1]}/{letter}{period_rows[0]}-1"
+        sheet.cell(summary_row, return_column).value = summary_value
+        changed.add((summary_row, return_column))
     return period_rows, affected_rows
 
 
@@ -469,6 +608,7 @@ def _set_benchmark_formulas(
     period_rows: list[int],
     affected_rows: set[int],
     changed: set[tuple[int, int]],
+    write_summary: bool = True,
 ) -> None:
     benchmark = route.get("benchmark")
     if not benchmark:
@@ -557,6 +697,8 @@ def _set_benchmark_formulas(
             ).value = f"={get_column_letter(product_return)}{row}-{get_column_letter(target_return)}{row}"
             changed.add((row, excess))
 
+    if not write_summary:
+        return
     if source_type == "level" and period_rows:
         first_date, last_date = by_row[period_rows[0]], by_row[period_rows[-1]]
         first_source, last_source = (
@@ -605,7 +747,9 @@ def _ensure_summary_formula_safety(
 
 
 def build_preview(
-    config: dict[str, Any], route_rows: dict[str, list[NavRow]]
+    config: dict[str, Any],
+    route_rows: dict[str, list[NavRow]],
+    warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     (ROOT / "plan.json").unlink(missing_ok=True)
     master = Path(config["workbook_path"])
@@ -636,7 +780,7 @@ def build_preview(
             sheet_name = str(route["sheet"])
             sheet = workbook[sheet_name]
             layout = discover_layout(
-                sheet, (config.get("column_overrides") or {}).get(sheet_name)
+                sheet, (config.get("column_overrides") or {}).get(sheet_name), route
             )
             current = existing_rows(sheet, layout)
             start = parse_date(route.get("series_start")) or dt.date.min
@@ -646,10 +790,15 @@ def build_preview(
             additions = [row for row in candidates if row.date not in current]
             if not additions:
                 continue
-            _ensure_summary_formula_safety(sheet, layout, route)
+            if layout.mode == "summary":
+                _ensure_summary_formula_safety(sheet, layout, route)
             additions.sort(key=lambda row: row.date)
-            latest_existing = max(current)
-            gaps = [row.date for row in additions if row.date <= latest_existing]
+            latest_existing = max(current) if current else None
+            gaps = (
+                [row.date for row in additions if row.date <= latest_existing]
+                if latest_existing
+                else []
+            )
             if gaps:
                 dates = ", ".join(date.isoformat() for date in gaps)
                 raise WorkbookError(
@@ -657,27 +806,56 @@ def build_preview(
                 )
             old_summary = layout.summary_row
             count = len(additions)
-            max_column = sheet.max_column
+            max_column = max([sheet.max_column, *layout.columns.values()])
+            changed: set[tuple[int, int]] = set()
+            for column, label in (layout.headers_to_write or {}).items():
+                cell = sheet.cell(layout.header_row, column)
+                cell.value = label
+                font = copy(cell.font)
+                font.bold = True
+                cell.font = font
+                changed.add((layout.header_row, column))
             sheet.insert_rows(old_summary, count)
             for offset, nav in enumerate(additions):
                 target = old_summary + offset
-                template = old_summary - 1 if offset == 0 else target - 1
-                _copy_row(sheet, template, target, max_column)
+                if current or layout.mode == "summary":
+                    template = old_summary - 1 if offset == 0 else target - 1
+                    _copy_row(sheet, template, target, max_column)
                 sheet.cell(target, layout.columns["date"]).value = nav.date
                 sheet.cell(target, layout.columns["unit"]).value = nav.unit
+                if layout.mode == "append" and not current:
+                    sheet.cell(
+                        target, layout.columns["date"]
+                    ).number_format = "yyyy-mm-dd"
+                    sheet.cell(
+                        target, layout.columns["unit"]
+                    ).number_format = "0.000000"
                 if layout.columns.get("cumulative"):
                     sheet.cell(
                         target, layout.columns["cumulative"]
                     ).value = effective_cumulative(nav, route)
+                    if layout.mode == "append" and not current:
+                        sheet.cell(
+                            target, layout.columns["cumulative"]
+                        ).number_format = "0.000000"
                 if layout.columns.get("code") and route.get("code"):
                     sheet.cell(target, layout.columns["code"]).value = normalize_code(
                         route["code"]
                     )
+                if layout.columns.get("name") and route.get("product_name"):
+                    sheet.cell(target, layout.columns["name"]).value = str(
+                        route["product_name"]
+                    ).strip()
             new_summary = old_summary + count
-            changed: set[tuple[int, int]] = set()
             new_rows = set(range(old_summary, new_summary))
             period_rows, affected_rows = _set_return_formulas(
-                sheet, layout, route, new_summary, new_rows, changed
+                sheet,
+                layout,
+                route,
+                new_summary,
+                new_rows,
+                changed,
+                write_summary=layout.mode == "summary",
             )
             _set_benchmark_formulas(
                 workbook,
@@ -688,14 +866,28 @@ def build_preview(
                 period_rows,
                 affected_rows,
                 changed,
+                write_summary=layout.mode == "summary",
             )
             plan_sheets.append(
                 {
                     "sheet": sheet_name,
+                    "sheet_mode": layout.mode,
+                    "header_row": layout.header_row,
                     "insert_before": old_summary,
                     "insert_count": count,
                     "new_rows": list(range(old_summary, new_summary)),
                     "summary_row": new_summary,
+                    "copy_template_rows": bool(current) or layout.mode == "summary",
+                    "format_rows": sorted(
+                        {
+                            *([layout.header_row] if layout.headers_to_write else []),
+                            *(
+                                range(old_summary, new_summary)
+                                if layout.mode == "append" and not current
+                                else []
+                            ),
+                        }
+                    ),
                     "changed_cells": sorted(
                         [{"row": row, "column": column} for row, column in changed],
                         key=lambda item: (item["row"], item["column"]),
@@ -729,6 +921,7 @@ def build_preview(
         "master_sha256": file_sha256(master),
         "preview_path": str(preview.resolve()) if plan_sheets else None,
         "preview_sha256": file_sha256(preview) if plan_sheets else None,
+        "warnings": list(warnings or []),
         "sheets": plan_sheets,
     }
     if not plan_sheets:
@@ -759,6 +952,7 @@ def validate_preview(config: dict[str, Any], plan: dict[str, Any]) -> None:
         if original.sheetnames != candidate.sheetnames:
             raise WorkbookError("Preview changed the workbook sheet topology")
         plans = {item["sheet"]: item for item in plan["sheets"]}
+        routes = {str(route["sheet"]): route for route in active_routes(config)}
         for name in original.sheetnames:
             left, right = original[name], candidate[name]
             sheet_plan = plans.get(name)
@@ -800,7 +994,9 @@ def validate_preview(config: dict[str, Any], plan: dict[str, Any]) -> None:
         for sheet_plan in plan["sheets"]:
             sheet = candidate[sheet_plan["sheet"]]
             layout = discover_layout(
-                sheet, (config.get("column_overrides") or {}).get(sheet.title)
+                sheet,
+                (config.get("column_overrides") or {}).get(sheet.title),
+                routes[sheet.title],
             )
             dates = []
             for row in range(layout.data_start, layout.summary_row):

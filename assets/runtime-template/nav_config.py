@@ -37,7 +37,9 @@ ROUTE_FIELDS = {
     "sender",
     "subject_contains",
     "sheet",
+    "sheet_mode",
     "code",
+    "product_name",
     "parser",
     "paused",
     "pause_reason",
@@ -161,6 +163,27 @@ def validate_config(config: dict[str, Any]) -> None:
             errors.append(f"{prefix}.sheet is already managed by another route")
         if sheet:
             managed_sheets.add(sheet)
+        sheet_mode = str(route.get("sheet_mode", "summary"))
+        if sheet_mode not in {"summary", "append"}:
+            errors.append(f"{prefix}.sheet_mode must be summary or append")
+        product_name = route.get("product_name")
+        if product_name is not None and (
+            not isinstance(product_name, str)
+            or not product_name.strip()
+            or len(product_name.strip()) > 200
+            or "\n" in product_name
+            or "\r" in product_name
+            or product_name.lstrip().startswith("=")
+        ):
+            errors.append(
+                f"{prefix}.product_name must be a non-empty, non-formula single-line string of at most 200 characters"
+            )
+        if (
+            sheet_mode == "append"
+            and not code
+            and not (isinstance(product_name, str) and product_name.strip())
+        ):
+            errors.append(f"{prefix} in append mode requires code or product_name")
         subject_contains = route.get("subject_contains")
         if subject_contains is not None and (
             not isinstance(subject_contains, str)
