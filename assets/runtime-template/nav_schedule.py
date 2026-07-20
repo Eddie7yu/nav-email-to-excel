@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import subprocess
-import datetime as dt
 from typing import Any
 
 from nav_config import ROOT, write_json_atomic
 
 
 STATE = ROOT / "scheduled_tasks.json"
+LAST_RUN = ROOT / "last-scheduled-run.json"
 
 
 class ScheduleError(RuntimeError):
@@ -21,6 +22,18 @@ def _state() -> dict[str, Any]:
         return json.loads(STATE.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return {"tasks": []}
+
+
+def record_scheduled_run(payload: dict[str, Any]) -> None:
+    write_json_atomic(LAST_RUN, payload)
+
+
+def _last_run() -> dict[str, Any] | None:
+    try:
+        value = json.loads(LAST_RUN.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _delete(name: str) -> None:
@@ -123,13 +136,60 @@ def install(config: dict[str, Any]) -> dict[str, Any]:
 def status() -> dict[str, Any]:
     names = [str(name) for name in _state().get("tasks") or []]
     if os.name != "nt":
-        return {"tasks": names, "available": False}
-    results = []
+        return {"tasks": names, "available": False, "last_run": _last_run()}
+    service = None
+    folder = None
+    try:
+        from win32com.client import Dispatch
+
+        service = Dispatch("Schedule.Service")
+        service.Connect()
+        folder = service.GetFolder("\\")
+    except Exception:
+        service = None
+        folder = None
+    state_names = {
+        0: "unknown",
+        1: "disabled",
+        2: "queued",
+        3: "ready",
+        4: "running",
+    }
+    results: list[dict[str, Any]] = []
     for name in names:
+        if folder is not None:
+            try:
+                task = folder.GetTask(name)
+                state = int(task.State)
+                results.append(
+                    {
+                        "name": name,
+                        "exists": True,
+                        "state": state_names.get(state, "unknown"),
+                        "last_run_time": _task_time(task.LastRunTime),
+                        "next_run_time": _task_time(task.NextRunTime),
+                        "last_result": int(task.LastTaskResult),
+                    }
+                )
+                continue
+            except Exception:
+                pass
         result = subprocess.run(
-            ["schtasks", "/Query", "/TN", name, "/FO", "LIST"],
+            ["schtasks", "/Query", "/TN", name],
             capture_output=True,
             text=True,
         )
         results.append({"name": name, "exists": result.returncode == 0})
-    return {"tasks": results, "available": True}
+    return {"tasks": results, "available": True, "last_run": _last_run()}
+
+
+def _task_time(value: Any) -> str | None:
+    try:
+        if int(value.year) <= 1900:
+            return None
+        try:
+            return value.isoformat(timespec="seconds")
+        except TypeError:
+            return value.isoformat()
+    except (AttributeError, TypeError, ValueError):
+        return None

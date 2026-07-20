@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -15,6 +16,7 @@ from nav_demo import list_runs as list_demo_runs
 from nav_demo import prepare as prepare_demo
 from nav_demo import remove as remove_demo
 from nav_schedule import install as install_schedule
+from nav_schedule import record_scheduled_run
 from nav_schedule import remove as remove_schedule
 from nav_schedule import status as schedule_status
 from nav_service import discover, doctor, preview, validate
@@ -23,6 +25,20 @@ from runtime_secret import read_password, remove_password, set_password
 
 def emit(payload: Any) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def configure_output() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(errors="backslashreplace")
+
+
+def record_scheduled_run_safely(payload: dict[str, Any]) -> None:
+    try:
+        record_scheduled_run(payload)
+    except OSError:
+        pass
 
 
 def prune_logs(config: dict[str, Any]) -> None:
@@ -41,47 +57,93 @@ def prune_logs(config: dict[str, Any]) -> None:
 @contextmanager
 def run_lock() -> Iterator[None]:
     path = ROOT / "run.lock"
-    descriptor = None
-    if path.exists():
-        try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-            pid = int(state["pid"])
-            created = dt.datetime.fromisoformat(state["created"])
-        except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError):
-            age = (
-                dt.datetime.now() - created
-                if "created" in locals()
-                else dt.timedelta(days=2)
-            )
-            if age > dt.timedelta(hours=24):
-                path.unlink(missing_ok=True)
-        else:
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                path.unlink(missing_ok=True)
+    descriptor = _acquire_runtime_lock(path)
     try:
-        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        payload = json.dumps(
+        _write_lock_state(
+            descriptor,
             {
+                "status": "active",
                 "pid": os.getpid(),
                 "created": dt.datetime.now().isoformat(timespec="seconds"),
-            }
+            },
         )
-        os.write(descriptor, payload.encode("utf-8"))
+        yield
+    finally:
+        try:
+            _write_lock_state(
+                descriptor,
+                {
+                    "status": "idle",
+                    "pid": os.getpid(),
+                    "released": dt.datetime.now().isoformat(timespec="seconds"),
+                },
+            )
+        except OSError:
+            pass
         os.close(descriptor)
-        descriptor = None
-    except FileExistsError as exc:
+
+
+def _write_lock_state(descriptor: int, state: dict[str, Any]) -> None:
+    payload = (json.dumps(state, ensure_ascii=False) + "\n").encode("utf-8")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    os.ftruncate(descriptor, 0)
+    os.write(descriptor, payload)
+    os.fsync(descriptor)
+
+
+def _acquire_runtime_lock(path: Path) -> int:
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x80000000 | 0x40000000,
+            0,
+            None,
+            4,
+            0x80,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            error = ctypes.get_last_error()
+            if error in {32, 33}:
+                raise RuntimeError(
+                    "Another runtime process is active; refusing a concurrent run"
+                )
+            raise ctypes.WinError(error)
+        try:
+            return msvcrt.open_osfhandle(int(handle), os.O_RDWR)
+        except Exception:
+            kernel32.CloseHandle(handle)
+            raise
+
+    import fcntl
+
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(descriptor)
         raise RuntimeError(
             "Another runtime process is active; refusing a concurrent run"
         ) from exc
-    try:
-        yield
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        if path.exists():
-            path.unlink()
+    return descriptor
 
 
 def command_doctor(config: dict[str, Any], _args: argparse.Namespace) -> int:
@@ -143,6 +205,23 @@ def command_preview(config: dict[str, Any], _args: argparse.Namespace) -> int:
     return 0
 
 
+def command_scheduled_preview(config: dict[str, Any], args: argparse.Namespace) -> int:
+    with run_lock():
+        plan = preview(config)
+    payload = {
+        "started": args.scheduled_started,
+        "finished": dt.datetime.now().isoformat(timespec="seconds"),
+        "passed": True,
+        "exit_code": 0,
+        "plan_id": plan["plan_id"],
+        "sheets": len(plan["sheets"]),
+        "new_rows": sum(len(item["new_dates"]) for item in plan["sheets"]),
+    }
+    record_scheduled_run_safely(payload)
+    emit(payload)
+    return 0
+
+
 def command_commit(config: dict[str, Any], args: argparse.Namespace) -> int:
     if not args.yes_reviewed_preview:
         raise RuntimeError("Refusing commit without --yes-reviewed-preview")
@@ -191,6 +270,7 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("discover")
     commands.add_parser("validate")
     commands.add_parser("preview")
+    commands.add_parser("scheduled-preview", help=argparse.SUPPRESS)
     commit_parser = commands.add_parser("commit")
     commit_parser.add_argument("--yes-reviewed-preview", action="store_true")
     schedule = commands.add_parser("schedule")
@@ -212,7 +292,9 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    configure_output()
     args = parser().parse_args()
+    args.scheduled_started = dt.datetime.now().isoformat(timespec="seconds")
     try:
         if args.command == "demo":
             return command_demo(args)
@@ -224,12 +306,28 @@ def main() -> int:
             "discover": command_discover,
             "validate": command_validate,
             "preview": command_preview,
+            "scheduled-preview": command_scheduled_preview,
             "commit": command_commit,
             "schedule": command_schedule,
         }
         return commands[args.command](config, args)
-    except (ConfigError, RuntimeError, ValueError) as exc:
-        emit({"passed": False, "error": str(exc)})
+    except (ConfigError, RuntimeError, ValueError, OSError) as exc:
+        error = (
+            str(exc)
+            if not isinstance(exc, OSError)
+            else f"系统操作失败：{exc.strerror or type(exc).__name__}"
+        )
+        if args.command == "scheduled-preview":
+            record_scheduled_run_safely(
+                {
+                    "started": args.scheduled_started,
+                    "finished": dt.datetime.now().isoformat(timespec="seconds"),
+                    "passed": False,
+                    "exit_code": 2,
+                    "error": error,
+                }
+            )
+        emit({"passed": False, "error": error})
         return 2
 
 

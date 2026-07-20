@@ -3,8 +3,10 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import html
+import importlib.util
 import io
 import re
+import sys
 import zipfile
 from dataclasses import dataclass
 from email.message import Message
@@ -322,7 +324,7 @@ def message_text(message: Message) -> str:
     return "\n".join(plain or rich)
 
 
-def rows_from_message(message: Message) -> list[NavRow]:
+def _rows_from_message_auto(message: Message) -> list[NavRow]:
     subject = str(message.get("Subject") or "")
     rows = rows_from_text(message_text(message), "body", subject)
     for part in message.walk():
@@ -347,6 +349,46 @@ def rows_from_message(message: Message) -> list[NavRow]:
                 f"Could not parse a {suffix or 'named'} attachment"
             ) from exc
     return deduplicate(rows)
+
+
+def _rows_from_local_parser(message: Message, parser_name: str) -> list[NavRow]:
+    name = parser_name.removeprefix("local:")
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name):
+        raise ParseError("Local parser name is invalid")
+    directory = (Path(__file__).resolve().parent / "parsers").resolve()
+    path = (directory / f"{name}.py").resolve()
+    if path.parent != directory or not path.is_file():
+        raise ParseError(f"Local parser is missing: {name}")
+    module_name = f"nav_local_parser_{name.replace('-', '_')}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ParseError(f"Local parser could not be loaded: {name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        parse_message = getattr(module, "parse_message", None)
+        if not callable(parse_message):
+            raise ParseError(f"Local parser {name} must define parse_message(message)")
+        result = parse_message(message)
+        rows = list(result)
+    except ParseError:
+        raise
+    except Exception as exc:
+        raise ParseError(f"Local parser failed: {name}") from exc
+    finally:
+        sys.modules.pop(module_name, None)
+    if any(not isinstance(row, NavRow) for row in rows):
+        raise ParseError(f"Local parser {name} returned an invalid row")
+    return deduplicate(rows)
+
+
+def rows_from_message(message: Message, parser_name: str = "auto") -> list[NavRow]:
+    if parser_name == "auto":
+        return _rows_from_message_auto(message)
+    if parser_name.startswith("local:"):
+        return _rows_from_local_parser(message, parser_name)
+    raise ParseError(f"Unsupported parser: {parser_name}")
 
 
 def deduplicate(rows: Iterable[NavRow]) -> list[NavRow]:

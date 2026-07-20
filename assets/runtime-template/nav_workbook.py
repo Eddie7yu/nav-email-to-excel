@@ -14,7 +14,7 @@ import openpyxl
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import column_index_from_string, get_column_letter, quote_sheetname
 
-from nav_config import ROOT, normalize_code, write_json_atomic
+from nav_config import ROOT, active_routes, normalize_code, write_json_atomic
 from nav_parse import NavRow, parse_date, parse_number
 
 
@@ -202,7 +202,7 @@ def validate_history(
     reports: list[dict[str, Any]] = []
     errors: list[str] = []
     try:
-        for route in config.get("routes") or []:
+        for route in active_routes(config):
             sheet_name = str(route["sheet"])
             if sheet_name not in workbook.sheetnames:
                 errors.append(f"Missing managed sheet: {sheet_name}")
@@ -353,7 +353,7 @@ def _set_return_formulas(
 ) -> tuple[list[int], set[int]]:
     return_column = layout.columns.get("return")
     if not return_column:
-        return []
+        return [], set()
     basis_name = (
         "cumulative"
         if route.get("return_basis", "cumulative") == "cumulative"
@@ -579,6 +579,31 @@ def _set_benchmark_formulas(
     changed.update({(summary_row, target_return), (summary_row, excess)})
 
 
+def _ensure_summary_formula_safety(
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    layout: Layout,
+    route: dict[str, Any],
+) -> None:
+    managed = {column for column in (layout.columns.get("return"),) if column}
+    if route.get("benchmark"):
+        managed.update(
+            column
+            for column in (
+                layout.columns.get("benchmark_return"),
+                layout.columns.get("excess"),
+            )
+            if column
+        )
+    for column in range(1, sheet.max_column + 1):
+        value = sheet.cell(layout.summary_row, column).value
+        if isinstance(value, str) and value.startswith("=") and column not in managed:
+            coordinate = sheet.cell(layout.summary_row, column).coordinate
+            raise WorkbookError(
+                f"{sheet.title}: summary formula at {coordinate} is not managed; "
+                "automatic insertion cannot prove that its range will expand safely"
+            )
+
+
 def build_preview(
     config: dict[str, Any], route_rows: dict[str, list[NavRow]]
 ) -> dict[str, Any]:
@@ -607,7 +632,7 @@ def build_preview(
     workbook = openpyxl.load_workbook(preview, data_only=False, keep_vba=keep_vba)
     plan_sheets: list[dict[str, Any]] = []
     try:
-        for route in config.get("routes") or []:
+        for route in active_routes(config):
             sheet_name = str(route["sheet"])
             sheet = workbook[sheet_name]
             layout = discover_layout(
@@ -621,6 +646,7 @@ def build_preview(
             additions = [row for row in candidates if row.date not in current]
             if not additions:
                 continue
+            _ensure_summary_formula_safety(sheet, layout, route)
             additions.sort(key=lambda row: row.date)
             latest_existing = max(current)
             gaps = [row.date for row in additions if row.date <= latest_existing]

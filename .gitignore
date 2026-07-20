@@ -8,6 +8,9 @@ route-report.json
 validation-report.json
 plan.json
 scheduled_tasks.json
+last-scheduled-run.json
+run.lock
+parsers/
 *.xlsx
 *.xlsm
 *.xls

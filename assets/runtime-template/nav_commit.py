@@ -15,7 +15,7 @@ from typing import Any
 
 import openpyxl
 
-from nav_config import ROOT
+from nav_config import ROOT, active_routes
 from nav_workbook import file_sha256, payload_sha256, validate_preview
 
 
@@ -365,7 +365,7 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
         raise CommitError(
             "The reviewed preview is missing or changed; regenerate the preview"
         )
-    allowed_sheets = {str(route["sheet"]) for route in config.get("routes") or []}
+    allowed_sheets = {str(route["sheet"]) for route in active_routes(config)}
     planned_sheets = {str(item.get("sheet") or "") for item in plan["sheets"]}
     if not planned_sheets or not planned_sheets <= allowed_sheets:
         raise CommitError(
@@ -395,34 +395,57 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
     backup_dir = ROOT / "backups"
     backup_dir.mkdir(exist_ok=True)
     keep = int((config.get("retention") or {}).get("backup_count", 10))
-    old_backups = sorted(
-        backup_dir.glob(f"{master.stem}-before-*{master.suffix}"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    for old in old_backups[max(keep - 1, 0) :]:
-        old.unlink()
     backup = backup_dir / f"{master.stem}-before-{timestamp}{master.suffix}"
-    shutil.copy2(master, backup)
     temp = master.with_name(f".{master.stem}.nav-write-{os.getpid()}{master.suffix}")
     if temp.exists():
         raise CommitError(f"Temporary target already exists: {temp.name}")
-    shutil.copy2(master, temp)
     before = file_sha256(master)
     try:
+        shutil.copy2(master, backup)
+        shutil.copy2(master, temp)
         application = _apply_plan_with_com(temp, preview, plan, config)
         _verify_temp(temp, preview, plan)
         if file_sha256(preview) != plan["preview_sha256"]:
             raise CommitError("The reviewed preview changed during commit")
         if file_sha256(master) != before:
             raise CommitError("The master changed during commit; refusing replacement")
-        os.replace(temp, master)
+        try:
+            os.replace(temp, master)
+        except OSError as exc:
+            if isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {
+                5,
+                32,
+                33,
+            }:
+                raise CommitError(
+                    "无法替换正式工作簿；请关闭正在打开该文件的 Excel/WPS 窗口后重试"
+                ) from exc
+            raise
     except Exception:
         if temp.exists():
-            temp.unlink()
-        if file_sha256(master) != before:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+        if backup.exists():
+            try:
+                backup.unlink()
+            except OSError:
+                pass
+        if not master.is_file() or file_sha256(master) != before:
             raise CommitError("Commit failed and the master hash changed unexpectedly")
         raise
+    old_backups = sorted(
+        backup_dir.glob(f"{master.stem}-before-*{master.suffix}"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    cleanup_failed = False
+    for old in old_backups[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            cleanup_failed = True
     return {
         "changed": True,
         "application": application,
@@ -430,4 +453,5 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
         "master_sha256": file_sha256(master),
         "sheets": len(plan["sheets"]),
         "rows": sum(int(sheet["insert_count"]) for sheet in plan["sheets"]),
+        "backup_cleanup_failed": cleanup_failed,
     }

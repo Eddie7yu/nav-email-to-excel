@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gc
 import json
 import shutil
+import subprocess
 import sys
 from email.message import EmailMessage
 from pathlib import Path
@@ -201,6 +203,21 @@ def parser_tests(runtime: Path) -> None:
         "multi-sheet attachment parsing failed",
     )
 
+    parser_dir = runtime / "parsers"
+    parser_dir.mkdir(exist_ok=True)
+    (parser_dir / "fixture.py").write_text(
+        "from datetime import date\n"
+        "from nav_parse import NavRow\n\n"
+        "def parse_message(message):\n"
+        "    return [NavRow(date(2026, 1, 30), 1.03, 1.03, 'DEMO01', 'local')]\n",
+        encoding="utf-8",
+    )
+    local_rows = rows_from_message(EmailMessage(), "local:fixture")
+    check(
+        len(local_rows) == 1 and local_rows[0].date == dt.date(2026, 1, 30),
+        "trusted local parser extension failed",
+    )
+
     route = {"code": "DEMO01", "allow_sender_only": False, "sheet": "Demo Fund"}
     conflict = rows_from_text(
         "Product Code | NAV Date | Unit NAV\nDEMO01 | 2026-01-09 | 1.01\nDEMO01 | 2026-01-09 | 1.02",
@@ -222,9 +239,148 @@ def parser_tests(runtime: Path) -> None:
         raise AssertionError("repeated labelled fields must fail closed")
 
 
+def route_state_tests(runtime: Path) -> None:
+    sys.path.insert(0, str(runtime))
+    import nav_service
+
+    book = runtime / "route-state-placeholder.xlsx"
+    create_book(book)
+    config = config_for(runtime, book)
+    empty = json.loads(json.dumps(config))
+    empty["routes"] = []
+    _, report = nav_service.collect_route_rows(empty)
+    check(
+        not report["passed"] and "No active routes" in report["errors"][0],
+        "empty route configuration reported discovery success",
+    )
+    paused = json.loads(json.dumps(config))
+    paused["routes"][0]["paused"] = True
+    paused["routes"][0]["pause_reason"] = "fixture pause"
+    _, report = nav_service.collect_route_rows(paused)
+    check(
+        not report["passed"] and report["warnings"],
+        "paused route was not excluded with a visible warning",
+    )
+    original_fetch = nav_service.fetch_authorized_messages
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": []
+    }
+    try:
+        _, report = nav_service.collect_route_rows(config)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    check(
+        not report["passed"]
+        and any("no routed NAV rows" in item for item in report["errors"]),
+        "active route with no messages reported discovery success",
+    )
+    mixed = json.loads(json.dumps(config))
+    mixed["routes"][0].update({"parser": "local:fixture", "max_staleness_days": 366})
+    second_route = json.loads(json.dumps(mixed["routes"][0]))
+    second_route.update({"sheet": "Second Fund", "code": "DEMO02", "parser": "auto"})
+    mixed["routes"].append(second_route)
+    mixed_message = EmailMessage()
+    mixed_message.set_content(
+        "Product Code | NAV Date | Unit NAV | Cumulative NAV\n"
+        "DEMO02 | 2026-02-06 | 1.04 | 1.04"
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [mixed_message]
+    }
+    try:
+        mixed_rows, report = nav_service.collect_route_rows(mixed)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    check(
+        report["passed"]
+        and len(mixed_rows["Demo Fund"]) == 1
+        and len(mixed_rows["Second Fund"]) == 1,
+        "multiple trusted parsers for one sender were not merged and routed safely",
+    )
+
+
+def lock_tests(runtime: Path) -> None:
+    sys.path.insert(0, str(runtime))
+    from nav_schedule import record_scheduled_run, status
+
+    holder_code = (
+        "import time\n"
+        "from navctl import run_lock\n"
+        "with run_lock():\n"
+        "    print('ready', flush=True)\n"
+        "    time.sleep(60)\n"
+    )
+    contender_code = (
+        "import sys\n"
+        "from navctl import run_lock\n"
+        "try:\n"
+        "    with run_lock():\n"
+        "        print('acquired')\n"
+        "except RuntimeError:\n"
+        "    print('blocked')\n"
+        "    raise SystemExit(3)\n"
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-X", "utf8", "-c", holder_code],
+        cwd=runtime,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    try:
+        ready = holder.stdout.readline().strip() if holder.stdout else ""
+        check(ready == "ready", "runtime lock holder did not start")
+        blocked = subprocess.run(
+            [sys.executable, "-X", "utf8", "-c", contender_code],
+            cwd=runtime,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        check(
+            blocked.returncode == 3 and "blocked" in blocked.stdout,
+            "runtime lock allowed concurrent access",
+        )
+        check(holder.poll() is None, "runtime lock probe interrupted the lock holder")
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+    recovered = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", contender_code],
+        cwd=runtime,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    check(
+        recovered.returncode == 0 and "acquired" in recovered.stdout,
+        "runtime lock did not recover after a crashed holder",
+    )
+    state = json.loads((runtime / "run.lock").read_text(encoding="utf-8"))
+    check(state.get("status") == "idle", "runtime lock did not record idle state")
+    scheduled = {
+        "started": "2026-01-01T09:30:00",
+        "finished": "2026-01-01T09:30:05",
+        "passed": False,
+        "exit_code": 2,
+        "error": "fixture failure",
+    }
+    record_scheduled_run(scheduled)
+    check(
+        status().get("last_run") == scheduled,
+        "schedule status did not expose the latest run result",
+    )
+    check(
+        "scheduled-preview"
+        in (runtime / "run-preview.cmd").read_text(encoding="utf-8"),
+        "scheduled wrapper does not record preview outcomes",
+    )
+
+
 def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     sys.path.insert(0, str(runtime))
-    from nav_commit import CommitError, commit
+    from nav_commit import CommitError, _process_id, commit, ensure_process_exit
     from nav_config import ConfigError, load_config, validate_config
     from nav_parse import NavRow
     from nav_workbook import WorkbookError, build_preview, validate_history
@@ -234,6 +390,7 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     config = config_for(runtime, book)
     invalid = json.loads(json.dumps(config))
     invalid["routes"][0]["series_start"] = "2026-99-99"
+    invalid["routes"][0]["parser"] = "local:../unsafe"
     invalid["unexpected"] = True
     try:
         validate_config(invalid)
@@ -241,6 +398,20 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         pass
     else:
         raise AssertionError("invalid dates and unknown config fields must be rejected")
+    local_parser_config = json.loads(json.dumps(config))
+    local_parser_config["routes"][0]["parser"] = "local:fixture"
+    validate_config(local_parser_config)
+    mixed_parser_config = json.loads(json.dumps(config))
+    second_route = json.loads(json.dumps(mixed_parser_config["routes"][0]))
+    second_route.update(
+        {"sheet": "Second Fund", "code": "DEMO02", "parser": "local:fixture"}
+    )
+    mixed_parser_config["routes"].append(second_route)
+    validate_config(mixed_parser_config)
+    paused_config = json.loads(json.dumps(config))
+    paused_config["routes"][0]["paused"] = True
+    paused_config["routes"][0]["pause_reason"] = "fixture pause"
+    validate_config(paused_config)
     (runtime / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -253,6 +424,25 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
             NavRow(dt.date(2026, 1, 23), 1.015, 1.015, "DEMO01", "fixture"),
         ]
     }
+    unsafe_book = runtime / "unsafe-summary.xlsx"
+    create_book(unsafe_book)
+    unsafe_workbook = openpyxl.load_workbook(unsafe_book)
+    try:
+        unsafe_workbook["Demo Fund"]["G4"] = "=SUM(D2:D3)"
+        unsafe_workbook.save(unsafe_book)
+    finally:
+        unsafe_workbook.close()
+    unsafe_config = config_for(runtime, unsafe_book)
+    try:
+        build_preview(unsafe_config, rows)
+    except WorkbookError as exc:
+        check(
+            "summary formula" in str(exc),
+            "unsafe summary formula failed for the wrong reason",
+        )
+    else:
+        raise AssertionError("unmanaged summary formula must fail closed")
+
     validation = validate_history(config, rows)
     check(validation["passed"], f"historical validation failed: {validation['errors']}")
     plan = build_preview(config, rows)
@@ -333,6 +523,53 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
 
     application = None
     if use_com:
+        from win32com.client import DispatchEx
+
+        master_before_locked_commit = book.read_bytes()
+        backups_before = set((runtime / "backups").glob("*"))
+        blocking_app = DispatchEx("Excel.Application")
+        blocking_app.Visible = False
+        blocking_app.DisplayAlerts = False
+        blocking_pid = _process_id(blocking_app)
+        blocking_book = blocking_app.Workbooks.Open(str(book.resolve()))
+        try:
+            locked = subprocess.run(
+                [
+                    sys.executable,
+                    "-X",
+                    "utf8",
+                    "navctl.py",
+                    "commit",
+                    "--yes-reviewed-preview",
+                ],
+                cwd=runtime,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            locked_report = json.loads(locked.stdout)
+            check(
+                locked.returncode == 2
+                and not locked_report["passed"]
+                and "关闭" in locked_report["error"]
+                and "Traceback" not in locked.stderr,
+                "open-workbook conflict did not return a readable JSON error",
+            )
+            check(
+                book.read_bytes() == master_before_locked_commit,
+                "open-workbook conflict changed the master",
+            )
+            check(
+                set((runtime / "backups").glob("*")) == backups_before,
+                "failed open-workbook commit retained a backup",
+            )
+        finally:
+            blocking_book.Close(False)
+            blocking_app.Quit()
+            blocking_book = None
+            blocking_app = None
+            gc.collect()
+            ensure_process_exit(blocking_pid)
         result = commit(config)
         application = str(result["application"])
         check(
@@ -403,6 +640,33 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         )
     finally:
         level_preview.close()
+
+    plain_book = runtime / "no-return-column.xlsx"
+    plain_workbook = openpyxl.Workbook()
+    plain_sheet = plain_workbook.active
+    plain_sheet.title = "Plain Fund"
+    plain_sheet.append(["NAV Date", "Unit NAV", "Cumulative NAV"])
+    plain_sheet.append([dt.date(2026, 1, 2), 1.0, 1.0])
+    plain_sheet.append([dt.date(2026, 1, 9), 1.01, 1.01])
+    plain_sheet.append(["TOTAL", None, None])
+    plain_workbook.save(plain_book)
+    plain_workbook.close()
+    plain_config = config_for(runtime, plain_book)
+    plain_config["routes"][0].update(
+        {"sheet": "Plain Fund", "code": None, "benchmark": None}
+    )
+    plain_rows = {
+        "Plain Fund": [
+            NavRow(dt.date(2026, 1, 2), 1.0, 1.0, None, "fixture"),
+            NavRow(dt.date(2026, 1, 9), 1.01, 1.01, None, "fixture"),
+            NavRow(dt.date(2026, 1, 16), 1.02, 1.02, None, "fixture"),
+        ]
+    }
+    plain_plan = build_preview(plain_config, plain_rows)
+    check(
+        plain_plan["sheets"][0]["new_dates"] == ["2026-01-16"],
+        "workbook without a return column could not produce a preview",
+    )
     return application
 
 
@@ -412,17 +676,22 @@ def main() -> int:
     parser.add_argument("--com", action="store_true")
     args = parser.parse_args()
     runtime = Path(args.runtime).resolve()
-    print("[1/3] 检查虚构邮件解析、精确发件人和冲突拦截")
+    print("[1/4] 检查自动解析、本地解析器、精确发件人和冲突拦截")
     parser_tests(runtime)
     print("      PASS")
-    print("[2/3] 检查历史核验、补录、公式、基准、预览保护和幂等性")
+    print("[2/4] 检查空路由、暂停路由和无邮件失败关闭")
+    route_state_tests(runtime)
+    print("      PASS")
+    print("[3/4] 检查崩溃恢复和并发运行锁")
+    lock_tests(runtime)
+    print("      PASS")
+    print("[4/4] 检查历史核验、汇总公式、补录、基准和幂等性")
     application = workbook_tests(runtime, args.com)
     print("      PASS")
     if args.com:
-        print("[3/3] 检查 Excel/WPS COM 正式写入及缓存数值")
-        print(f"      PASS（{application}）")
+        print(f"      Excel/WPS COM、文件占用提示及缓存数值：PASS（{application}）")
     else:
-        print("[3/3] 跳过 COM；如需验证正式写入，请添加 --com")
+        print("      未启用 COM；如需验证正式写入，请添加 --com")
     print("selftest_driver: PASS（全程仅使用虚构数据）")
     return 0
 

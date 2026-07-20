@@ -11,9 +11,15 @@ from pathlib import Path
 from typing import Any
 
 from nav_commit import ensure_process_exit, spreadsheet_app
-from nav_config import ROOT, normalize_code, write_json_atomic
+from nav_config import ROOT, active_routes, normalize_code, write_json_atomic
 from nav_mail import decoded, fetch_authorized_messages
-from nav_parse import NavRow, ParseError, choose_route_rows, rows_from_message
+from nav_parse import (
+    NavRow,
+    ParseError,
+    choose_route_rows,
+    deduplicate,
+    rows_from_message,
+)
 from nav_workbook import build_preview, validate_history
 from runtime_secret import read_password
 
@@ -25,12 +31,29 @@ def _sender_id(sender: str) -> str:
 def collect_route_rows(
     config: dict[str, Any],
 ) -> tuple[dict[str, list[NavRow]], dict[str, Any]]:
+    routes_config = active_routes(config)
+    paused_routes = [
+        route for route in config.get("routes") or [] if route.get("paused", False)
+    ]
+    warnings = [
+        f"{route['sheet']}: paused ({str(route['pause_reason']).strip()})"
+        for route in paused_routes
+    ]
+    if not routes_config:
+        report = {
+            "passed": False,
+            "routes": [],
+            "warnings": warnings,
+            "errors": ["No active routes are configured"],
+        }
+        write_json_atomic(ROOT / "route-report.json", report)
+        return {}, report
     messages = fetch_authorized_messages(config)
     sender_routes: dict[str, list[dict[str, Any]]] = {}
-    for route in config.get("routes") or []:
+    for route in routes_config:
         sender_routes.setdefault(str(route["sender"]).lower(), []).append(route)
     output: dict[str, list[NavRow]] = {
-        str(route["sheet"]): [] for route in config.get("routes") or []
+        str(route["sheet"]): [] for route in routes_config
     }
     route_reports: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -52,13 +75,23 @@ def collect_route_rows(
                     applicable.append(route)
             if not applicable:
                 continue
-            try:
-                message_rows = rows_from_message(message)
-            except ParseError:
-                message_rows = []
-            if not message_rows:
+            message_rows: list[NavRow] = []
+            parse_failed = False
+            for parser_name in sorted(
+                {str(route.get("parser", "auto")) for route in applicable}
+            ):
+                try:
+                    parsed = rows_from_message(message, parser_name)
+                except ParseError:
+                    parsed = []
+                if not parsed:
+                    parse_failed = True
+                    break
+                message_rows.extend(parsed)
+            if parse_failed or not message_rows:
                 errors.append("An in-scope authorized message could not be parsed")
                 continue
+            message_rows = deduplicate(message_rows)
             used_sheets: set[str] = set()
             for row in message_rows:
                 matches: list[dict[str, Any]] = []
@@ -97,7 +130,11 @@ def collect_route_rows(
                 errors.append(f"{route['sheet']}: {exc}")
                 selected = []
             output[sheet] = selected
-            if selected:
+            if not selected:
+                errors.append(
+                    f"{sheet}: no routed NAV rows were found in the lookback window"
+                )
+            else:
                 max_age = int(route.get("max_staleness_days", 14))
                 if max(row.date for row in selected) < dt.date.today() - dt.timedelta(
                     days=max_age
@@ -114,7 +151,12 @@ def collect_route_rows(
                     "candidate_dates": [row.date.isoformat() for row in selected],
                 }
             )
-    report = {"passed": not errors, "routes": route_reports, "errors": errors}
+    report = {
+        "passed": not errors,
+        "routes": route_reports,
+        "warnings": warnings,
+        "errors": errors,
+    }
     write_json_atomic(ROOT / "route-report.json", report)
     return output, report
 
@@ -129,10 +171,12 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
     add("python", supported_python, platform.python_version())
     workbook = Path(config["workbook_path"])
     add("workbook", workbook.is_file(), "present" if workbook.is_file() else "missing")
+    configured_routes = config.get("routes") or []
+    active = active_routes(config)
     add(
         "routes",
-        bool(config.get("routes")),
-        f"{len(config.get('routes') or [])} configured",
+        bool(active),
+        f"{len(active)} active; {len(configured_routes) - len(active)} paused",
     )
     expected_packages = {
         "openpyxl": "3.1.5",
@@ -207,7 +251,12 @@ def validate(
     if rows is None:
         rows, discovery = collect_route_rows(config)
         if not discovery["passed"]:
-            return {"passed": False, "routes": [], "errors": discovery["errors"]}
+            return {
+                "passed": False,
+                "routes": [],
+                "warnings": discovery.get("warnings", []),
+                "errors": discovery["errors"],
+            }
     return validate_history(config, rows)
 
 

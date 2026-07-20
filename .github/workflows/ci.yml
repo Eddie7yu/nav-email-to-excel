@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python: ["3.11", "3.13", "3.14"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -39,3 +39,21 @@ jobs:
           python -X utf8 -m ruff check .
       - name: Run sanitized offline regression
         run: python -X utf8 scripts/selftest.py
+
+  macos-preview-smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.lock
+            assets/runtime-template/requirements.lock
+      - name: Install locked dependencies
+        run: python -m pip install -r assets/runtime-template/requirements.lock -r requirements-dev.lock
+      - name: Validate and run sanitized preview regression
+        run: |
+          python -X utf8 scripts/package_check.py
+          python -X utf8 scripts/selftest.py

@@ -72,6 +72,29 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     )
     if rejected.returncode == 0 or destination.exists():
         raise AssertionError("bootstrap accepted a negative lookback window")
+    if os.name == "nt":
+        long_parent = temporary / "long-path-check"
+        long_parent.mkdir()
+        minimum_length = 121
+        leaf_length = max(10, minimum_length - len(str(long_parent.resolve())) - 1)
+        long_destination = long_parent / ("x" * leaf_length)
+        long_command = command.copy()
+        long_command[long_command.index(str(destination))] = str(long_destination)
+        rejected = subprocess.run(
+            long_command + ["--validate-only"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=environment,
+        )
+        if (
+            rejected.returncode != 2
+            or long_destination.exists()
+            or "安装目录过长" not in rejected.stderr
+        ):
+            raise AssertionError(
+                "bootstrap did not reject a Windows destination beyond its supported path budget"
+            )
     installation = subprocess.run(
         command, capture_output=True, text=True, encoding="utf-8", env=environment
     )
@@ -85,6 +108,10 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     ]
     if unwanted:
         raise AssertionError("bootstrap copied build caches into the deployed runtime")
+    if not (destination / "parsers").is_dir():
+        raise AssertionError(
+            "bootstrap did not create the trusted local parser directory"
+        )
     config_path = destination / "config.json"
     original_config = config_path.read_bytes()
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -119,6 +146,33 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     ):
         raise AssertionError(
             f"bootstrapped runtime readiness report is wrong: {doctor.stdout}"
+        )
+    scheduled_preview = subprocess.run(
+        [str(runtime_python), "-X", "utf8", "navctl.py", "scheduled-preview"],
+        cwd=destination,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+    )
+    if scheduled_preview.returncode != 2:
+        raise AssertionError("empty scheduled preview did not fail closed")
+    schedule_status = subprocess.run(
+        [str(runtime_python), "-X", "utf8", "navctl.py", "schedule", "status"],
+        cwd=destination,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+    )
+    status_report = json.loads(schedule_status.stdout)
+    if (
+        schedule_status.returncode
+        or status_report.get("last_run", {}).get("passed") is not False
+        or status_report.get("last_run", {}).get("exit_code") != 2
+    ):
+        raise AssertionError(
+            "schedule status did not report the latest preview failure"
         )
     demo = subprocess.run(
         [str(runtime_python), "-X", "utf8", "navctl.py", "demo", "prepare"],
@@ -212,6 +266,31 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
             raise AssertionError(f"offline demo cleanup failed: {removed.stdout}")
     if config_path.read_bytes() != original_config:
         raise AssertionError("offline demo changed the real runtime configuration")
+    if os.name == "nt":
+        unicode_destination = temporary / "unicode-😀-runtime"
+        unicode_command = [
+            sys.executable,
+            str(BOOTSTRAP),
+            "--destination",
+            str(unicode_destination),
+            "--workbook",
+            str(workbook_path),
+            "--email",
+            "user@example.invalid",
+            "--imap-host",
+            "imap.example.invalid",
+            "--skip-deps",
+        ]
+        unicode_environment = dict(os.environ, PYTHONUTF8="0")
+        unicode_result = subprocess.run(
+            unicode_command,
+            capture_output=True,
+            env=unicode_environment,
+        )
+        if unicode_result.returncode or not unicode_destination.is_dir():
+            raise AssertionError(
+                "bootstrap failed after creating a valid non-console-codepage path"
+            )
 
 
 def main() -> int:

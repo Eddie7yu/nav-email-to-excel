@@ -11,6 +11,7 @@ from email.policy import default
 from email.utils import getaddresses
 from typing import Any
 
+from nav_config import active_routes
 from runtime_secret import read_password
 
 
@@ -79,7 +80,7 @@ def connect(config: dict[str, Any]) -> imaplib.IMAP4_SSL:
 
 def fetch_authorized_messages(config: dict[str, Any]) -> dict[str, list[Message]]:
     senders = sorted(
-        {str(route["sender"]).strip().lower() for route in config.get("routes") or []}
+        {str(route["sender"]).strip().lower() for route in active_routes(config)}
     )
     if not senders:
         return {}

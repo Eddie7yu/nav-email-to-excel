@@ -39,6 +39,8 @@ ROUTE_FIELDS = {
     "sheet",
     "code",
     "parser",
+    "paused",
+    "pause_reason",
     "allow_sender_only",
     "cumulative_policy",
     "cumulative_offset",
@@ -168,8 +170,27 @@ def validate_config(config: dict[str, Any]) -> None:
             errors.append(
                 f"{prefix}.subject_contains must be a non-empty string of at most 200 characters"
             )
-        if str(route.get("parser", "auto")) != "auto":
-            errors.append(f"{prefix}.parser currently supports only auto")
+        parser_name = str(route.get("parser", "auto"))
+        if parser_name != "auto" and not re.fullmatch(
+            r"local:[a-z][a-z0-9_-]{0,63}", parser_name
+        ):
+            errors.append(
+                f"{prefix}.parser must be auto or local:<trusted-parser-name>"
+            )
+        paused = route.get("paused", False)
+        if not isinstance(paused, bool):
+            errors.append(f"{prefix}.paused must be true or false")
+        pause_reason = route.get("pause_reason")
+        if paused and (
+            not isinstance(pause_reason, str)
+            or not pause_reason.strip()
+            or len(pause_reason.strip()) > 200
+        ):
+            errors.append(
+                f"{prefix}.pause_reason is required when paused and must be at most 200 characters"
+            )
+        if not paused and pause_reason is not None:
+            errors.append(f"{prefix}.pause_reason requires paused: true")
         if not isinstance(route.get("allow_sender_only", False), bool):
             errors.append(f"{prefix}.allow_sender_only must be true or false")
         policy = str(route.get("cumulative_policy", "require"))
@@ -356,6 +377,14 @@ def validate_config(config: dict[str, Any]) -> None:
 def normalize_code(value: Any) -> str | None:
     text = re.sub(r"[^A-Za-z0-9]", "", str(value or "")).upper()
     return text or None
+
+
+def active_routes(config: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        route
+        for route in config.get("routes") or []
+        if isinstance(route, dict) and not route.get("paused", False)
+    ]
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:

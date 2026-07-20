@@ -31,6 +31,7 @@ RUNTIME_FILES = (
     "run-preview.cmd",
     "runtime_secret.py",
 )
+MAX_WINDOWS_DESTINATION_CHARS = 120
 
 
 def runtime_python(root: Path) -> Path:
@@ -42,6 +43,13 @@ def validate_inputs(args: argparse.Namespace) -> tuple[Path, Path]:
         raise RuntimeError("Python 3.11 through 3.14 is required")
     destination = Path(args.destination).expanduser().resolve()
     workbook = Path(args.workbook).expanduser().resolve()
+    if os.name == "nt" and len(str(destination)) > MAX_WINDOWS_DESTINATION_CHARS:
+        raise RuntimeError(
+            "Windows 安装目录过长"
+            f"（当前 {len(str(destination))} 个字符，本工具支持不超过 "
+            f"{MAX_WINDOWS_DESTINATION_CHARS} 个字符）。"
+            "请改用 D:\\nav-runtime 这类短本地路径；不要部署在深层云盘同步目录或桌面目录。"
+        )
     if destination.exists():
         raise RuntimeError(
             f"Destination already exists; choose a new directory: {destination}"
@@ -110,12 +118,18 @@ def create_runtime(args: argparse.Namespace, destination: Path, workbook: Path) 
             if not source.is_file():
                 raise RuntimeError(f"Bundled runtime file is missing: {name}")
             shutil.copy2(source, staging / name)
+        (staging / "parsers").mkdir()
         builder = venv.EnvBuilder(
             with_pip=True, clear=False, system_site_packages=args.skip_deps
         )
         builder.create(staging / ".venv")
         python = runtime_python(staging)
         if not args.skip_deps:
+            print(
+                "正在安装锁定依赖，网络较慢时可能需要几分钟，请勿关闭窗口……",
+                flush=True,
+            )
+            environment = dict(os.environ, PYTHONUTF8="1")
             result = subprocess.run(
                 [
                     str(python),
@@ -127,10 +141,24 @@ def create_runtime(args: argparse.Namespace, destination: Path, workbook: Path) 
                     str(staging / "requirements.lock"),
                 ],
                 cwd=staging,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
             )
             if result.returncode:
+                detail = next(
+                    (
+                        line.strip()
+                        for line in reversed((result.stderr or "").splitlines())
+                        if line.strip()
+                    ),
+                    "未返回可读的错误详情",
+                )
                 raise RuntimeError(
-                    "Dependency installation failed; no runtime was installed"
+                    "依赖安装失败，运行目录已回滚。"
+                    f"请检查网络、权限和路径长度。详情：{detail}"
                 )
         config = config_payload(args, workbook)
         (staging / "config.json").write_text(
@@ -169,6 +197,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(errors="backslashreplace")
     args = parser().parse_args()
     try:
         destination, workbook = validate_inputs(args)

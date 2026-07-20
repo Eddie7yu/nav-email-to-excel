@@ -41,6 +41,8 @@ DENIED_NAMES = {
     "validation-report.json",
     "plan.json",
     "scheduled_tasks.json",
+    "last-scheduled-run.json",
+    "run.lock",
     "secret.json",
 }
 PATTERNS = {
