@@ -16,7 +16,13 @@ import openpyxl
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import column_index_from_string, get_column_letter, quote_sheetname
 
-from nav_config import ROOT, active_routes, normalize_code, write_json_atomic
+from nav_config import (
+    ROOT,
+    STATE_ROOT,
+    active_routes,
+    normalize_code,
+    write_json_atomic,
+)
 from nav_parse import NavRow, parse_date, parse_number
 
 
@@ -649,7 +655,7 @@ def validate_history(
         "warnings": warnings,
         "errors": errors,
     }
-    write_json_atomic(ROOT / "validation-report.json", report)
+    write_json_atomic(STATE_ROOT / "validation-report.json", report)
     return report
 
 
@@ -997,7 +1003,7 @@ def build_preview(
     route_rows: dict[str, list[NavRow]],
     warnings: list[str] | None = None,
 ) -> dict[str, Any]:
-    (ROOT / "plan.json").unlink(missing_ok=True)
+    (STATE_ROOT / "plan.json").unlink(missing_ok=True)
     master = Path(config["workbook_path"])
     preview_dir = ROOT / "previews"
     preview_dir.mkdir(exist_ok=True)
@@ -1185,7 +1191,7 @@ def build_preview(
     except Exception:
         workbook.close()
         preview.unlink(missing_ok=True)
-        (ROOT / "plan.json").unlink(missing_ok=True)
+        (STATE_ROOT / "plan.json").unlink(missing_ok=True)
         raise
     else:
         workbook.close()
@@ -1203,15 +1209,15 @@ def build_preview(
     }
     if not plan_sheets:
         preview.unlink(missing_ok=True)
-        (ROOT / "plan.json").unlink(missing_ok=True)
+        (STATE_ROOT / "plan.json").unlink(missing_ok=True)
         return plan
     try:
         validate_preview(config, plan)
     except Exception:
         preview.unlink(missing_ok=True)
-        (ROOT / "plan.json").unlink(missing_ok=True)
+        (STATE_ROOT / "plan.json").unlink(missing_ok=True)
         raise
-    write_json_atomic(ROOT / "plan.json", plan)
+    write_json_atomic(STATE_ROOT / "plan.json", plan)
     return plan
 
 

@@ -11,9 +11,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from nav_config import STATE_ROOT
 
-ROOT = Path(__file__).resolve().parent
-DEMO_ROOT = ROOT / "demo-runs"
+DEMO_ROOT = STATE_ROOT / "demo-runs"
 RUN_ID_PATTERN = re.compile(r"demo-\d{8}-\d{6}-[0-9a-f]{8}")
 FIXTURE_VALUE = "-".join(("fixture", "only"))
 DEMO_FILES = (
@@ -73,7 +73,7 @@ def prepare() -> dict[str, Any]:
     path.mkdir()
     try:
         for name in DEMO_FILES:
-            source = ROOT / name
+            source = STATE_ROOT / name
             if not source.is_file():
                 raise RuntimeError(f"演练所需文件缺失：{name}")
             shutil.copy2(source, path / name)

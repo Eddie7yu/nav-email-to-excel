@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config.json"
+STATE_ROOT = Path(__file__).resolve().parent
+ROOT = STATE_ROOT.parent if STATE_ROOT.name == "app" else STATE_ROOT
+CONFIG_PATH = STATE_ROOT / "config.json"
 DAY_NAMES = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}
 TOP_FIELDS = {
     "schema_version",

@@ -16,7 +16,7 @@ from nav_automation import (
     status as automation_status,
 )
 from nav_commit import commit
-from nav_config import CONFIG_PATH, ConfigError, ROOT, load_config
+from nav_config import CONFIG_PATH, STATE_ROOT, ConfigError, ROOT, load_config
 from nav_demo import commit as commit_demo
 from nav_demo import list_runs as list_demo_runs
 from nav_demo import prepare as prepare_demo
@@ -68,7 +68,7 @@ def prune_logs(config: dict[str, Any]) -> None:
 
 @contextmanager
 def run_lock() -> Iterator[None]:
-    path = ROOT / "run.lock"
+    path = STATE_ROOT / "run.lock"
     descriptor = _acquire_runtime_lock(path)
     try:
         _write_lock_state(

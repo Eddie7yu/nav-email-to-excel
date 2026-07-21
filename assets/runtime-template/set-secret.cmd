@@ -8,7 +8,7 @@ if errorlevel 1 (
   exit /b 2
 )
 title NAV email automation - authorization code
-if not exist ".venv\Scripts\python.exe" (
+if not exist "app\.venv\Scripts\python.exe" (
   echo Runtime Python was not found. Ask the AI to check this deployment.
   pause
   popd
@@ -17,7 +17,7 @@ if not exist ".venv\Scripts\python.exe" (
 echo This window only accepts the email authorization code.
 echo The code will not be shown in chat or logs.
 echo.
-".venv\Scripts\python.exe" -X utf8 navctl.py secret set
+"app\.venv\Scripts\python.exe" -X utf8 "app\navctl.py" secret set
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
   echo.

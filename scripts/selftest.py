@@ -10,7 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from bootstrap import pip_install_command
+from bootstrap import MAX_WINDOWS_DESTINATION_CHARS, pip_install_command
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,7 +108,7 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     if os.name == "nt":
         long_parent = temporary / "long-path-check"
         long_parent.mkdir()
-        minimum_length = 121
+        minimum_length = MAX_WINDOWS_DESTINATION_CHARS + 1
         leaf_length = max(10, minimum_length - len(str(long_parent.resolve())) - 1)
         long_destination = long_parent / ("x" * leaf_length)
         long_command = command.copy()
@@ -141,32 +141,64 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     ]
     if unwanted:
         raise AssertionError("bootstrap copied build caches into the deployed runtime")
-    if not (destination / "parsers").is_dir():
+    app = destination / "app"
+    if not (app / "parsers").is_dir():
         raise AssertionError(
             "bootstrap did not create the trusted local parser directory"
         )
-    secret_launcher = destination / "set-secret.cmd"
+    expected_user_entries = {
+        ".gitignore",
+        "app",
+        "backups",
+        "logs",
+        "previews",
+        "使用说明.txt",
+        "手动更新.bat",
+        "查看状态.bat",
+        "首次授权.bat",
+    }
+    if {path.name for path in destination.iterdir()} != expected_user_entries:
+        raise AssertionError("bootstrap did not keep the user-facing root concise")
+    if list(destination.glob("*.py")) or list(destination.glob("*.json")):
+        raise AssertionError(
+            "bootstrap exposed internal code or state in the user root"
+        )
+    for launcher_name in ("首次授权.bat", "查看状态.bat", "手动更新.bat"):
+        launcher = destination / launcher_name
+        launcher_text = launcher.read_text(encoding="utf-8")
+        if (
+            not launcher.is_file()
+            or not launcher.read_bytes().isascii()
+            or "app\\.venv\\Scripts\\python.exe" not in launcher_text
+            or "app\\navctl.py" not in launcher_text
+        ):
+            raise AssertionError(
+                f"bootstrap generated an invalid user launcher: {launcher_name}"
+            )
+    secret_launcher = destination / "首次授权.bat"
     if (
         not secret_launcher.is_file()
-        or "navctl.py secret set" not in secret_launcher.read_text(encoding="utf-8")
+        or "secret set" not in secret_launcher.read_text(encoding="utf-8")
         or not secret_launcher.read_bytes().isascii()
     ):
         raise AssertionError(
             "bootstrap did not create a cmd-compatible visible secret prompt"
         )
-    config_path = destination / "config.json"
+    config_path = app / "config.json"
     original_config = config_path.read_bytes()
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if config["workbook_path"] != str(workbook_path.resolve()) or config["routes"]:
         raise AssertionError("bootstrap generated an unsafe initial configuration")
     runtime_python = (
-        destination
-        / ".venv"
-        / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        app / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     )
     if not runtime_python.is_file():
         raise AssertionError("bootstrap did not create the isolated Python runtime")
-    for wrapper in destination.glob("*.cmd"):
+    for wrapper in (
+        path
+        for path in destination.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".bat", ".cmd"}
+    ):
         payload = wrapper.read_bytes()
         if b"\n" in payload.replace(b"\r\n", b""):
             raise AssertionError(
@@ -174,7 +206,7 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
             )
     doctor = subprocess.run(
         [str(runtime_python), "-X", "utf8", "navctl.py", "doctor"],
-        cwd=destination,
+        cwd=app,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -198,7 +230,7 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     if os.name == "nt":
         piped_secret = subprocess.run(
             [str(runtime_python), "-X", "utf8", "navctl.py", "secret", "set"],
-            cwd=destination,
+            cwd=app,
             input="",
             capture_output=True,
             text=True,
@@ -217,7 +249,7 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
             )
     scheduled_update = subprocess.run(
         [str(runtime_python), "-X", "utf8", "navctl.py", "scheduled-update"],
-        cwd=destination,
+        cwd=app,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -227,7 +259,7 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
         raise AssertionError("unapproved scheduled update did not fail closed")
     schedule_status = subprocess.run(
         [str(runtime_python), "-X", "utf8", "navctl.py", "schedule", "status"],
-        cwd=destination,
+        cwd=app,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -244,7 +276,7 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
         )
     demo = subprocess.run(
         [str(runtime_python), "-X", "utf8", "navctl.py", "demo", "prepare"],
-        cwd=destination,
+        cwd=app,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -276,7 +308,7 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
                 "--run-id",
                 run_id,
             ],
-            cwd=destination,
+            cwd=app,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -297,7 +329,7 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
                     run_id,
                     "--yes-reviewed-preview",
                 ],
-                cwd=destination,
+                cwd=app,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -324,7 +356,7 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
                 "--run-id",
                 run_id,
             ],
-            cwd=destination,
+            cwd=app,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -334,6 +366,15 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
             raise AssertionError(f"offline demo cleanup failed: {removed.stdout}")
     if config_path.read_bytes() != original_config:
         raise AssertionError("offline demo changed the real runtime configuration")
+    if list(destination.glob("*.py")) or list(destination.glob("*.json")):
+        raise AssertionError(
+            "runtime commands leaked internal files into the user root"
+        )
+    if (
+        not (app / "last-scheduled-run.json").is_file()
+        or not (app / "run.lock").is_file()
+    ):
+        raise AssertionError("runtime state was not kept inside app")
     if os.name == "nt":
         unicode_destination = temporary / "unicode-😀-runtime"
         unicode_command = [

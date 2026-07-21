@@ -16,7 +16,13 @@ from nav_commit import (
     ensure_process_exit,
     spreadsheet_app,
 )
-from nav_config import ROOT, active_routes, normalize_code, write_json_atomic
+from nav_config import (
+    ROOT,
+    STATE_ROOT,
+    active_routes,
+    normalize_code,
+    write_json_atomic,
+)
 from nav_mail import (
     decoded,
     fetch_authorized_messages,
@@ -122,7 +128,7 @@ def propose_routes(config: dict[str, Any]) -> dict[str, Any]:
         "warnings": warnings,
         "errors": [] if candidates else ["没有发现可自动解析的净值邮件候选"],
     }
-    write_json_atomic(ROOT / "route-proposals.json", report)
+    write_json_atomic(STATE_ROOT / "route-proposals.json", report)
     return report
 
 
@@ -144,7 +150,7 @@ def collect_route_rows(
             "warnings": warnings,
             "errors": ["No active routes are configured"],
         }
-        write_json_atomic(ROOT / "route-report.json", report)
+        write_json_atomic(STATE_ROOT / "route-report.json", report)
         return {}, report
     messages = fetch_authorized_messages(config)
     sender_routes: dict[str, list[dict[str, Any]]] = {}
@@ -255,7 +261,7 @@ def collect_route_rows(
         "warnings": warnings,
         "errors": errors,
     }
-    write_json_atomic(ROOT / "route-report.json", report)
+    write_json_atomic(STATE_ROOT / "route-report.json", report)
     return output, report
 
 
@@ -384,7 +390,7 @@ def preview(
     config: dict[str, Any], rows: dict[str, list[NavRow]] | None = None
 ) -> dict[str, Any]:
     # A failed preview must never leave an older commit plan looking current.
-    (ROOT / "plan.json").unlink(missing_ok=True)
+    (STATE_ROOT / "plan.json").unlink(missing_ok=True)
     warnings: list[str] = []
     if rows is None:
         rows, discovery = collect_route_rows(config)

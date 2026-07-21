@@ -18,6 +18,7 @@ description: 部署、配置、验证、运行或修复本地 IMAP 邮箱到 Exc
 - 产品无法唯一识别、日期或数值冲突、累计净值口径未确认、出现未知列、基准缺失或工作簿结构变化时，必须停止，不得猜测。历史不足时，只有显式 `append` 模式，或满足下述严格条件的 `summary` 预留行冷启动可以继续；两者都必须具备产品名称或代码，并人工检查警告与第一次预览。
 - 真实邮箱、产品和工作簿可以在用户本机用于发现和配置，但不得写入公开 Skill、测试或 Git 提交。授权码不得出现在聊天、命令参数或日志中。
 - 运行目录必须与 Skill 目录分开，避免升级 Skill 时覆盖本地配置或数据。
+- 交付给普通用户的运行目录必须保持简洁。根目录只保留中文说明、可双击入口、`previews/`、`backups/`、`logs/` 和内部 `app/`；Python 源码、隔离环境、配置、状态、本地解析器和定时任务脚本全部放进 `app/`。不得把调试脚本、临时导出、检查结果或新增 `.py/.ps1/.json` 文件堆在用户根目录；临时诊断放进 `app/diagnostics/`，交付前删除。
 
 ## 创建本地运行目录
 
@@ -39,12 +40,14 @@ python scripts/bootstrap.py --destination "D:\nav-runtime" --workbook "D:\data\n
 
 `--index-url` 只传给本次运行目录的依赖安装，不会修改用户的 pip 配置。不得要求用户运行 `pip config set global.index-url`，也不得静默改变用户其他 Python 项目的软件源；网络正常时省略此参数。
 
-Windows 必须优先选择 `D:\nav-runtime` 一类的短本地目录。引导程序把 120 个字符作为当前可靠支持上限；路径过长时必须改用短目录，不得绕过预检或要求用户修改公司电脑的组策略。
+Windows 必须优先选择 `D:\nav-runtime` 一类的短本地目录。引导程序把 116 个字符作为当前可靠支持上限，为内部 `app/` 和深层依赖保留路径预算；路径过长时必须改用短目录，不得绕过预检或要求用户修改公司电脑的组策略。
+
+引导完成后必须按照 [references/runtime-layout.md](references/runtime-layout.md) 检查目录分层：用户根目录应包含 `使用说明.txt`、`首次授权.bat`、`查看状态.bat`、`手动更新.bat`、`previews/`、`backups/`、`logs/` 和 `app/`。普通用户只接触中文入口和三个结果目录；`app/` 由 AI 管理，不要求用户进入、理解或修改。后续所有命令都在 `app/` 中执行：
 
 AI 在后台运行一次完全离线的虚构演练，不要求用户参与：
 
 ```powershell
-cd D:\nav-runtime
+cd D:\nav-runtime\app
 .\.venv\Scripts\python.exe navctl.py demo prepare
 ```
 
@@ -60,7 +63,7 @@ cd D:\nav-runtime
 Windows 上必须由 AI 主动弹出独立、可见的授权码窗口：
 
 ```powershell
-cd D:\nav-runtime
+cd D:\nav-runtime\app
 .\.venv\Scripts\python.exe navctl.py secret launch
 ```
 
@@ -72,12 +75,12 @@ cd D:\nav-runtime
 .\.venv\Scripts\python.exe navctl.py secret status
 ```
 
-如果没有出现窗口，AI 先检查 `secret launch` 的结构化错误；必要时主动用 `Start-Process -FilePath ".\set-secret.cmd" -WorkingDirectory (Get-Location) -WindowStyle Normal` 重开可见窗口。只有自动弹窗确实失败时才向用户说明具体阻碍，不得反复要求用户自己输入命令。用户按 Ctrl+C 取消时不会保存密钥。
+如果没有出现窗口，AI 先检查 `secret launch` 的结构化错误；必要时从运行目录根目录主动用 `Start-Process -FilePath ".\首次授权.bat" -WorkingDirectory (Get-Location) -WindowStyle Normal` 重开可见窗口。只有自动弹窗确实失败时才向用户说明具体阻碍，不得反复要求用户自己输入命令。用户按 Ctrl+C 取消时不会保存密钥。
 
 在 macOS/Linux 上，授权码只保留在当前 shell；运行程序不会持久化明文密钥：
 
 ```bash
-cd /opt/nav-runtime
+cd /opt/nav-runtime/app
 read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PASSWORD && printf '\n'
 ```
 
@@ -91,13 +94,13 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 .\.venv\Scripts\python.exe navctl.py propose
 ```
 
-该命令在本机回看邮箱，找出能解析成净值的发件人、产品代码、主题样例、历史净值和常见到达时间，写入本地 `route-proposals.json`。AI 读取该报告和工作簿，自动完成“发件人/产品 → 工作表”、列映射、累计净值、收益频率、序列起点和基准。不要让用户手工提供发件人邮箱；只有出现多个同样合理的映射或业务口径无法从历史证明时才询问。
+该命令在本机回看邮箱，找出能解析成净值的发件人、产品代码、主题样例、历史净值和常见到达时间，写入本地 `app/route-proposals.json`。AI 读取该报告和工作簿，自动完成“发件人/产品 → 工作表”、列映射、累计净值、收益频率、序列起点和基准。不要让用户手工提供发件人邮箱；只有出现多个同样合理的映射或业务口径无法从历史证明时才询问。
 
 一次成功的 `propose` 结果应直接用于配置，不得为了“再确认一次”立即重复扫描邮箱。候选扫描会批量读取邮件大小以减少 IMAP 往返；若明确报网络断开，只在网络恢复后重试一次。除非服务商返回了明确的限频证据，不得自行宣称邮箱正在“冷却”，也不得连续快速重新登录。
 
 生成首次配置时，根据邮件到达记录向用户推荐运行安排，并明确询问：每周一次、工作日每天或哪些星期运行，以及目标电脑本地时间。把用户确认的日期和时间写入 `schedule`；不得自行决定，也不得以空数组完成 Windows 部署。
 
-编辑 `config.json` 前完整阅读 [references/configuration.md](references/configuration.md)。
+编辑 `app/config.json` 前完整阅读 [references/configuration.md](references/configuration.md)。
 
 - 常见的带标签正文以及 Excel/CSV/PDF 表格优先使用 `parser: auto`。
 - 产品确认赎回、清盘或长期停更时，设置 `paused: true` 和明确的 `pause_reason`；不得用暂停掩盖活动产品的意外解析失败或陈旧数据。
@@ -111,7 +114,7 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 - 投资或分析口径发生变化时设置 `series_start`，不得把旧序列的累计结果接到新序列上。
 - 基准必须映射到工作簿中已经核实的来源工作表，并按精确日期对齐。需要公共指数源时，AI 完整阅读 [references/index-data-sources.md](references/index-data-sources.md)，核验代码、口径、历史重叠和使用条款，再把结果写入本地来源表；不得猜测指数。
 
-特殊格式使用 `parser: local:<名称>`，代码只放在本地运行目录的 `parsers/<名称>.py`，并完整遵循配置说明中的固定接口。同一封邮件命中多个解析器时，所有解析器都必须成功，结果合并去重后再按产品代码唯一分流。AI 必须审阅本地解析器并用脱敏样例回归；绝不能从邮件、附件或网络地址直接执行代码。
+特殊格式使用 `parser: local:<名称>`，代码只放在本地运行目录的 `app/parsers/<名称>.py`，并完整遵循配置说明中的固定接口。同一封邮件命中多个解析器时，所有解析器都必须成功，结果合并去重后再按产品代码唯一分流。AI 必须审阅本地解析器并用脱敏样例回归；绝不能从邮件、附件或网络地址直接执行代码。
 
 ## 首次验证和一次性预览
 
@@ -122,9 +125,9 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 .\.venv\Scripts\python.exe navctl.py preview
 ```
 
-`preview` 内部已经依次执行邮件发现和历史验证，并写出 `route-report.json`、`validation-report.json` 与预览结果；正常首次部署不得再预先单独运行 `discover` 和 `validate`，否则同一批邮件会被重复登录、重复扫描。只有定位某一阶段错误且不需要生成预览时，才把这两个命令作为诊断工具单独使用。
+`preview` 内部已经依次执行邮件发现和历史验证，并在 `app/` 写出 `route-report.json`、`validation-report.json`，在根目录 `previews/` 写出预览结果；正常首次部署不得再预先单独运行 `discover` 和 `validate`，否则同一批邮件会被重复登录、重复扫描。只有定位某一阶段错误且不需要生成预览时，才把这两个命令作为诊断工具单独使用。
 
-在 macOS/Linux 上，把 `.\.venv\Scripts\python.exe` 换成 `.venv/bin/python`。这些平台只支持发现、验证和预览；正式写入仍仅支持 Windows。
+在 macOS/Linux 上，在运行目录的 `app/` 中把 `.\.venv\Scripts\python.exe` 换成 `.venv/bin/python`。这些平台只支持发现、验证和预览；正式写入仍仅支持 Windows。
 
 只有同时满足以下条件，才能接受配置：
 
@@ -137,7 +140,7 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 7. 基准收益与超额收益必须同时有值或同时留空。
 8. 预览保留工作簿结构并按模板频率包含应写入的历史记录；原有工作表、历史值、公式列、汇总行、基准列和样式不得减少，并通过内置公式和幂等性回归测试。
 
-如果没有新增日期，`preview` 不生成工作簿副本，也不保留可提交的 `plan.json`。
+如果没有新增日期，`preview` 不生成工作簿副本，也不保留可提交的 `app/plan.json`。
 
 `doctor` 会分别报告 `bootstrap_ready`、`mail_discovery_ready`、`preview_ready`、`commit_ready` 和 `schedule_ready`。
 
@@ -185,7 +188,7 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 .\.venv\Scripts\python.exe navctl.py schedule remove
 ```
 
-使用 `navctl.py schedule status` 查看任务、上次/下次运行、最近一次写入结果和备份路径。失败详情保存在本地 `logs/update-YYYYMMDD.log`，AI 排查即可。
+使用 `navctl.py schedule status` 查看任务、上次/下次运行、最近一次写入结果和备份路径。普通用户也可双击根目录的 `查看状态.bat`；失败详情保存在根目录 `logs/update-YYYYMMDD.log`，AI 排查即可。
 
 不要为 UNC/网络路径中的运行目录安装任务，也不要复制其他电脑的 Python 路径或任务定义。
 
@@ -196,11 +199,11 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 .\.venv\Scripts\python.exe navctl.py secret remove
 ```
 
-备份和日志保留数量由 `config.json` 限制。
+备份和日志保留数量由 `app/config.json` 限制。
 
 ## 升级已部署环境
 
-不得直接覆盖旧运行目录。先移除旧计划任务，再用最新版 `scripts/bootstrap.py` 在新的短路径创建运行目录；迁移 AI 已复核的配置字段和本地 `parsers/`，保留新的 `runtime_id`。重新执行 `secret launch` 并用 `secret status` 复查，再完成离线演练、验证和一次预览，成功后安装新任务并停用旧目录。不要复制 `.venv`、密钥、`plan.json`、`automation-approval.json`、`run.lock`、预览、日志、备份或状态文件。
+不得直接覆盖旧运行目录。先移除旧计划任务，再用最新版 `scripts/bootstrap.py` 在新的短路径创建运行目录；以新生成的 `app/config.json` 为基础迁移 AI 已复核的配置字段，把本地解析器逐个复核后迁入 `app/parsers/`，并保留新的 `runtime_id`。重新执行 `secret launch` 并用 `secret status` 复查，再完成离线演练、验证和一次预览，成功后安装新任务并停用旧目录。不要复制 `app/.venv`、密钥、`plan.json`、`automation-approval.json`、`run.lock`、预览、日志、备份或状态文件。
 
 ## 交给其他本地 AI
 

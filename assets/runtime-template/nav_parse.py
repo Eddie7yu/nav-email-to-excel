@@ -18,7 +18,7 @@ import openpyxl
 import xlrd
 from pypdf import PdfReader
 
-from nav_config import normalize_code
+from nav_config import STATE_ROOT, normalize_code
 
 
 DATE_WORDS = ("净值日期", "估值日期", "业务日期", "navdate", "date", "日期")
@@ -355,7 +355,7 @@ def _rows_from_local_parser(message: Message, parser_name: str) -> list[NavRow]:
     name = parser_name.removeprefix("local:")
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name):
         raise ParseError("Local parser name is invalid")
-    directory = (Path(__file__).resolve().parent / "parsers").resolve()
+    directory = (STATE_ROOT / "parsers").resolve()
     path = (directory / f"{name}.py").resolve()
     if path.parent != directory or not path.is_file():
         raise ParseError(f"Local parser is missing: {name}")

@@ -16,7 +16,7 @@
 
 ## 顶层字段
 
-`config.json` 由本地运行实例生成，绝不能提交到 Git。
+`app/config.json` 由本地运行实例生成，绝不能提交到 Git。普通用户不需要打开或修改它；AI 从运行目录的 `app/` 执行以下命令。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -49,7 +49,7 @@
 .\.venv\Scripts\python.exe navctl.py propose
 ```
 
-命令会在本机按 `lookback_days` 扫描邮箱，忽略不能解析成净值的普通邮件，把可解析候选的真实发件人、主题样例、产品代码、净值日期/数值和近期到达时间写入 `route-proposals.json`。这些数据只存在于本地运行目录。AI 应读取该报告和工作簿，自动生成 `routes`、`column_overrides` 和 `schedule`；不得要求用户手工抄写发件人邮箱、产品代码或逐项填写列号。
+命令会在本机按 `lookback_days` 扫描邮箱，忽略不能解析成净值的普通邮件，把可解析候选的真实发件人、主题样例、产品代码、净值日期/数值和近期到达时间写入 `app/route-proposals.json`。这些数据只存在于本地运行目录。AI 应读取该报告和工作簿，自动生成 `routes`、`column_overrides` 和 `schedule`；不得要求用户手工抄写发件人邮箱、产品代码或逐项填写列号。
 
 成功生成候选报告后不要立即重复运行 `propose`。完成路由配置后直接运行一次 `preview`；它会在同一次授权邮件扫描结果上完成发现、历史验证和预览。`discover`、`validate` 仅用于分阶段诊断，不应在每次 `preview` 前固定串行执行。运行时会按批次读取邮件大小，避免为每封邮件额外发送一次大小查询。
 
@@ -114,11 +114,11 @@
 
 `summary` 还有一个程序自动识别的冷启动状态：表头下只有一条预留数据行，该行仅含与路由精确一致的产品名称或代码及一个预留日期，单位/累计净值为空，其下立即是“累计/合计”行。邮件至少含 `minimum_history_dates` 个不同日期、预留行没有备注或其他业务内容时，程序用最早真实邮件替换预留日期并补全该行，再把其余日期插入汇总行之前。AI 不得把这种结构改成 `append`，不得询问用户删除“累计”行，也不得为凑门槛伪造历史数据。
 
-已有工作簿的模板高于邮件频率：邮箱历史用于提供和核验真实净值，表内日期规律、表头、公式和汇总结构决定落表方式。周度模板收到日度邮件时，不得把全部日度记录直接灌入；运行时会优先复用工作簿已经出现的周内日期，新增周沿用历史中最常见的星期；没有足够历史但表头明确周度时，默认取每个已完成自然周最后一条可用净值。`validation-report.json` 和 `plan.json` 会写明最终采用的 `data_frequency` 及判断来源。详细反例和验收表见 [template-preservation-case.md](template-preservation-case.md)。
+已有工作簿的模板高于邮件频率：邮箱历史用于提供和核验真实净值，表内日期规律、表头、公式和汇总结构决定落表方式。周度模板收到日度邮件时，不得把全部日度记录直接灌入；运行时会优先复用工作簿已经出现的周内日期，新增周沿用历史中最常见的星期；没有足够历史但表头明确周度时，默认取每个已完成自然周最后一条可用净值。`app/validation-report.json` 和 `app/plan.json` 会写明最终采用的 `data_frequency` 及判断来源。详细反例和验收表见 [template-preservation-case.md](template-preservation-case.md)。
 
 ## 本地解析器
 
-默认使用 `parser: auto`。确有完全脱敏的样例证明通用解析器无法处理时，可以在本地运行目录的 `parsers/` 中增加受信任解析器，并配置为 `local:<名称>`，例如 `local:custom_nav` 对应 `parsers/custom_nav.py`。名称只能使用小写字母、数字、下划线和连字符。同一封邮件命中多个不同解析器时，所有适用解析器都必须成功，结果会合并去重后再按产品代码唯一分流。
+默认使用 `parser: auto`。确有完全脱敏的样例证明通用解析器无法处理时，可以在本地运行目录的 `app/parsers/` 中增加受信任解析器，并配置为 `local:<名称>`，例如 `local:custom_nav` 对应 `app/parsers/custom_nav.py`。名称只能使用小写字母、数字、下划线和连字符。同一封邮件命中多个不同解析器时，所有适用解析器都必须成功，结果会合并去重后再按产品代码唯一分流。
 
 同一发件人的不同产品使用不同解析器时，优先配置互不重叠的 `subject_contains`，避免每封邮件同时触发所有解析器。无法用主题可靠分流时，必须用完全脱敏的同发件人样例验证所有解析器都能处理范围内的每封邮件。
 
@@ -196,9 +196,9 @@ AI 应先采用一致、可解释的行业常用口径并在交付中说明：
 }
 ```
 
-时间使用目标电脑的本地时区。首次配置时，AI 应参考 `route-proposals.json` 中的近期到达时间给出推荐，然后明确询问用户希望每周一次、工作日每天或哪些星期运行，以及具体时间；只有用户确认后才能写入 `schedule`。可以配置多个时点。Windows 正式部署不得保持空数组，`doctor` 会用 `schedule-config` 和 `schedule_ready` 显示是否完成。定时任务仅支持 Windows、本地路径和已登录的用户会话。
+时间使用目标电脑的本地时区。首次配置时，AI 应参考 `app/route-proposals.json` 中的近期到达时间给出推荐，然后明确询问用户希望每周一次、工作日每天或哪些星期运行，以及具体时间；只有用户确认后才能写入 `schedule`。可以配置多个时点。Windows 正式部署不得保持空数组，`doctor` 会用 `schedule-config` 和 `schedule_ready` 显示是否完成。定时任务仅支持 Windows、本地路径和已登录的用户会话。
 
-第一次预览经用户批准并成功执行 `commit --yes-reviewed-preview` 后，当前写表配置会记录到本地 `automation-approval.json`。此后计划任务自动执行发现、验证、备份和 COM 写入，不要求逐次预览；内部临时验收副本在运行结束后删除。路由、工作簿路径、IMAP 范围、列映射、样式或校验规则变化会使批准失效，防止新规则未经第一次验收就自动写入。只修改运行时间或保留数量不会使批准失效。
+第一次预览经用户批准并成功执行 `commit --yes-reviewed-preview` 后，当前写表配置会记录到本地 `app/automation-approval.json`。此后计划任务自动执行发现、验证、备份和 COM 写入，不要求逐次预览；内部临时验收副本在运行结束后删除。路由、工作簿路径、IMAP 范围、列映射、样式或校验规则变化会使批准失效，防止新规则未经第一次验收就自动写入。只修改运行时间或保留数量不会使批准失效。
 
 安装后使用 `navctl.py schedule status` 查看任务、自动更新批准状态、上次/下次运行、写入行数和备份路径。失败详情保存在 `logs/update-YYYYMMDD.log`；失败时正式工作簿保持不变。
 
@@ -210,10 +210,10 @@ AI 应先采用一致、可解释的行业常用口径并在交付中说明：
 
 ## 本地敏感文件
 
-以下文件仅能存在于本地运行目录，并应被 Git 忽略：`config.json`、`route-proposals.json`、`route-report.json`、`validation-report.json`、`plan.json`、`automation-approval.json`、`scheduled_tasks.json`、`last-scheduled-run.json`、`run.lock`、本地 `parsers/`、预览工作簿、正式工作簿、`logs/` 和 `backups/`。Windows 密钥保存在当前用户的本地应用数据目录，并使用 DPAPI 加密。
+以下文件仅能存在于本地运行目录，并应被 Git 忽略：`app/config.json`、`app/route-proposals.json`、`app/route-report.json`、`app/validation-report.json`、`app/plan.json`、`app/automation-approval.json`、`app/scheduled_tasks.json`、`app/last-scheduled-run.json`、`app/run.lock`、本地 `app/parsers/`、根目录中的预览工作簿、`logs/` 和 `backups/`。正式工作簿保留在用户指定的原路径。Windows 密钥保存在当前用户的本地应用数据目录，并使用 DPAPI 加密。目录分层见 [runtime-layout.md](runtime-layout.md)。
 
-`run.lock` 在正常运行结束后保留一条 `idle` 诊断记录，不代表仍被锁定。真正的并发保护由操作系统持有；进程崩溃或断电后会自动释放，不需要手动删除文件。
+`app/run.lock` 在正常运行结束后保留一条 `idle` 诊断记录，不代表仍被锁定。真正的并发保护由操作系统持有；进程崩溃或断电后会自动释放，不需要手动删除文件。
 
-`demo-runs/` 只包含 `navctl.py demo` 生成的虚构邮件状态、虚构工作簿和预览，不会复制真实配置或密钥。检查完成后使用 `navctl.py demo remove --run-id <run_id>` 删除指定演练。
+`app/demo-runs/` 只包含 `navctl.py demo` 生成的虚构邮件状态、虚构工作簿和预览，不会复制真实配置或密钥。检查完成后使用 `navctl.py demo remove --run-id <run_id>` 删除指定演练。
 
 程序会在 IMAP 搜索后再次精确检查解析出的 `From` 地址，但这只是路由验证，并非加密级发件人认证。若伪造邮件构成实质风险，应先在邮箱服务商侧强制执行 DKIM/DMARC，或使用专用邮箱规则，再启用此流程。

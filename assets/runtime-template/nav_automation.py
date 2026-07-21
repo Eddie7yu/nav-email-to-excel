@@ -6,10 +6,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from nav_config import ROOT, write_json_atomic
+from nav_config import ROOT, STATE_ROOT, write_json_atomic
 
 
-APPROVAL = ROOT / "automation-approval.json"
+APPROVAL = STATE_ROOT / "automation-approval.json"
 APPROVED_CONFIG_FIELDS = (
     "schema_version",
     "runtime_id",
@@ -92,7 +92,7 @@ def discard_staging(plan: dict[str, Any] | None) -> None:
             preview = Path(str(value)).resolve()
             if preview.parent == (ROOT / "previews").resolve():
                 preview.unlink(missing_ok=True)
-    (ROOT / "plan.json").unlink(missing_ok=True)
+    (STATE_ROOT / "plan.json").unlink(missing_ok=True)
 
 
 def automatic_update(

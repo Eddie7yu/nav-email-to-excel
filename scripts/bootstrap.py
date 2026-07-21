@@ -16,8 +16,15 @@ from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "assets" / "runtime-template"
-RUNTIME_FILES = (
-    ".gitignore",
+APP_DIRECTORY = "app"
+ROOT_FILE_MAP = {
+    ".gitignore": ".gitignore",
+    "manual-update.cmd": "手动更新.bat",
+    "runtime-guide.txt": "使用说明.txt",
+    "set-secret.cmd": "首次授权.bat",
+    "view-status.cmd": "查看状态.bat",
+}
+APP_FILES = (
     "navctl.py",
     "nav_automation.py",
     "nav_commit.py",
@@ -31,14 +38,18 @@ RUNTIME_FILES = (
     "nav_workbook.py",
     "requirements.lock",
     "run-update.cmd",
-    "set-secret.cmd",
     "runtime_secret.py",
 )
-MAX_WINDOWS_DESTINATION_CHARS = 120
+MAX_WINDOWS_DESTINATION_CHARS = 116
 
 
 def runtime_python(root: Path) -> Path:
-    return root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    return (
+        root
+        / APP_DIRECTORY
+        / ".venv"
+        / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    )
 
 
 def normalize_index_url(value: str | None) -> str | None:
@@ -152,16 +163,25 @@ def create_runtime(args: argparse.Namespace, destination: Path, workbook: Path) 
     )
     try:
         staging.mkdir()
-        for name in RUNTIME_FILES:
+        app = staging / APP_DIRECTORY
+        app.mkdir()
+        for source_name, destination_name in ROOT_FILE_MAP.items():
+            source = TEMPLATE / source_name
+            if not source.is_file():
+                raise RuntimeError(f"Bundled runtime file is missing: {source_name}")
+            shutil.copy2(source, staging / destination_name)
+        for name in APP_FILES:
             source = TEMPLATE / name
             if not source.is_file():
                 raise RuntimeError(f"Bundled runtime file is missing: {name}")
-            shutil.copy2(source, staging / name)
-        (staging / "parsers").mkdir()
+            shutil.copy2(source, app / name)
+        (app / "parsers").mkdir()
+        for name in ("backups", "logs", "previews"):
+            (staging / name).mkdir()
         builder = venv.EnvBuilder(
             with_pip=True, clear=False, system_site_packages=args.skip_deps
         )
-        builder.create(staging / ".venv")
+        builder.create(app / ".venv")
         python = runtime_python(staging)
         if not args.skip_deps:
             source = (
@@ -175,10 +195,8 @@ def create_runtime(args: argparse.Namespace, destination: Path, workbook: Path) 
             )
             environment = dict(os.environ, PYTHONUTF8="1")
             result = subprocess.run(
-                pip_install_command(
-                    python, staging / "requirements.lock", args.index_url
-                ),
-                cwd=staging,
+                pip_install_command(python, app / "requirements.lock", args.index_url),
+                cwd=app,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -205,10 +223,14 @@ def create_runtime(args: argparse.Namespace, destination: Path, workbook: Path) 
                     f"请检查网络、权限和路径长度。{network_hint}详情：{detail}"
                 )
         config = config_payload(args, workbook)
-        (staging / "config.json").write_text(
+        (app / "config.json").write_text(
             json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-        for command in staging.glob("*.cmd"):
+        for command in (
+            path
+            for path in staging.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".bat", ".cmd"}
+        ):
             text = (
                 command.read_text(encoding="utf-8")
                 .replace("\r\n", "\n")
@@ -258,8 +280,8 @@ def main() -> int:
         create_runtime(args, destination, workbook)
         print(f"Runtime created: {destination}")
         print(
-            "Next: run navctl.py secret set, then let the AI run navctl.py propose "
-            "to discover sender routes automatically."
+            "下一步：由 AI 在 app 目录运行 navctl.py secret launch，"
+            "用户只在弹出的窗口粘贴一次授权码；随后由 AI 自动发现路由。"
         )
         return 0
     except Exception as exc:

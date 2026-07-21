@@ -15,7 +15,7 @@ from typing import Any
 
 import openpyxl
 
-from nav_config import ROOT, active_routes
+from nav_config import ROOT, STATE_ROOT, active_routes
 from nav_workbook import file_sha256, payload_sha256, validate_preview
 
 
@@ -407,7 +407,7 @@ def _verify_temp(temp: Path, preview: Path, plan: dict[str, Any]) -> None:
 
 
 def commit(config: dict[str, Any]) -> dict[str, Any]:
-    plan_path = ROOT / "plan.json"
+    plan_path = STATE_ROOT / "plan.json"
     try:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError) as exc:

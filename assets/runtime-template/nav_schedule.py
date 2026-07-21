@@ -7,11 +7,11 @@ import subprocess
 from typing import Any
 
 from nav_automation import require_approved
-from nav_config import ROOT, write_json_atomic
+from nav_config import ROOT, STATE_ROOT, write_json_atomic
 
 
-STATE = ROOT / "scheduled_tasks.json"
-LAST_RUN = ROOT / "last-scheduled-run.json"
+STATE = STATE_ROOT / "scheduled_tasks.json"
+LAST_RUN = STATE_ROOT / "last-scheduled-run.json"
 
 
 class ScheduleError(RuntimeError):
@@ -78,7 +78,7 @@ def install(config: dict[str, Any]) -> dict[str, Any]:
     if not schedules:
         raise ScheduleError("config.schedule is empty")
     previous = [str(name) for name in _state().get("tasks") or []]
-    wrapper = ROOT / "run-update.cmd"
+    wrapper = STATE_ROOT / "run-update.cmd"
     if not wrapper.is_file():
         raise ScheduleError("run-update.cmd is missing")
     generation = dt.datetime.now().strftime("%Y%m%d%H%M%S")

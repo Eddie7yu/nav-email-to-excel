@@ -10,6 +10,7 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Callable, TextIO
 
+from nav_config import ROOT
 
 MASKED_INPUT_PROMPT = "请右键粘贴授权码，屏幕只显示星号，粘贴后回车"
 
@@ -73,7 +74,7 @@ def set_password(runtime_id: str, password: str | None = None) -> Path:
 def launch_secret_prompt() -> int:
     if os.name != "nt":
         raise RuntimeError("可见授权码窗口只支持 Windows")
-    launcher = Path(__file__).resolve().with_name("set-secret.cmd")
+    launcher = ROOT / "首次授权.bat"
     if not launcher.is_file():
         raise RuntimeError("授权码窗口启动脚本缺失")
     system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
