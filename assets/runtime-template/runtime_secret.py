@@ -13,6 +13,10 @@ from typing import Callable, TextIO
 MASKED_INPUT_PROMPT = "请右键粘贴授权码，屏幕只显示星号，粘贴后回车"
 
 
+class SecretInputCancelled(Exception):
+    pass
+
+
 class DATA_BLOB(ctypes.Structure):
     _fields_ = [
         ("cbData", wintypes.DWORD),
@@ -68,7 +72,28 @@ def set_password(runtime_id: str, password: str | None = None) -> Path:
 def _read_windows_secret() -> str:
     import msvcrt
 
-    return _read_masked(msvcrt.getwch, sys.stderr)
+    return _read_interactive_secret(msvcrt.getwch, sys.stdin, sys.stderr)
+
+
+def _read_interactive_secret(
+    get_character: Callable[[], str], input_stream: TextIO | None, output: TextIO
+) -> str:
+    _require_interactive_terminal(input_stream)
+    try:
+        return _read_masked(get_character, output)
+    except KeyboardInterrupt:
+        output.write("\n")
+        output.flush()
+        raise SecretInputCancelled from None
+
+
+def _require_interactive_terminal(input_stream: TextIO | None) -> None:
+    try:
+        interactive = bool(input_stream and input_stream.isatty())
+    except (AttributeError, OSError, ValueError):
+        interactive = False
+    if not interactive:
+        raise RuntimeError("此命令需要用户在真实终端中运行")
 
 
 def _read_masked(get_character: Callable[[], str], output: TextIO) -> str:
@@ -81,8 +106,6 @@ def _read_masked(get_character: Callable[[], str], output: TextIO) -> str:
             output.flush()
             return "".join(characters)
         if character == "\x03":
-            output.write("\n")
-            output.flush()
             raise KeyboardInterrupt
         if character in {"\x00", "\xe0"}:
             get_character()

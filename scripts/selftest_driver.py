@@ -158,7 +158,47 @@ def parser_tests(runtime: Path) -> None:
         needs_imap_id,
         single_from_address,
     )
-    from runtime_secret import MASKED_INPUT_PROMPT, _read_masked
+    from runtime_secret import (
+        MASKED_INPUT_PROMPT,
+        SecretInputCancelled,
+        _read_interactive_secret,
+        _read_masked,
+    )
+
+    try:
+        _read_interactive_secret(
+            lambda: (_ for _ in ()).throw(
+                AssertionError("non-terminal input reader was called")
+            ),
+            io.StringIO(),
+            io.StringIO(),
+        )
+    except RuntimeError as exc:
+        check(
+            str(exc) == "此命令需要用户在真实终端中运行",
+            "non-terminal secret input returned the wrong error",
+        )
+    else:
+        raise AssertionError("non-terminal secret input was allowed to wait for input")
+
+    class FakeTerminal:
+        def isatty(self):
+            return True
+
+    cancelled_keys = iter(["a", "\x03"])
+    cancelled_mask = io.StringIO()
+    try:
+        _read_interactive_secret(
+            lambda: next(cancelled_keys), FakeTerminal(), cancelled_mask
+        )
+    except SecretInputCancelled:
+        pass
+    else:
+        raise AssertionError("Ctrl+C did not cancel interactive secret input")
+    check(
+        cancelled_mask.getvalue().endswith("*\n"),
+        "Ctrl+C did not finish the masked input line cleanly",
+    )
 
     keys = iter(["a", "b", "\b", "C", "\x00", "K", "\r"])
     masked_output = io.StringIO()
@@ -188,6 +228,28 @@ def parser_tests(runtime: Path) -> None:
         and secret_stderr.getvalue() == "已加密保存\n"
         and json.loads(secret_stdout.getvalue())["stored"],
         "secret set did not print the encrypted-save confirmation",
+    )
+    navctl.set_password = lambda _runtime_id: (_ for _ in ()).throw(
+        SecretInputCancelled
+    )
+    cancelled_stdout = io.StringIO()
+    cancelled_stderr = io.StringIO()
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    try:
+        sys.stdout, sys.stderr = cancelled_stdout, cancelled_stderr
+        cancelled = navctl.command_secret(
+            {"runtime_id": "00000000-0000-4000-8000-000000000001"},
+            argparse.Namespace(secret_action="set"),
+        )
+    finally:
+        sys.stdout, sys.stderr = original_stdout, original_stderr
+        navctl.set_password = original_set_password
+    check(
+        cancelled == 130
+        and cancelled_stderr.getvalue() == ""
+        and json.loads(cancelled_stdout.getvalue())
+        == {"passed": False, "error": "已取消"},
+        "Ctrl+C during secret input did not exit cleanly",
     )
 
     check(

@@ -26,7 +26,12 @@ from nav_schedule import record_scheduled_run
 from nav_schedule import remove as remove_schedule
 from nav_schedule import status as schedule_status
 from nav_service import discover, doctor, preview, propose_routes, validate
-from runtime_secret import read_password, remove_password, set_password
+from runtime_secret import (
+    SecretInputCancelled,
+    read_password,
+    remove_password,
+    set_password,
+)
 
 
 def emit(payload: Any) -> None:
@@ -160,7 +165,11 @@ def command_doctor(config: dict[str, Any], _args: argparse.Namespace) -> int:
 
 def command_secret(config: dict[str, Any], args: argparse.Namespace) -> int:
     if args.secret_action == "set":
-        path = set_password(str(config["runtime_id"]))
+        try:
+            path = set_password(str(config["runtime_id"]))
+        except SecretInputCancelled:
+            emit({"passed": False, "error": "已取消"})
+            return 130
         print("已加密保存", file=sys.stderr, flush=True)
         emit({"stored": True, "location": str(path.parent), "value_echoed": False})
         return 0

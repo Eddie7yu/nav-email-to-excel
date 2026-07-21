@@ -53,6 +53,8 @@ cd D:\nav-runtime
 .\.venv\Scripts\python.exe navctl.py secret set
 ```
 
+必须让用户在真实终端中直接执行该命令；不得由 AI 通过管道、后台任务或重定向标准输入代跑。非交互环境会立即拒绝，用户按 Ctrl+C 取消时不会保存密钥。
+
 在 macOS/Linux 上，授权码只保留在当前 shell；运行程序不会持久化明文密钥：
 
 ```bash

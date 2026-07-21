@@ -151,6 +151,26 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
         raise AssertionError(
             f"bootstrapped runtime readiness report is wrong: {doctor.stdout}"
         )
+    if os.name == "nt":
+        piped_secret = subprocess.run(
+            [str(runtime_python), "-X", "utf8", "navctl.py", "secret", "set"],
+            cwd=destination,
+            input="",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=environment,
+            timeout=10,
+        )
+        piped_report = json.loads(piped_secret.stdout)
+        if (
+            piped_secret.returncode != 2
+            or piped_report.get("error") != "此命令需要用户在真实终端中运行"
+            or piped_secret.stderr
+        ):
+            raise AssertionError(
+                "piped secret input did not fail immediately and cleanly"
+            )
     scheduled_update = subprocess.run(
         [str(runtime_python), "-X", "utf8", "navctl.py", "scheduled-update"],
         cwd=destination,
