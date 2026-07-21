@@ -11,6 +11,7 @@ import sys
 import uuid
 import venv
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +31,7 @@ RUNTIME_FILES = (
     "nav_workbook.py",
     "requirements.lock",
     "run-update.cmd",
+    "set-secret.cmd",
     "runtime_secret.py",
 )
 MAX_WINDOWS_DESTINATION_CHARS = 120
@@ -37,6 +39,41 @@ MAX_WINDOWS_DESTINATION_CHARS = 120
 
 def runtime_python(root: Path) -> Path:
     return root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def normalize_index_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().rstrip("/")
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError(
+            "Python 包索引地址必须是无账号、密码、查询参数和片段的 HTTPS 地址"
+        )
+    return normalized
+
+
+def pip_install_command(
+    python: Path, requirements: Path, index_url: str | None
+) -> list[str]:
+    command = [
+        str(python),
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+    ]
+    if index_url:
+        command.extend(["--index-url", index_url])
+    command.extend(["-r", str(requirements)])
+    return command
 
 
 def validate_inputs(args: argparse.Namespace) -> tuple[Path, Path]:
@@ -76,6 +113,7 @@ def validate_inputs(args: argparse.Namespace) -> tuple[Path, Path]:
         raise RuntimeError("IMAP port must be between 1 and 65535")
     if not 1 <= args.lookback_days <= 3650:
         raise RuntimeError("Lookback days must be between 1 and 3650")
+    args.index_url = normalize_index_url(args.index_url)
     return destination, workbook
 
 
@@ -126,21 +164,20 @@ def create_runtime(args: argparse.Namespace, destination: Path, workbook: Path) 
         builder.create(staging / ".venv")
         python = runtime_python(staging)
         if not args.skip_deps:
+            source = (
+                f"指定镜像 {urlsplit(args.index_url).hostname}"
+                if args.index_url
+                else "默认 PyPI"
+            )
             print(
-                "正在安装锁定依赖，网络较慢时可能需要几分钟，请勿关闭窗口……",
+                f"正在通过{source}安装锁定依赖，网络较慢时可能需要几分钟，请勿关闭窗口……",
                 flush=True,
             )
             environment = dict(os.environ, PYTHONUTF8="1")
             result = subprocess.run(
-                [
-                    str(python),
-                    "-m",
-                    "pip",
-                    "install",
-                    "--disable-pip-version-check",
-                    "-r",
-                    str(staging / "requirements.lock"),
-                ],
+                pip_install_command(
+                    python, staging / "requirements.lock", args.index_url
+                ),
                 cwd=staging,
                 capture_output=True,
                 text=True,
@@ -157,9 +194,15 @@ def create_runtime(args: argparse.Namespace, destination: Path, workbook: Path) 
                     ),
                     "未返回可读的错误详情",
                 )
+                network_hint = (
+                    "中国大陆网络可让 AI 使用 --index-url "
+                    "https://pypi.tuna.tsinghua.edu.cn/simple 重新部署；"
+                    if not args.index_url
+                    else "请检查指定镜像是否可访问；"
+                )
                 raise RuntimeError(
                     "依赖安装失败，运行目录已回滚。"
-                    f"请检查网络、权限和路径长度。详情：{detail}"
+                    f"请检查网络、权限和路径长度。{network_hint}详情：{detail}"
                 )
         config = config_payload(args, workbook)
         (staging / "config.json").write_text(
@@ -190,6 +233,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--imap-port", type=int, default=993)
     result.add_argument("--mailbox", default="INBOX")
     result.add_argument("--lookback-days", type=int, default=180)
+    result.add_argument(
+        "--index-url",
+        help="仅本次安装使用的 HTTPS Python 包索引，不修改 pip 全局配置",
+    )
     result.add_argument("--skip-deps", action="store_true", help=argparse.SUPPRESS)
     result.add_argument(
         "--validate-only", action="store_true", help="Validate without creating files"

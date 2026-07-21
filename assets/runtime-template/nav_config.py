@@ -48,6 +48,7 @@ ROUTE_FIELDS = {
     "cumulative_offset",
     "return_basis",
     "return_frequency",
+    "data_frequency",
     "series_start",
     "max_staleness_days",
     "benchmark",
@@ -228,6 +229,12 @@ def validate_config(config: dict[str, Any]) -> None:
             errors.append(f"{prefix}.return_basis is invalid")
         if str(route.get("return_frequency", "weekly")) not in {"daily", "weekly"}:
             errors.append(f"{prefix}.return_frequency is invalid")
+        if str(route.get("data_frequency", "auto")) not in {
+            "auto",
+            "daily",
+            "weekly",
+        }:
+            errors.append(f"{prefix}.data_frequency is invalid")
         if route.get("series_start"):
             try:
                 dt.date.fromisoformat(str(route["series_start"]))

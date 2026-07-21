@@ -1,4 +1,4 @@
 interface:
   display_name: "净值邮件写入 Excel"
-  short_description: "授权一次，由 AI 自动发现、配置并持续更新净值表"
-  default_prompt: "请使用 $nav-email-to-excel，为我的工作簿部署净值邮件自动化；自动发现发件人，首次验收，并询问我定时更新的频率和时间。"
+  short_description: "授权一次，由 AI 严格按原模板自动补历史并持续更新"
+  default_prompt: "请使用 $nav-email-to-excel，为我的工作簿部署净值邮件自动化：自动发现并补入产品历史，严格保留原表的频率、公式、汇总、基准和样式，首次预览由我验收后再安装定时更新。"

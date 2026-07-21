@@ -171,10 +171,16 @@ class FakeIMAP:
             return "OK", [b"1 2 3 4"]
         uid = args[0]
         request = args[1]
+        if request == "(UID RFC822.SIZE)":
+            return "OK", [
+                b"1 (UID "
+                + item_uid
+                + b" RFC822.SIZE "
+                + str(len(self.messages[item_uid])).encode("ascii")
+                + b")"
+                for item_uid in uid.split(b",")
+            ]
         payload = self.messages[uid]
-        if request == "(RFC822.SIZE)":
-            size = str(len(payload)).encode("ascii")
-            return "OK", [b"1 (RFC822.SIZE " + size + b")"]
         if request == "(BODY.PEEK[])":
             return "OK", [(b"1 (BODY[])", payload)]
         raise RuntimeError(f"意外的演练 IMAP 请求：{request}")

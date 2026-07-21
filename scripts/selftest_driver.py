@@ -123,6 +123,7 @@ def config_for(runtime: Path, book: Path) -> dict:
                 "cumulative_offset": None,
                 "return_basis": "cumulative",
                 "return_frequency": "weekly",
+                "data_frequency": "auto",
                 "series_start": "2026-01-02",
                 "benchmark": {
                     "source_sheet": "Demo Benchmark",
@@ -228,6 +229,26 @@ def parser_tests(runtime: Path) -> None:
         and secret_stderr.getvalue() == "已加密保存\n"
         and json.loads(secret_stdout.getvalue())["stored"],
         "secret set did not print the encrypted-save confirmation",
+    )
+    original_launch_secret_prompt = navctl.launch_secret_prompt
+    navctl.launch_secret_prompt = lambda: 4321
+    launch_stdout = io.StringIO()
+    try:
+        sys.stdout = launch_stdout
+        launched = navctl.command_secret(
+            {"runtime_id": "00000000-0000-4000-8000-000000000001"},
+            argparse.Namespace(secret_action="launch"),
+        )
+    finally:
+        sys.stdout = original_stdout
+        navctl.launch_secret_prompt = original_launch_secret_prompt
+    launch_report = json.loads(launch_stdout.getvalue())
+    check(
+        launched == 0
+        and launch_report["launched"]
+        and launch_report["process_id"] == 4321
+        and "secret status" in launch_report["next"],
+        "secret launch did not open a dedicated prompt and require verification",
     )
     navctl.set_password = lambda _runtime_id: (_ for _ in ()).throw(
         SecretInputCancelled
@@ -359,15 +380,21 @@ def parser_tests(runtime: Path) -> None:
         "DEMO01 | 2026-01-09 | 1.01 | 1.01"
     )
     candidate_payload = candidate_message.as_bytes()
+    candidate_calls: list[tuple[str, tuple[Any, ...]]] = []
 
     class CandidateIMAP:
         def uid(self, command, *_args):
+            candidate_calls.append((command, _args))
             if command == "search":
-                return "OK", [b"1"]
+                return "OK", [b"1 2"]
             query = str(_args[-1])
             if "RFC822.SIZE" in query:
-                return "OK", [f"1 (RFC822.SIZE {len(candidate_payload)})".encode()]
-            return "OK", [(b"1 (BODY[])", candidate_payload), b")"]
+                return "OK", [
+                    f"1 (UID 1 RFC822.SIZE {len(candidate_payload)})".encode(),
+                    f"2 (UID 2 RFC822.SIZE {len(candidate_payload)})".encode(),
+                ]
+            uid = _args[0]
+            return "OK", [(uid + b" (BODY[])", candidate_payload), b")"]
 
         def close(self):
             return "OK", [b""]
@@ -382,11 +409,38 @@ def parser_tests(runtime: Path) -> None:
     finally:
         nav_mail.connect = original_connect
     check(
-        len(candidates) == 1
+        len(candidates) == 2
         and single_from_address(candidates[0]) == "sender@example.invalid"
-        and scan["messages_fetched"] == 1,
+        and scan["messages_fetched"] == 2
+        and len(
+            [
+                call
+                for call in candidate_calls
+                if call[0] == "fetch" and "RFC822.SIZE" in str(call[1][-1])
+            ]
+        )
+        == 1,
         "mailbox-wide sender discovery did not return the local NAV candidate",
     )
+
+    class DisconnectingIMAP(CandidateIMAP):
+        def uid(self, command, *_args):
+            if command == "fetch" and "BODY.PEEK" in str(_args[-1]):
+                raise nav_mail.imaplib.IMAP4.abort("fixture disconnect")
+            return super().uid(command, *_args)
+
+    nav_mail.connect = lambda _config: DisconnectingIMAP()
+    try:
+        fetch_candidate_messages(mail_config)
+    except MailError as exc:
+        check(
+            "意外断开" in str(exc) and "fixture disconnect" not in str(exc),
+            "IMAP disconnect did not return a readable, sanitized stage error",
+        )
+    else:
+        raise AssertionError("IMAP disconnect was not converted to MailError")
+    finally:
+        nav_mail.connect = original_connect
     check(
         parse_number("1.02%") is None, "percentage text must not be accepted as a NAV"
     )
@@ -664,6 +718,7 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     invalid = json.loads(json.dumps(config))
     invalid["routes"][0]["series_start"] = "2026-99-99"
     invalid["routes"][0]["parser"] = "local:../unsafe"
+    invalid["routes"][0]["data_frequency"] = "hourly"
     invalid["unexpected"] = True
     try:
         validate_config(invalid)
@@ -798,12 +853,92 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         "preview tampering changed the master workbook",
     )
 
+    dense_rows = {
+        "Demo Fund": [
+            NavRow(date, value, value, "DEMO01", "fixture")
+            for date, value in (
+                (dt.date(2026, 1, 2), 1.0),
+                (dt.date(2026, 1, 5), 1.002),
+                (dt.date(2026, 1, 6), 1.004),
+                (dt.date(2026, 1, 7), 1.006),
+                (dt.date(2026, 1, 8), 1.008),
+                (dt.date(2026, 1, 9), 1.01),
+                (dt.date(2026, 1, 12), 1.012),
+                (dt.date(2026, 1, 13), 1.014),
+                (dt.date(2026, 1, 14), 1.016),
+                (dt.date(2026, 1, 15), 1.018),
+                (dt.date(2026, 1, 16), 1.02),
+                (dt.date(2026, 1, 19), 1.019),
+                (dt.date(2026, 1, 20), 1.018),
+                (dt.date(2026, 1, 21), 1.017),
+                (dt.date(2026, 1, 22), 1.016),
+                (dt.date(2026, 1, 23), 1.015),
+            )
+        ]
+    }
+    dense_validation = validate_history(config, dense_rows)
+    check(
+        dense_validation["passed"]
+        and dense_validation["routes"][0]["data_frequency"] == "weekly"
+        and dense_validation["routes"][0]["data_frequency_source"]
+        == "workbook-history",
+        "weekly template frequency was not inferred from existing history",
+    )
+    dense_plan = build_preview(config, dense_rows)
+    check(
+        dense_plan["sheets"][0]["new_dates"] == ["2026-01-16", "2026-01-23"]
+        and dense_plan["sheets"][0]["data_frequency"] == "weekly",
+        "daily email history was not reduced to the weekly template dates",
+    )
+    dense_preview = openpyxl.load_workbook(dense_plan["preview_path"], data_only=False)
+    try:
+        dense_sheet = dense_preview["Demo Fund"]
+        check(
+            dense_sheet.max_row == 6
+            and dense_sheet["A6"].value == "TOTAL"
+            and dense_sheet["B4"].value == "=F4/F3-1",
+            "weekly preview did not preserve the summary row and formulas",
+        )
+    finally:
+        dense_preview.close()
+
+    forced_daily = json.loads(json.dumps(config))
+    forced_daily["routes"][0]["data_frequency"] = "daily"
+    try:
+        build_preview(forced_daily, dense_rows)
+    except WorkbookError as exc:
+        check("conflicts" in str(exc), "frequency mismatch failed unclearly")
+    else:
+        raise AssertionError("an explicit daily override replaced a weekly template")
+
+    gap_book = runtime / "daily-gap.xlsx"
+    gap_workbook = openpyxl.Workbook()
+    gap_sheet = gap_workbook.active
+    gap_sheet.title = "Daily Fund"
+    gap_sheet.append(["NAV Date", "Product Code", "Unit NAV", "Cumulative NAV"])
+    gap_sheet.append([dt.date(2026, 1, 2), "DEMO01", 1.0, 1.0])
+    gap_sheet.append([dt.date(2026, 1, 4), "DEMO01", 1.02, 1.02])
+    gap_sheet.append(["TOTAL", None, None, None])
+    gap_workbook.save(gap_book)
+    gap_workbook.close()
+    gap_config = config_for(runtime, gap_book)
+    gap_config["routes"][0].update(
+        {
+            "sheet": "Daily Fund",
+            "product_name": None,
+            "benchmark": None,
+            "return_frequency": "daily",
+        }
+    )
     gap_rows = {
-        "Demo Fund": rows["Demo Fund"]
-        + [NavRow(dt.date(2026, 1, 5), 1.005, 1.005, "DEMO01", "fixture")]
+        "Daily Fund": [
+            NavRow(dt.date(2026, 1, 2), 1.0, 1.0, "DEMO01", "fixture"),
+            NavRow(dt.date(2026, 1, 3), 1.01, 1.01, "DEMO01", "fixture"),
+            NavRow(dt.date(2026, 1, 4), 1.02, 1.02, "DEMO01", "fixture"),
+        ]
     }
     try:
-        build_preview(config, gap_rows)
+        build_preview(gap_config, gap_rows)
     except WorkbookError:
         check(
             not (runtime / "plan.json").exists(),
@@ -959,6 +1094,133 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     check(
         plain_plan["sheets"][0]["new_dates"] == ["2026-01-16"],
         "workbook without a return column could not produce a preview",
+    )
+
+    reserved_book = runtime / "summary-reserved-cold-start.xlsx"
+    reserved_workbook = openpyxl.Workbook()
+    reserved_sheet = reserved_workbook.active
+    reserved_sheet.title = "Reserved Fund"
+    reserved_sheet.append(
+        ["Product Code", "NAV Date", "Unit NAV", "Cumulative NAV", "Weekly Return"]
+    )
+    reserved_sheet.append(["DEMO43", dt.date(2026, 1, 1), None, None, None])
+    reserved_sheet.append(["累计", None, None, None, None])
+    reserved_workbook.save(reserved_book)
+    reserved_workbook.close()
+    reserved_config = config_for(runtime, reserved_book)
+    reserved_config["routes"][0].update(
+        {
+            "sheet": "Reserved Fund",
+            "code": "DEMO43",
+            "benchmark": None,
+            "return_basis": "cumulative",
+        }
+    )
+    reserved_rows = {
+        "Reserved Fund": [
+            NavRow(date, value, value, "DEMO43", "fixture")
+            for date, value in (
+                (dt.date(2026, 1, 2), 1.0),
+                (dt.date(2026, 1, 5), 1.002),
+                (dt.date(2026, 1, 6), 1.004),
+                (dt.date(2026, 1, 7), 1.006),
+                (dt.date(2026, 1, 8), 1.008),
+                (dt.date(2026, 1, 9), 1.01),
+                (dt.date(2026, 1, 12), 1.012),
+                (dt.date(2026, 1, 13), 1.014),
+                (dt.date(2026, 1, 14), 1.016),
+                (dt.date(2026, 1, 15), 1.018),
+                (dt.date(2026, 1, 16), 1.02),
+            )
+        ]
+    }
+    reserved_validation = validate_history(reserved_config, reserved_rows)
+    check(
+        reserved_validation["passed"]
+        and reserved_validation["warnings"]
+        and reserved_validation["routes"][0]["cold_start_kind"]
+        == "summary-reserved-row"
+        and reserved_validation["routes"][0]["data_frequency"] == "weekly",
+        "reserved summary row was not recognized as a safe cold start",
+    )
+    reserved_plan = build_preview(
+        reserved_config, reserved_rows, reserved_validation["warnings"]
+    )
+    reserved_sheet_plan = reserved_plan["sheets"][0]
+    check(
+        reserved_sheet_plan["insert_count"] == 2
+        and reserved_sheet_plan["populated_count"] == 3
+        and reserved_sheet_plan["filled_existing_rows"] == [2]
+        and reserved_sheet_plan["new_dates"]
+        == ["2026-01-02", "2026-01-09", "2026-01-16"],
+        "reserved-row plan did not distinguish the filled row from inserted rows",
+    )
+    reserved_preview = openpyxl.load_workbook(
+        reserved_plan["preview_path"], data_only=False
+    )
+    try:
+        preview_sheet = reserved_preview["Reserved Fund"]
+        check(
+            (
+                preview_sheet["B2"].value == dt.datetime(2026, 1, 2)
+                or preview_sheet["B2"].value == dt.date(2026, 1, 2)
+            )
+            and preview_sheet["C2"].value == 1.0
+            and preview_sheet["D2"].value == 1.0
+            and preview_sheet["C4"].value == 1.02,
+            "reserved first row or later email history was not populated",
+        )
+        check(
+            preview_sheet["A5"].value == "累计"
+            and preview_sheet["E4"].value == "=D4/D3-1"
+            and preview_sheet["E5"].value == "=D4/D2-1",
+            "summary row or managed formulas were not preserved after cold start",
+        )
+    finally:
+        reserved_preview.close()
+    if use_com:
+        reserved_result = commit(reserved_config)
+        application = str(reserved_result["application"])
+        check(
+            reserved_result["changed"] and reserved_result["rows"] == 3,
+            "COM reserved-row cold start did not report all populated dates",
+        )
+    else:
+        shutil.copy2(reserved_plan["preview_path"], reserved_book)
+    reserved_second_validation = validate_history(reserved_config, reserved_rows)
+    check(
+        reserved_second_validation["passed"]
+        and not reserved_second_validation["warnings"],
+        "reserved-row cold start did not become ordinary verified history",
+    )
+    reserved_second = build_preview(reserved_config, reserved_rows)
+    check(
+        not reserved_second["sheets"] and reserved_second["preview_path"] is None,
+        "reserved-row cold start was not idempotent after the first write",
+    )
+
+    unsafe_reserved_book = runtime / "unsafe-reserved-row.xlsx"
+    unsafe_reserved_workbook = openpyxl.Workbook()
+    unsafe_reserved_sheet = unsafe_reserved_workbook.active
+    unsafe_reserved_sheet.title = "Reserved Fund"
+    unsafe_reserved_sheet.append(
+        ["Product Code", "NAV Date", "Unit NAV", "Cumulative NAV", "Note"]
+    )
+    unsafe_reserved_sheet.append(
+        ["DEMO43", dt.date(2026, 1, 1), None, None, "keep this content"]
+    )
+    unsafe_reserved_sheet.append(["累计", None, None, None, None])
+    unsafe_reserved_workbook.save(unsafe_reserved_book)
+    unsafe_reserved_workbook.close()
+    unsafe_reserved_config = config_for(runtime, unsafe_reserved_book)
+    unsafe_reserved_config["routes"][0].update(
+        {"sheet": "Reserved Fund", "code": "DEMO43", "benchmark": None}
+    )
+    unsafe_reserved_validation = validate_history(unsafe_reserved_config, reserved_rows)
+    check(
+        not unsafe_reserved_validation["passed"]
+        and not unsafe_reserved_validation["routes"][0]["cold_start"],
+        "a row containing extra business content was treated as a placeholder",
     )
 
     header_book = runtime / "append-header-only.xlsx"

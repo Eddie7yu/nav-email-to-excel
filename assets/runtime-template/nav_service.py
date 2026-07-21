@@ -11,7 +11,11 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
-from nav_commit import ensure_process_exit, spreadsheet_app
+from nav_commit import (
+    detected_spreadsheet_apps,
+    ensure_process_exit,
+    spreadsheet_app,
+)
 from nav_config import ROOT, active_routes, normalize_code, write_json_atomic
 from nav_mail import (
     decoded,
@@ -257,6 +261,7 @@ def collect_route_rows(
 
 def doctor(config: dict[str, Any]) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
+    detected_spreadsheets = detected_spreadsheet_apps()
 
     def add(name: str, passed: bool, detail: str) -> None:
         checks.append({"name": name, "passed": passed, "detail": detail})
@@ -302,10 +307,15 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
             gc.collect()
             ensure_process_exit(process_id)
             add("spreadsheet-com", True, progid)
-        except Exception:
-            add("spreadsheet-com", False, "Excel/WPS COM unavailable; preview only")
+        except Exception as exc:
+            add("spreadsheet-com", False, str(exc))
     else:
-        add("spreadsheet-com", False, "formal commit is Windows-only")
+        add(
+            "spreadsheet-com",
+            False,
+            f"当前 Python 运行在 {sys.platform}，无法访问 Windows 上的 Excel/WPS COM；"
+            "请从 Windows PowerShell 使用原生 Windows Python 部署",
+        )
     path_text = str(ROOT.resolve())
     local_path = not path_text.startswith("\\\\")
     add(
@@ -344,6 +354,8 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
         "preview_ready": preview_ready,
         "commit_ready": commit_ready,
         "schedule_ready": schedule_ready,
+        "runtime_platform": sys.platform,
+        "spreadsheet_apps_detected": detected_spreadsheets,
         "blockers": blockers,
         "checks": checks,
     }

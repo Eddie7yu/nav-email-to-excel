@@ -28,6 +28,7 @@ from nav_schedule import status as schedule_status
 from nav_service import discover, doctor, preview, propose_routes, validate
 from runtime_secret import (
     SecretInputCancelled,
+    launch_secret_prompt,
     read_password,
     remove_password,
     set_password,
@@ -164,6 +165,16 @@ def command_doctor(config: dict[str, Any], _args: argparse.Namespace) -> int:
 
 
 def command_secret(config: dict[str, Any], args: argparse.Namespace) -> int:
+    if args.secret_action == "launch":
+        process_id = launch_secret_prompt()
+        emit(
+            {
+                "launched": True,
+                "process_id": process_id,
+                "next": "请在新窗口粘贴授权码并回车；随后必须运行 secret status 确认保存成功",
+            }
+        )
+        return 0
     if args.secret_action == "set":
         try:
             path = set_password(str(config["runtime_id"]))
@@ -302,7 +313,7 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor")
     secret = commands.add_parser("secret")
-    secret.add_argument("secret_action", choices=("set", "status", "remove"))
+    secret.add_argument("secret_action", choices=("launch", "set", "status", "remove"))
     commands.add_parser("propose")
     commands.add_parser("discover")
     commands.add_parser("validate")

@@ -23,6 +23,49 @@ class CommitError(RuntimeError):
     pass
 
 
+SPREADSHEET_PROGIDS = (
+    ("Excel.Application", "Microsoft Excel"),
+    ("ket.Application", "WPS 表格"),
+)
+
+
+def detected_spreadsheet_apps() -> list[str]:
+    if sys.platform != "win32":
+        return []
+    import winreg
+
+    detected: set[str] = set()
+    for progid, name in SPREADSHEET_PROGIDS:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"{progid}\\CLSID"):
+                detected.add(name)
+        except OSError:
+            pass
+    app_paths = (("excel.exe", "Microsoft Excel"), ("et.exe", "WPS 表格"))
+    views = (0, winreg.KEY_WOW64_32KEY, winreg.KEY_WOW64_64KEY)
+    for executable, name in app_paths:
+        if shutil.which(executable):
+            detected.add(name)
+        key_path = (
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths" + "\\" + executable
+        )
+        for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for view in views:
+                try:
+                    with winreg.OpenKey(root, key_path, 0, winreg.KEY_READ | view):
+                        detected.add(name)
+                except OSError:
+                    pass
+    return sorted(detected)
+
+
+def _activation_error(exc: Exception) -> str:
+    code = getattr(exc, "hresult", None)
+    if isinstance(code, int):
+        return f"{type(exc).__name__}(0x{code & 0xFFFFFFFF:08X})"
+    return type(exc).__name__
+
+
 def _process_id(app) -> int:
     process_id = ctypes.c_ulong()
     ctypes.windll.user32.GetWindowThreadProcessId(
@@ -62,7 +105,7 @@ def spreadsheet_app():
     from win32com.client import DispatchEx
 
     errors: list[str] = []
-    for progid in ("Excel.Application", "KET.Application", "Ket.Application"):
+    for progid, _name in SPREADSHEET_PROGIDS:
         app = None
         try:
             app = DispatchEx(progid)
@@ -77,13 +120,21 @@ def spreadsheet_app():
                 )
             return app, progid, _process_id(app)
         except Exception as exc:
-            errors.append(type(exc).__name__)
+            errors.append(f"{progid}={_activation_error(exc)}")
             try:
                 if app is not None:
                     app.Quit()
             except Exception:
                 pass
-    raise CommitError("No supported Excel/WPS COM application is available")
+    detected = detected_spreadsheet_apps()
+    detected_text = "、".join(detected) if detected else "未确认"
+    raise CommitError(
+        "无法启动 Excel/WPS COM 自动化接口；"
+        f"已安装软件探测：{detected_text}；启动结果：{'; '.join(errors)}。"
+        "这不等于软件没有安装：请先确认使用原生 Windows Python，"
+        "再手动启动一次 Excel/WPS、完成首次设置并关闭，然后重新运行 doctor；"
+        "仍失败时再修复或启用 Office/WPS 的 COM 自动化组件"
+    )
 
 
 def _copy_value(source, target) -> None:
@@ -418,9 +469,16 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
             header_row = int(item["header_row"])
             insert_before = int(item["insert_before"])
             insert_count = int(item["insert_count"])
+            populated_count = int(item.get("populated_count", insert_count))
             summary_row = int(item["summary_row"])
             new_rows = [int(row) for row in item["new_rows"]]
+            filled_existing_rows = [
+                int(row) for row in item.get("filled_existing_rows") or []
+            ]
             format_rows = [int(row) for row in item.get("format_rows") or []]
+            changed_rows = {
+                int(cell["row"]) for cell in item.get("changed_cells") or []
+            }
         except (KeyError, TypeError, ValueError) as exc:
             raise CommitError("The plan row structure is invalid") from exc
         if (
@@ -432,9 +490,18 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
             raise CommitError("The plan insertion range is invalid")
         if (
             summary_row != insert_before + insert_count
-            or len(item.get("new_dates") or []) != insert_count
+            or populated_count != insert_count + len(filled_existing_rows)
+            or len(item.get("new_dates") or []) != populated_count
         ):
             raise CommitError("The plan summary row or new-date count is invalid")
+        if filled_existing_rows and (
+            str(item.get("sheet_mode", "summary")) != "summary"
+            or filled_existing_rows != [insert_before - 1]
+            or filled_existing_rows[0] <= header_row
+        ):
+            raise CommitError("The plan reserved-row range is invalid")
+        if not set(filled_existing_rows) <= changed_rows:
+            raise CommitError("The plan does not populate its reserved row")
         if not set(format_rows) <= {*new_rows, header_row}:
             raise CommitError("The plan format range is invalid")
         if not isinstance(item.get("copy_template_rows", True), bool):
@@ -501,6 +568,9 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
         "backup": str(backup),
         "master_sha256": file_sha256(master),
         "sheets": len(plan["sheets"]),
-        "rows": sum(int(sheet["insert_count"]) for sheet in plan["sheets"]),
+        "rows": sum(
+            int(sheet.get("populated_count", sheet["insert_count"]))
+            for sheet in plan["sheets"]
+        ),
         "backup_cleanup_failed": cleanup_failed,
     }

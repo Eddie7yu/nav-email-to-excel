@@ -10,6 +10,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from bootstrap import pip_install_command
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "assets" / "runtime-template"
@@ -72,6 +74,37 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     )
     if rejected.returncode == 0 or destination.exists():
         raise AssertionError("bootstrap accepted a negative lookback window")
+    mirror_url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+    accepted = subprocess.run(
+        command + ["--index-url", mirror_url, "--validate-only"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+    )
+    if accepted.returncode or destination.exists():
+        raise AssertionError("bootstrap rejected a valid one-time HTTPS package index")
+    rejected = subprocess.run(
+        command
+        + [
+            "--index-url",
+            "http://pypi.tuna.tsinghua.edu.cn/simple",
+            "--validate-only",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+    )
+    if rejected.returncode != 2 or destination.exists():
+        raise AssertionError("bootstrap accepted an insecure package index")
+    install_command = pip_install_command(
+        Path("python"), Path("requirements.lock"), mirror_url
+    )
+    if install_command[-4:] != ["--index-url", mirror_url, "-r", "requirements.lock"]:
+        raise AssertionError(
+            "bootstrap did not scope the selected index to pip install"
+        )
     if os.name == "nt":
         long_parent = temporary / "long-path-check"
         long_parent.mkdir()
@@ -112,6 +145,15 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
         raise AssertionError(
             "bootstrap did not create the trusted local parser directory"
         )
+    secret_launcher = destination / "set-secret.cmd"
+    if (
+        not secret_launcher.is_file()
+        or "navctl.py secret set" not in secret_launcher.read_text(encoding="utf-8")
+        or not secret_launcher.read_bytes().isascii()
+    ):
+        raise AssertionError(
+            "bootstrap did not create a cmd-compatible visible secret prompt"
+        )
     config_path = destination / "config.json"
     original_config = config_path.read_bytes()
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -147,6 +189,8 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
         or report["preview_ready"]
         or report["schedule_ready"]
         or checks.get("schedule-config") is not False
+        or report.get("runtime_platform") != sys.platform
+        or not isinstance(report.get("spreadsheet_apps_detected"), list)
     ):
         raise AssertionError(
             f"bootstrapped runtime readiness report is wrong: {doctor.stdout}"

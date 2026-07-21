@@ -4,7 +4,9 @@ import datetime as dt
 import json
 import re
 import shutil
+import statistics
 import uuid
+from collections import Counter
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
@@ -310,6 +312,170 @@ def existing_rows(
     return output
 
 
+def _summary_reserved_row(
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    layout: Layout,
+    route: dict[str, Any],
+    existing: dict[dt.date, dict[str, Any]],
+) -> tuple[dt.date, int] | None:
+    """Identify a strictly bounded summary-mode cold-start placeholder.
+
+    A real data row is never treated as a placeholder.  The only accepted shape is
+    one dated row immediately above the summary row, with a matching configured
+    identity and no content other than that identity and the date.
+    """
+
+    if layout.mode != "summary" or len(existing) != 1:
+        return None
+    date, values = next(iter(existing.items()))
+    row = int(values["row"])
+    if row != layout.data_start or row != layout.summary_row - 1:
+        return None
+
+    expected_code = normalize_code(route.get("code"))
+    expected_name = str(route.get("product_name") or "").strip()
+    identity_columns: set[int] = set()
+    if expected_code and layout.columns.get("code"):
+        code_column = layout.columns["code"]
+        code_value = normalize_code(sheet.cell(row, code_column).value)
+        if code_value:
+            if code_value != expected_code:
+                return None
+            identity_columns.add(code_column)
+    if expected_name and layout.columns.get("name"):
+        name_column = layout.columns["name"]
+        name_value = str(sheet.cell(row, name_column).value or "").strip()
+        if name_value:
+            if name_value != expected_name:
+                return None
+            identity_columns.add(name_column)
+    if not identity_columns:
+        return None
+
+    allowed_columns = {layout.columns["date"], *identity_columns}
+    for column in range(1, sheet.max_column + 1):
+        value = sheet.cell(row, column).value
+        if column not in allowed_columns and value is not None and value != "":
+            return None
+    return date, row
+
+
+def _header_data_frequency(
+    sheet: openpyxl.worksheet.worksheet.Worksheet, layout: Layout
+) -> str | None:
+    return_column = layout.columns.get("return")
+    if not return_column:
+        return None
+    header = _norm(sheet.cell(layout.header_row, return_column).value)
+    if "周" in header or "week" in header:
+        return "weekly"
+    if "日收益" in header or "日度" in header or "daily" in header:
+        return "daily"
+    return None
+
+
+def _weekly_like_gaps(gaps: list[int]) -> bool:
+    if not gaps:
+        return False
+    weekly = sum(1 for gap in gaps if gap >= 5 and min(gap % 7, (7 - gap % 7) % 7) <= 1)
+    return weekly / len(gaps) >= 0.7
+
+
+def _data_frequency(
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    layout: Layout,
+    route: dict[str, Any],
+    existing: dict[dt.date, dict[str, Any]],
+    reserved: tuple[dt.date, int] | None,
+) -> tuple[str, str, int | None]:
+    configured = str(route.get("data_frequency", "auto"))
+    history_dates = sorted(
+        date for date in existing if reserved is None or date != reserved[0]
+    )
+    inferred: str | None = None
+    source = "email-source"
+    preferred_weekday: int | None = None
+    if len(history_dates) >= 2:
+        gaps = [
+            (current - previous).days
+            for previous, current in zip(history_dates, history_dates[1:])
+        ]
+        median_gap = float(statistics.median(gaps))
+        if median_gap <= 4:
+            inferred = "daily"
+        elif median_gap <= 10 or _weekly_like_gaps(gaps):
+            inferred = "weekly"
+        else:
+            raise WorkbookError(
+                f"{sheet.title}: existing dates do not prove a daily or weekly data frequency"
+            )
+        source = "workbook-history"
+        if inferred == "weekly":
+            counts = Counter(date.weekday() for date in history_dates)
+            last_seen = {
+                weekday: max(
+                    index
+                    for index, date in enumerate(history_dates)
+                    if date.weekday() == weekday
+                )
+                for weekday in counts
+            }
+            preferred_weekday = max(
+                counts, key=lambda weekday: (counts[weekday], last_seen[weekday])
+            )
+    else:
+        inferred = _header_data_frequency(sheet, layout)
+        if inferred:
+            source = "workbook-header"
+
+    if configured != "auto":
+        if inferred and configured != inferred:
+            raise WorkbookError(
+                f"{sheet.title}: configured data_frequency {configured} conflicts with "
+                f"the {inferred} workbook template"
+            )
+        return configured, "route-config", preferred_weekday
+    return inferred or "daily", source, preferred_weekday
+
+
+def _select_data_rows(
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    layout: Layout,
+    route: dict[str, Any],
+    existing: dict[dt.date, dict[str, Any]],
+    reserved: tuple[dt.date, int] | None,
+    candidates: list[NavRow],
+) -> tuple[list[NavRow], str, str]:
+    frequency, source, preferred_weekday = _data_frequency(
+        sheet, layout, route, existing, reserved
+    )
+    if frequency == "daily":
+        return candidates, frequency, source
+
+    groups: dict[tuple[int, int], list[NavRow]] = {}
+    for candidate in candidates:
+        iso = candidate.date.isocalendar()
+        groups.setdefault((iso.year, iso.week), []).append(candidate)
+    current_iso = dt.date.today().isocalendar()
+    current_week = (current_iso.year, current_iso.week)
+    existing_dates = set(existing)
+    selected: list[NavRow] = []
+    for week in sorted(groups):
+        rows = sorted(groups[week], key=lambda item: item.date)
+        exact = [row for row in rows if row.date in existing_dates]
+        if exact:
+            selected.extend(exact)
+            continue
+        if week >= current_week:
+            continue
+        if preferred_weekday is None:
+            selected.append(rows[-1])
+            continue
+        on_or_before = [row for row in rows if row.date.weekday() <= preferred_weekday]
+        selected.append(on_or_before[-1] if on_or_before else rows[0])
+    return selected, frequency, source
+
+
 def validate_history(
     config: dict[str, Any], route_rows: dict[str, list[NavRow]]
 ) -> dict[str, Any]:
@@ -349,6 +515,23 @@ def validate_history(
                 ),
                 key=lambda item: item.date,
             )
+            reserved = _summary_reserved_row(
+                workbook[sheet_name], layout, route, existing
+            )
+            selected_candidates, data_frequency, frequency_source = _select_data_rows(
+                workbook[sheet_name],
+                layout,
+                route,
+                existing,
+                reserved,
+                candidates,
+            )
+            selected_dates = {candidate.date for candidate in selected_candidates}
+            reserved_date = reserved[0] if reserved else None
+            candidate_dates = selected_dates
+            reserved_source_date = (
+                min(candidate_dates) if reserved and candidate_dates else None
+            )
             known_units = {
                 date: values["unit"]
                 for date, values in existing.items()
@@ -366,6 +549,14 @@ def validate_history(
                     errors.append(
                         f"{sheet_name}: NAV date {candidate.date.isoformat()} exceeds max_future_days"
                     )
+                if (
+                    reserved_source_date is not None
+                    and candidate.date == reserved_source_date
+                ):
+                    if layout.columns.get("cumulative"):
+                        effective_cumulative(candidate, route)
+                    known_units[candidate.date] = candidate.unit
+                    continue
                 if candidate.date not in existing:
                     prior = [
                         (date, unit)
@@ -382,7 +573,11 @@ def validate_history(
                                 f"{sheet_name}: NAV change exceeds max_period_change on {candidate.date.isoformat()}"
                             )
                     known_units[candidate.date] = candidate.unit
-                if candidate.date < start or candidate.date not in existing:
+                if (
+                    candidate.date < start
+                    or candidate.date not in existing
+                    or candidate.date not in selected_dates
+                ):
                     continue
                 observed = existing[candidate.date]
                 unit_ok = (
@@ -409,7 +604,17 @@ def validate_history(
                     errors.append(
                         f"{sheet_name}: historical value conflict on {candidate.date.isoformat()}"
                     )
-            if matches < minimum:
+            summary_cold_start = reserved_date is not None
+            if summary_cold_start:
+                if len(candidate_dates) < minimum:
+                    errors.append(
+                        f"{sheet_name}: summary-mode cold start found only {len(candidate_dates)} email dates; {minimum} required"
+                    )
+                if candidate_dates and len(candidate_dates) >= minimum:
+                    warnings.append(
+                        f"{sheet_name}: detected a reserved summary row cold start; replace the empty placeholder with the earliest email NAV, keep the summary row, and review the first preview"
+                    )
+            elif matches < minimum:
                 message = f"{sheet_name}: only {matches} verified historical dates; {minimum} required"
                 if layout.mode == "append":
                     warnings.append(
@@ -421,9 +626,19 @@ def validate_history(
                 {
                     "sheet": sheet_name,
                     "sheet_mode": layout.mode,
-                    "cold_start": layout.mode == "append" and matches < minimum,
+                    "cold_start": summary_cold_start
+                    or (layout.mode == "append" and matches < minimum),
+                    "cold_start_kind": (
+                        "summary-reserved-row"
+                        if summary_cold_start
+                        else "append"
+                        if layout.mode == "append" and matches < minimum
+                        else None
+                    ),
                     "matched_history_dates": matches,
                     "conflicts": conflicts,
+                    "data_frequency": data_frequency,
+                    "data_frequency_source": frequency_source,
                 }
             )
     finally:
@@ -746,6 +961,37 @@ def _ensure_summary_formula_safety(
             )
 
 
+def _write_nav_values(
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    row: int,
+    layout: Layout,
+    route: dict[str, Any],
+    nav: NavRow,
+    changed: set[tuple[int, int]] | None = None,
+) -> None:
+    values: list[tuple[int, Any]] = [
+        (layout.columns["date"], nav.date),
+        (layout.columns["unit"], nav.unit),
+    ]
+    if layout.columns.get("cumulative"):
+        values.append((layout.columns["cumulative"], effective_cumulative(nav, route)))
+    if layout.columns.get("code") and route.get("code"):
+        values.append((layout.columns["code"], normalize_code(route["code"])))
+    if layout.columns.get("name") and route.get("product_name"):
+        values.append((layout.columns["name"], str(route["product_name"]).strip()))
+    for column, value in values:
+        cell = sheet.cell(row, column)
+        same = (
+            parse_date(cell.value) == value
+            if column == layout.columns["date"]
+            else cell.value == value
+        )
+        if not same:
+            cell.value = value
+            if changed is not None:
+                changed.add((row, column))
+
+
 def build_preview(
     config: dict[str, Any],
     route_rows: dict[str, list[NavRow]],
@@ -784,15 +1030,36 @@ def build_preview(
             )
             current = existing_rows(sheet, layout)
             start = parse_date(route.get("series_start")) or dt.date.min
-            candidates = [
-                row for row in route_rows.get(sheet_name, []) if row.date >= start
-            ]
-            additions = [row for row in candidates if row.date not in current]
-            if not additions:
+            candidates = sorted(
+                (row for row in route_rows.get(sheet_name, []) if row.date >= start),
+                key=lambda row: row.date,
+            )
+            reserved = _summary_reserved_row(sheet, layout, route, current)
+            candidates, data_frequency, frequency_source = _select_data_rows(
+                sheet, layout, route, current, reserved, candidates
+            )
+            reserved_date = reserved[0] if reserved else None
+            reserved_row = reserved[1] if reserved else None
+            reserved_nav: NavRow | None = None
+            if reserved_date is not None:
+                distinct_dates = {row.date for row in candidates}
+                minimum = int(
+                    (config.get("validation") or {}).get("minimum_history_dates", 2)
+                )
+                if len(distinct_dates) < minimum:
+                    raise WorkbookError(
+                        f"{sheet_name}: summary-mode cold start needs at least {minimum} email NAV dates"
+                    )
+                reserved_nav = candidates[0]
+            additions = (
+                candidates[1:]
+                if reserved_nav is not None
+                else [row for row in candidates if row.date not in current]
+            )
+            if not additions and reserved_nav is None:
                 continue
             if layout.mode == "summary":
                 _ensure_summary_formula_safety(sheet, layout, route)
-            additions.sort(key=lambda row: row.date)
             latest_existing = max(current) if current else None
             gaps = (
                 [row.date for row in additions if row.date <= latest_existing]
@@ -808,6 +1075,7 @@ def build_preview(
             count = len(additions)
             max_column = max([sheet.max_column, *layout.columns.values()])
             changed: set[tuple[int, int]] = set()
+            filled_existing_rows: list[int] = []
             for column, label in (layout.headers_to_write or {}).items():
                 cell = sheet.cell(layout.header_row, column)
                 cell.value = label
@@ -815,14 +1083,23 @@ def build_preview(
                 font.bold = True
                 cell.font = font
                 changed.add((layout.header_row, column))
+            if reserved_nav is not None and reserved_row is not None:
+                _write_nav_values(
+                    sheet,
+                    reserved_row,
+                    layout,
+                    route,
+                    reserved_nav,
+                    changed,
+                )
+                filled_existing_rows.append(reserved_row)
             sheet.insert_rows(old_summary, count)
             for offset, nav in enumerate(additions):
                 target = old_summary + offset
                 if current or layout.mode == "summary":
                     template = old_summary - 1 if offset == 0 else target - 1
                     _copy_row(sheet, template, target, max_column)
-                sheet.cell(target, layout.columns["date"]).value = nav.date
-                sheet.cell(target, layout.columns["unit"]).value = nav.unit
+                _write_nav_values(sheet, target, layout, route, nav)
                 if layout.mode == "append" and not current:
                     sheet.cell(
                         target, layout.columns["date"]
@@ -831,29 +1108,19 @@ def build_preview(
                         target, layout.columns["unit"]
                     ).number_format = "0.000000"
                 if layout.columns.get("cumulative"):
-                    sheet.cell(
-                        target, layout.columns["cumulative"]
-                    ).value = effective_cumulative(nav, route)
                     if layout.mode == "append" and not current:
                         sheet.cell(
                             target, layout.columns["cumulative"]
                         ).number_format = "0.000000"
-                if layout.columns.get("code") and route.get("code"):
-                    sheet.cell(target, layout.columns["code"]).value = normalize_code(
-                        route["code"]
-                    )
-                if layout.columns.get("name") and route.get("product_name"):
-                    sheet.cell(target, layout.columns["name"]).value = str(
-                        route["product_name"]
-                    ).strip()
             new_summary = old_summary + count
             new_rows = set(range(old_summary, new_summary))
+            managed_rows = new_rows | set(filled_existing_rows)
             period_rows, affected_rows = _set_return_formulas(
                 sheet,
                 layout,
                 route,
                 new_summary,
-                new_rows,
+                managed_rows,
                 changed,
                 write_summary=layout.mode == "summary",
             )
@@ -872,10 +1139,14 @@ def build_preview(
                 {
                     "sheet": sheet_name,
                     "sheet_mode": layout.mode,
+                    "data_frequency": data_frequency,
+                    "data_frequency_source": frequency_source,
                     "header_row": layout.header_row,
                     "insert_before": old_summary,
                     "insert_count": count,
+                    "populated_count": count + len(filled_existing_rows),
                     "new_rows": list(range(old_summary, new_summary)),
+                    "filled_existing_rows": filled_existing_rows,
                     "summary_row": new_summary,
                     "copy_template_rows": bool(current) or layout.mode == "summary",
                     "format_rows": sorted(
@@ -892,7 +1163,13 @@ def build_preview(
                         [{"row": row, "column": column} for row, column in changed],
                         key=lambda item: (item["row"], item["column"]),
                     ),
-                    "new_dates": [row.date.isoformat() for row in additions],
+                    "new_dates": [
+                        row.date.isoformat()
+                        for row in (
+                            ([reserved_nav] if reserved_nav is not None else [])
+                            + additions
+                        )
+                    ],
                     "return_columns": [
                         column
                         for column in (

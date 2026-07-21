@@ -4,6 +4,7 @@ import base64
 import ctypes
 import json
 import os
+import subprocess
 import sys
 from ctypes import wintypes
 from pathlib import Path
@@ -67,6 +68,27 @@ def set_password(runtime_id: str, password: str | None = None) -> Path:
     temporary.write_text(json.dumps(payload), encoding="utf-8")
     temporary.replace(path)
     return path
+
+
+def launch_secret_prompt() -> int:
+    if os.name != "nt":
+        raise RuntimeError("可见授权码窗口只支持 Windows")
+    launcher = Path(__file__).resolve().with_name("set-secret.cmd")
+    if not launcher.is_file():
+        raise RuntimeError("授权码窗口启动脚本缺失")
+    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    command_processor = Path(
+        os.environ.get("COMSPEC") or system_root / "System32" / "cmd.exe"
+    )
+    if not command_processor.is_file():
+        raise RuntimeError("找不到 Windows 命令处理程序，无法打开授权码窗口")
+    process = subprocess.Popen(
+        [str(command_processor), "/d", "/c", str(launcher)],
+        cwd=launcher.parent,
+        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010),
+        close_fds=True,
+    )
+    return int(process.pid)
 
 
 def _read_windows_secret() -> str:
