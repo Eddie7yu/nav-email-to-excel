@@ -12,6 +12,7 @@ last-scheduled-run.json
 run.lock
 parsers/
 *.xlsx
+!assets/workbook-templates/nav-standard-cn.xlsx
 *.xlsm
 *.xls
 *.pdf
@@ -23,3 +24,4 @@ backups/
 previews/
 secret.json
 **/secret.json
+node_modules/

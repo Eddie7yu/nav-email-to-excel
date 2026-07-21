@@ -16,6 +16,7 @@ TOP_FIELDS = {
     "schema_version",
     "runtime_id",
     "workbook_path",
+    "workbook_mode",
     "imap",
     "routes",
     "column_overrides",
@@ -54,7 +55,13 @@ ROUTE_FIELDS = {
     "max_staleness_days",
     "benchmark",
 }
-BENCHMARK_FIELDS = {"source_sheet", "source_type", "source_date", "source_value"}
+BENCHMARK_FIELDS = {
+    "source_sheet",
+    "source_type",
+    "source_date",
+    "source_value",
+    "display_name",
+}
 COLUMN_FIELDS = {
     "header_row",
     "date",
@@ -63,6 +70,8 @@ COLUMN_FIELDS = {
     "unit",
     "cumulative",
     "return",
+    "daily_return",
+    "weekly_return",
     "benchmark_level",
     "benchmark_return",
     "excess",
@@ -102,6 +111,11 @@ def validate_config(config: dict[str, Any]) -> None:
         errors.append("workbook_path must be absolute")
     elif workbook.suffix.lower() not in {".xlsx", ".xlsm"}:
         errors.append("workbook_path must end in .xlsx or .xlsm")
+    workbook_mode = str(config.get("workbook_mode", "existing"))
+    if workbook_mode not in {"existing", "bundled-template"}:
+        errors.append("workbook_mode must be existing or bundled-template")
+    if workbook_mode == "bundled-template" and workbook.suffix.lower() != ".xlsx":
+        errors.append("bundled-template workbook_path must end in .xlsx")
 
     imap = config.get("imap") or {}
     if not isinstance(imap, dict):
@@ -166,8 +180,16 @@ def validate_config(config: dict[str, Any]) -> None:
         if sheet:
             managed_sheets.add(sheet)
         sheet_mode = str(route.get("sheet_mode", "summary"))
-        if sheet_mode not in {"summary", "append"}:
-            errors.append(f"{prefix}.sheet_mode must be summary or append")
+        if sheet_mode not in {"summary", "append", "template"}:
+            errors.append(f"{prefix}.sheet_mode must be summary, append, or template")
+        if workbook_mode == "bundled-template" and sheet_mode != "template":
+            errors.append(
+                f"{prefix}.sheet_mode must be template for a bundled-template workbook"
+            )
+        if workbook_mode == "existing" and sheet_mode == "template":
+            errors.append(
+                f"{prefix}.sheet_mode template is reserved for bundled workbooks"
+            )
         product_name = route.get("product_name")
         if product_name is not None and (
             not isinstance(product_name, str)
@@ -181,11 +203,13 @@ def validate_config(config: dict[str, Any]) -> None:
                 f"{prefix}.product_name must be a non-empty, non-formula single-line string of at most 200 characters"
             )
         if (
-            sheet_mode == "append"
+            sheet_mode in {"append", "template"}
             and not code
             and not (isinstance(product_name, str) and product_name.strip())
         ):
-            errors.append(f"{prefix} in append mode requires code or product_name")
+            errors.append(
+                f"{prefix} in {sheet_mode} mode requires code or product_name"
+            )
         subject_contains = route.get("subject_contains")
         if subject_contains is not None and (
             not isinstance(subject_contains, str)
@@ -236,6 +260,19 @@ def validate_config(config: dict[str, Any]) -> None:
             "weekly",
         }:
             errors.append(f"{prefix}.data_frequency is invalid")
+        if (
+            sheet_mode == "template"
+            and str(route.get("data_frequency", "auto")) == "auto"
+        ):
+            errors.append(
+                f"{prefix}.data_frequency must be daily or weekly for template initialization"
+            )
+        if sheet_mode == "template" and str(
+            route.get("return_frequency", "weekly")
+        ) != str(route.get("data_frequency", "auto")):
+            errors.append(
+                f"{prefix}.return_frequency must match data_frequency in template mode"
+            )
         if route.get("series_start"):
             try:
                 dt.date.fromisoformat(str(route["series_start"]))
@@ -268,6 +305,18 @@ def validate_config(config: dict[str, Any]) -> None:
                 }:
                     errors.append(
                         f"{prefix}.benchmark.source_type must be level or aligned_return"
+                    )
+                display_name = benchmark.get("display_name")
+                if display_name is not None and (
+                    not isinstance(display_name, str)
+                    or not display_name.strip()
+                    or len(display_name.strip()) > 100
+                    or "\n" in display_name
+                    or "\r" in display_name
+                    or display_name.lstrip().startswith("=")
+                ):
+                    errors.append(
+                        f"{prefix}.benchmark.display_name must be a non-empty, non-formula single-line string of at most 100 characters"
                     )
         key = (sender, sheet, code or "")
         if key in route_keys:
@@ -357,8 +406,8 @@ def validate_config(config: dict[str, Any]) -> None:
         style = {}
     for field in sorted(set(style) - {"mode", "zero_threshold"}):
         errors.append(f"unknown style field: {field}")
-    if style.get("mode", "infer") != "infer":
-        errors.append("style.mode currently supports only infer")
+    if style.get("mode", "infer") not in {"infer", "cn-red-up-green-down"}:
+        errors.append("style.mode must be infer or cn-red-up-green-down")
     try:
         zero_threshold = float(style.get("zero_threshold", 0.00005))
         if (

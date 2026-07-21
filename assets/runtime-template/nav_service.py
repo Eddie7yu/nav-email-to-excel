@@ -275,7 +275,20 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
     supported_python = (3, 11) <= sys.version_info[:2] <= (3, 14)
     add("python", supported_python, platform.python_version())
     workbook = Path(config["workbook_path"])
-    add("workbook", workbook.is_file(), "present" if workbook.is_file() else "missing")
+    workbook_exists = workbook.is_file()
+    workbook_mode = str(config.get("workbook_mode", "existing"))
+    add("workbook", workbook_exists, "present" if workbook_exists else "missing")
+    template_target_ready = (
+        workbook_mode == "bundled-template"
+        and workbook.suffix.lower() == ".xlsx"
+        and workbook.parent.is_dir()
+    )
+    if workbook_mode == "bundled-template":
+        add(
+            "workbook-template-target",
+            template_target_ready,
+            "initialized" if workbook_exists else "ready for workbook init-template",
+        )
     configured_routes = config.get("routes") or []
     active = active_routes(config)
     add(
@@ -340,14 +353,20 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
         ),
     )
     by_name = {item["name"]: item["passed"] for item in checks}
-    base_names = {
-        "python",
-        "workbook",
-        *{f"package:{name}" for name in expected_packages},
-    }
+    base_names = {"python", *{f"package:{name}" for name in expected_packages}}
+    base_names.add(
+        "workbook-template-target"
+        if workbook_mode == "bundled-template"
+        else "workbook"
+    )
     bootstrap_ready = all(by_name.get(name, False) for name in base_names)
     mail_discovery_ready = bootstrap_ready and by_name["imap-secret"]
-    preview_ready = bootstrap_ready and by_name["routes"] and by_name["imap-secret"]
+    preview_ready = (
+        bootstrap_ready
+        and workbook_exists
+        and by_name["routes"]
+        and by_name["imap-secret"]
+    )
     commit_ready = preview_ready and by_name["spreadsheet-com"]
     schedule_ready = (
         commit_ready and by_name["schedule-path"] and by_name["schedule-config"]

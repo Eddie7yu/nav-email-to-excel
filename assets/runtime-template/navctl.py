@@ -26,6 +26,7 @@ from nav_schedule import record_scheduled_run
 from nav_schedule import remove as remove_schedule
 from nav_schedule import status as schedule_status
 from nav_service import discover, doctor, preview, propose_routes, validate
+from nav_template import init_template
 from runtime_secret import (
     SecretInputCancelled,
     launch_secret_prompt,
@@ -289,6 +290,13 @@ def command_schedule(config: dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
+def command_workbook(config: dict[str, Any], args: argparse.Namespace) -> int:
+    if args.workbook_action == "init-template":
+        emit(init_template(config))
+        return 0
+    raise RuntimeError(f"Unsupported workbook action: {args.workbook_action}")
+
+
 def command_demo(args: argparse.Namespace) -> int:
     if args.demo_action == "prepare":
         emit(prepare_demo())
@@ -325,6 +333,8 @@ def parser() -> argparse.ArgumentParser:
     schedule.add_argument("schedule_action", choices=("install", "remove", "status"))
     automation = commands.add_parser("automation")
     automation.add_argument("automation_action", choices=("status", "revoke"))
+    workbook = commands.add_parser("workbook")
+    workbook.add_argument("workbook_action", choices=("init-template",))
     demo = commands.add_parser(
         "demo", help="使用虚构邮箱和工作簿进行完全离线的安全演练"
     )
@@ -361,6 +371,7 @@ def main() -> int:
             "commit": command_commit,
             "schedule": command_schedule,
             "automation": command_automation,
+            "workbook": command_workbook,
         }
         return commands[args.command](config, args)
     except (ConfigError, RuntimeError, ValueError, OSError) as exc:

@@ -1416,23 +1416,362 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     return application
 
 
+def template_tests(runtime: Path, use_com: bool) -> str | None:
+    from nav_automation import approve, automatic_update
+    from nav_commit import commit, ensure_process_exit, spreadsheet_app
+    from nav_config import validate_config
+    from nav_parse import NavRow
+    from nav_template import TemplateError, init_template
+    from nav_workbook import build_preview, validate_history
+
+    target = runtime / "全新脱敏模板.xlsx"
+    route_specs = [
+        ("周度无指数", "WEEK00", "weekly", None),
+        ("周度有指数", "WEEK01", "weekly", "示例指数"),
+        ("日度无指数", "DAY000", "daily", None),
+        ("日度有指数", "DAY001", "daily", "示例指数"),
+    ]
+    routes = []
+    for index, (sheet, code, frequency, benchmark_name) in enumerate(route_specs, 1):
+        benchmark = None
+        if benchmark_name:
+            benchmark = {
+                "source_sheet": "指数数据",
+                "source_type": "level",
+                "source_date": "A",
+                "source_value": "B",
+                "display_name": benchmark_name,
+            }
+        routes.append(
+            {
+                "sender": f"sender{index}@example.invalid",
+                "subject_contains": code,
+                "sheet": sheet,
+                "sheet_mode": "template",
+                "code": code,
+                "product_name": f"示例产品{index}",
+                "parser": "auto",
+                "allow_sender_only": False,
+                "cumulative_policy": "require",
+                "return_basis": "cumulative",
+                "return_frequency": frequency,
+                "data_frequency": frequency,
+                "series_start": "2026-01-02",
+                "benchmark": benchmark,
+            }
+        )
+    config = {
+        "schema_version": 1,
+        "runtime_id": "00000000-0000-4000-8000-000000000170",
+        "workbook_path": str(target.resolve()),
+        "workbook_mode": "bundled-template",
+        "imap": {
+            "host": "imap.example.invalid",
+            "port": 993,
+            "user": "user@example.invalid",
+            "mailbox": "INBOX",
+            "lookback_days": 180,
+        },
+        "routes": routes,
+        "column_overrides": {},
+        "style": {"mode": "cn-red-up-green-down", "zero_threshold": 0.00005},
+        "schedule": [{"days": ["MON", "WED", "FRI"], "time": "09:00"}],
+        "validation": {"minimum_history_dates": 2, "tolerance": 0.000001},
+    }
+    validate_config(config)
+    initialized = init_template(config)
+    check(
+        initialized["product_sheets"]
+        == ["周度无指数", "周度有指数", "日度无指数", "日度有指数"]
+        and initialized["benchmark_source_sheets"] == ["指数数据"]
+        and target.is_file(),
+        "template initializer did not create four product sheets and one shared source sheet",
+    )
+    try:
+        init_template(config)
+    except TemplateError as exc:
+        check("refusing to overwrite" in str(exc), "overwrite refusal is unclear")
+    else:
+        raise AssertionError("template initializer overwrote an existing workbook")
+
+    workbook = openpyxl.load_workbook(target, data_only=False)
+    dates_by_frequency = {
+        "weekly": [
+            dt.date(2026, 1, 2),
+            dt.date(2026, 1, 9),
+            dt.date(2026, 1, 16),
+        ],
+        "daily": [
+            dt.date(2026, 1, 2),
+            dt.date(2026, 1, 5),
+            dt.date(2026, 1, 6),
+        ],
+    }
+    try:
+        check(
+            workbook.sheetnames
+            == ["周度无指数", "周度有指数", "日度无指数", "日度有指数", "指数数据"],
+            "generated workbook sheet order is wrong",
+        )
+        expected_headers = {
+            "周度无指数": [
+                "产品代码",
+                "产品名称",
+                "单位净值",
+                "累计单位净值",
+                "净值日期",
+                "周收益",
+            ],
+            "周度有指数": [
+                "产品代码",
+                "产品名称",
+                "单位净值",
+                "累计单位净值",
+                "净值日期",
+                "周收益",
+                "示例指数",
+                "指数收益(周度)",
+                "超额(周度)",
+            ],
+            "日度无指数": [
+                "产品代码",
+                "产品名称",
+                "单位净值",
+                "累计单位净值",
+                "净值日期",
+                "日收益",
+                "周收益",
+            ],
+            "日度有指数": [
+                "产品代码",
+                "产品名称",
+                "单位净值",
+                "累计单位净值",
+                "净值日期",
+                "日收益",
+                "周收益",
+                "示例指数收益(日度)",
+                "超额(日度)",
+            ],
+        }
+        for name, headers in expected_headers.items():
+            sheet = workbook[name]
+            check(
+                [sheet.cell(2, column).value for column in range(1, len(headers) + 1)]
+                == headers,
+                f"{name}: generated headers are wrong",
+            )
+            check(
+                sheet["A1"].value is None
+                and list(sheet.merged_cells.ranges)
+                and sheet["B2"].font.name == "等线"
+                and sheet["B2"].font.sz == 10
+                and sheet["F3"].fill.fgColor.rgb.endswith("FFF2CC")
+                and sum(len(item.rules) for item in sheet.conditional_formatting) >= 2,
+                f"{name}: template style or dynamic return coloring is incomplete",
+            )
+        check(
+            workbook["日度有指数"]["I3"].fill.fgColor.rgb.endswith("FFFF00"),
+            "daily excess column is not bright yellow",
+        )
+        source = workbook["指数数据"]
+        check(
+            [source.cell(1, column).value for column in range(1, 4)]
+            == ["日期", "示例指数点位", "来源"],
+            "shared index source headers are wrong",
+        )
+        source_points = {
+            dt.date(2026, 1, 2): 100.0,
+            dt.date(2026, 1, 5): 100.2,
+            dt.date(2026, 1, 6): 100.3,
+            dt.date(2026, 1, 9): 101.0,
+            dt.date(2026, 1, 16): 100.5,
+        }
+        for row, (date, level) in enumerate(sorted(source_points.items()), 2):
+            source.cell(row, 1).value = date
+            source.cell(row, 2).value = level
+            source.cell(row, 3).value = "https://example.invalid/index"
+        workbook.save(target)
+    finally:
+        workbook.close()
+
+    values = {
+        "周度无指数": [1.0, 1.02, 1.03],
+        "周度有指数": [1.0, 1.01, 1.02],
+        "日度无指数": [1.0, 0.99, 1.01],
+        "日度有指数": [1.0, 0.98, 0.97],
+    }
+
+    def rows(count: int) -> dict[str, list[NavRow]]:
+        return {
+            sheet: [
+                NavRow(date, value, value, code, "fixture")
+                for date, value in zip(
+                    dates_by_frequency[frequency][:count], values[sheet][:count]
+                )
+            ]
+            for sheet, code, frequency, _benchmark in route_specs
+        }
+
+    first_rows = rows(1)
+    first_validation = validate_history(config, first_rows)
+    check(
+        first_validation["passed"]
+        and len(first_validation["warnings"]) == 4
+        and all(
+            item["cold_start_kind"] == "bundled-template"
+            for item in first_validation["routes"]
+        ),
+        "one-date bundled template cold start was not accepted with visible warnings",
+    )
+    first_plan = build_preview(config, first_rows, first_validation["warnings"])
+    check(
+        len(first_plan["sheets"]) == 4
+        and all(item["new_dates"] == ["2026-01-02"] for item in first_plan["sheets"]),
+        "one-date template preview is incomplete",
+    )
+    application = None
+    if use_com:
+        application = str(commit(config)["application"])
+    else:
+        shutil.copy2(first_plan["preview_path"], target)
+    one_date_validation = validate_history(config, first_rows)
+    check(
+        one_date_validation["passed"] and one_date_validation["warnings"],
+        "template did not keep the cold-start warning until two dates were verified",
+    )
+
+    second_rows = rows(2)
+    second_validation = validate_history(config, second_rows)
+    check(
+        second_validation["passed"] and second_validation["warnings"],
+        "second date was not allowed to enter the reviewed template preview",
+    )
+    second_plan = build_preview(config, second_rows, second_validation["warnings"])
+    preview = openpyxl.load_workbook(second_plan["preview_path"], data_only=False)
+    try:
+        weekly = preview["周度有指数"]
+        daily = preview["日度有指数"]
+        check(
+            weekly["F4"].value == "=D4/D3-1"
+            and weekly["G3"].value == "='指数数据'!B2"
+            and weekly["G4"].value == "='指数数据'!B5"
+            and weekly["H4"].value == "=G4/G3-1"
+            and weekly["I4"].value == "=F4-H4",
+            "weekly benchmark return or excess formulas are wrong: "
+            f"{[weekly[cell].value for cell in ('F4', 'G3', 'G4', 'H4', 'I4')]}",
+        )
+        check(
+            daily["F4"].value == "=D4/D3-1"
+            and daily["G4"].value == "=D4/D3-1"
+            and daily["H4"].value == "='指数数据'!B3/'指数数据'!B2-1"
+            and daily["I4"].value == "=F4-H4"
+            and daily["F5"].value == "=D4/D3-1"
+            and daily["G5"].value is None,
+            "daily/weekly product returns or daily excess formulas are wrong",
+        )
+        check(
+            set(second_plan["sheets"][3]["return_columns"]) == {6, 7, 8, 9},
+            "daily benchmark style plan does not include all return columns",
+        )
+    finally:
+        preview.close()
+    if use_com:
+        application = str(commit(config)["application"])
+        app, _progid, process_id = spreadsheet_app()
+        book = None
+        try:
+            book = app.Workbooks.Open(
+                str(target.resolve()), ReadOnly=True, UpdateLinks=0
+            )
+            app.CalculateFull()
+            red = int(book.Worksheets("周度无指数").Range("F4").Font.Color)
+            green = int(book.Worksheets("日度有指数").Range("F4").Font.Color)
+            check(
+                red == 255 and green == 176 * 256 + 80 * 65536,
+                "Excel/WPS did not display red-up/green-down fixed colors",
+            )
+        finally:
+            if book is not None:
+                book.Close(SaveChanges=False)
+            app.Quit()
+            app = None
+            gc.collect()
+            ensure_process_exit(process_id)
+    else:
+        shutil.copy2(second_plan["preview_path"], target)
+    strict = validate_history(config, second_rows)
+    check(
+        strict["passed"] and not strict["warnings"],
+        "two verified template dates did not restore strict validation",
+    )
+    no_op = build_preview(config, second_rows)
+    check(
+        not no_op["sheets"] and no_op["preview_path"] is None,
+        "template update is not idempotent after two verified dates",
+    )
+
+    third_rows = rows(3)
+    third_validation = validate_history(config, third_rows)
+    check(
+        third_validation["passed"] and not third_validation["warnings"],
+        "later template increment did not pass strict history validation",
+    )
+    if use_com:
+        approve(config)
+        result = automatic_update(config, third_rows)
+        application = str(result["application"])
+        check(
+            result["changed"] and result["rows"] == 4,
+            "scheduled automatic update did not write one date to every product sheet",
+        )
+    else:
+        third_plan = build_preview(config, third_rows)
+        expected_increment = {
+            "周度无指数": ["2026-01-16"],
+            "周度有指数": ["2026-01-16"],
+            "日度无指数": ["2026-01-06"],
+            "日度有指数": ["2026-01-06"],
+        }
+        check(
+            all(
+                item["new_dates"] == expected_increment[item["sheet"]]
+                for item in third_plan["sheets"]
+            ),
+            "later template preview did not contain exactly one incremental date",
+        )
+        shutil.copy2(third_plan["preview_path"], target)
+    final = validate_history(config, third_rows)
+    check(
+        final["passed"]
+        and not final["warnings"]
+        and not build_preview(config, third_rows)["sheets"],
+        "template workflow is not strict and idempotent after the later increment",
+    )
+    return application
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime", required=True)
     parser.add_argument("--com", action="store_true")
     args = parser.parse_args()
     runtime = Path(args.runtime).resolve()
-    print("[1/4] 检查自动解析、本地解析器、精确发件人和冲突拦截")
+    print("[1/5] 检查自动解析、本地解析器、精确发件人和冲突拦截")
     parser_tests(runtime)
     print("      PASS")
-    print("[2/4] 检查空路由、暂停路由和无邮件失败关闭")
+    print("[2/5] 检查空路由、暂停路由和无邮件失败关闭")
     route_state_tests(runtime)
     print("      PASS")
-    print("[3/4] 检查崩溃恢复和并发运行锁")
+    print("[3/5] 检查崩溃恢复和并发运行锁")
     lock_tests(runtime)
     print("      PASS")
-    print("[4/4] 检查严格表、空表冷启动、分析页保留、补录、基准和幂等性")
+    print("[4/5] 检查严格表、空表冷启动、分析页保留、补录、基准和幂等性")
     application = workbook_tests(runtime, args.com)
+    print("      PASS")
+    print("[5/5] 检查四类脱敏模板、共享指数、冷启动、增量和拒绝覆盖")
+    template_application = template_tests(runtime, args.com)
+    application = template_application or application
     print("      PASS")
     if args.com:
         print(f"      Excel/WPS COM、文件占用提示及缓存数值：PASS（{application}）")

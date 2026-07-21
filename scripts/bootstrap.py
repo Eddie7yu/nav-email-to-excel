@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "assets" / "runtime-template"
+WORKBOOK_TEMPLATES = ROOT / "assets" / "workbook-templates"
 APP_DIRECTORY = "app"
 ROOT_FILE_MAP = {
     ".gitignore": ".gitignore",
@@ -35,11 +36,13 @@ APP_FILES = (
     "nav_parse.py",
     "nav_schedule.py",
     "nav_service.py",
+    "nav_template.py",
     "nav_workbook.py",
     "requirements.lock",
     "run-update.cmd",
     "runtime_secret.py",
 )
+WORKBOOK_ASSETS = ("nav-standard-cn.xlsx",)
 MAX_WINDOWS_DESTINATION_CHARS = 116
 
 
@@ -91,7 +94,10 @@ def validate_inputs(args: argparse.Namespace) -> tuple[Path, Path]:
     if not (3, 11) <= sys.version_info[:2] <= (3, 14):
         raise RuntimeError("Python 3.11 through 3.14 is required")
     destination = Path(args.destination).expanduser().resolve()
-    workbook = Path(args.workbook).expanduser().resolve()
+    existing_workbook = args.workbook is not None
+    workbook_arg = args.workbook if existing_workbook else args.new_workbook
+    workbook = Path(workbook_arg).expanduser().resolve()
+    args.workbook_mode = "existing" if existing_workbook else "bundled-template"
     if os.name == "nt" and len(str(destination)) > MAX_WINDOWS_DESTINATION_CHARS:
         raise RuntimeError(
             "Windows 安装目录过长"
@@ -107,10 +113,26 @@ def validate_inputs(args: argparse.Namespace) -> tuple[Path, Path]:
         raise RuntimeError(f"Destination parent does not exist: {destination.parent}")
     if not os.access(destination.parent, os.W_OK):
         raise RuntimeError(f"Destination parent is not writable: {destination.parent}")
-    if not workbook.is_file() or workbook.suffix.lower() not in {".xlsx", ".xlsm"}:
-        raise RuntimeError("Workbook must be an existing .xlsx or .xlsm file")
+    if existing_workbook:
+        if not workbook.is_file() or workbook.suffix.lower() not in {".xlsx", ".xlsm"}:
+            raise RuntimeError("Workbook must be an existing .xlsx or .xlsm file")
+    else:
+        if workbook.exists():
+            raise RuntimeError(
+                "New workbook target already exists; refusing to overwrite it"
+            )
+        if workbook.suffix.lower() != ".xlsx":
+            raise RuntimeError("New workbook target must end in .xlsx")
+        if not workbook.parent.is_dir():
+            raise RuntimeError(f"New workbook parent does not exist: {workbook.parent}")
+        if not os.access(workbook.parent, os.W_OK):
+            raise RuntimeError(
+                f"New workbook parent is not writable: {workbook.parent}"
+            )
     if not TEMPLATE.is_dir():
         raise RuntimeError("Bundled runtime template is missing")
+    if not WORKBOOK_TEMPLATES.is_dir():
+        raise RuntimeError("Bundled workbook templates are missing")
     args.email = args.email.strip()
     args.imap_host = args.imap_host.strip()
     args.mailbox = args.mailbox.strip()
@@ -133,6 +155,7 @@ def config_payload(args: argparse.Namespace, workbook: Path) -> dict:
         "schema_version": 1,
         "runtime_id": str(uuid.uuid4()),
         "workbook_path": str(workbook),
+        "workbook_mode": args.workbook_mode,
         "imap": {
             "host": args.imap_host,
             "port": args.imap_port,
@@ -145,7 +168,12 @@ def config_payload(args: argparse.Namespace, workbook: Path) -> dict:
         },
         "routes": [],
         "column_overrides": {},
-        "style": {"mode": "infer", "zero_threshold": 0.00005},
+        "style": {
+            "mode": (
+                "infer" if args.workbook_mode == "existing" else "cn-red-up-green-down"
+            ),
+            "zero_threshold": 0.00005,
+        },
         "schedule": [],
         "validation": {
             "minimum_history_dates": 2,
@@ -165,6 +193,8 @@ def create_runtime(args: argparse.Namespace, destination: Path, workbook: Path) 
         staging.mkdir()
         app = staging / APP_DIRECTORY
         app.mkdir()
+        app_assets = app / "assets"
+        app_assets.mkdir()
         for source_name, destination_name in ROOT_FILE_MAP.items():
             source = TEMPLATE / source_name
             if not source.is_file():
@@ -175,6 +205,11 @@ def create_runtime(args: argparse.Namespace, destination: Path, workbook: Path) 
             if not source.is_file():
                 raise RuntimeError(f"Bundled runtime file is missing: {name}")
             shutil.copy2(source, app / name)
+        for name in WORKBOOK_ASSETS:
+            source = WORKBOOK_TEMPLATES / name
+            if not source.is_file():
+                raise RuntimeError(f"Bundled workbook asset is missing: {name}")
+            shutil.copy2(source, app_assets / name)
         (app / "parsers").mkdir()
         for name in ("backups", "logs", "previews"):
             (staging / name).mkdir()
@@ -249,7 +284,12 @@ def parser() -> argparse.ArgumentParser:
         description="Create an isolated local NAV email runtime"
     )
     result.add_argument("--destination", required=True)
-    result.add_argument("--workbook", required=True)
+    workbook = result.add_mutually_exclusive_group(required=True)
+    workbook.add_argument("--workbook", help="继续使用已经存在的 .xlsx 或 .xlsm 工作簿")
+    workbook.add_argument(
+        "--new-workbook",
+        help="登记尚不存在的 .xlsx 路径，稍后用内置脱敏模板创建",
+    )
     result.add_argument("--email", required=True)
     result.add_argument("--imap-host", required=True)
     result.add_argument("--imap-port", type=int, default=993)
@@ -283,6 +323,11 @@ def main() -> int:
             "下一步：由 AI 在 app 目录运行 navctl.py secret launch，"
             "用户只在弹出的窗口粘贴一次授权码；随后由 AI 自动发现路由。"
         )
+        if args.workbook_mode == "bundled-template":
+            print(
+                "发现并确认路由后，由 AI 运行 navctl.py workbook init-template "
+                "创建脱敏模板工作簿；目标路径存在时程序会拒绝覆盖。"
+            )
         return 0
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

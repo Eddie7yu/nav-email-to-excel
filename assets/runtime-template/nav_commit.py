@@ -6,6 +6,7 @@ import datetime as dt
 import gc
 import json
 import os
+import re
 import shutil
 import sys
 import uuid
@@ -207,6 +208,15 @@ def _apply_return_style(
                 cell.Font.Color = color
 
 
+def _cn_return_profile() -> dict[str, Any]:
+    return {
+        "positive": 255,
+        "negative": 176 * 256 + 80 * 65536,
+        "zero": 0,
+        "font": ("微软雅黑", 10.0, True, "0.00%"),
+    }
+
+
 def _apply_plan_with_com(
     temp: Path, preview: Path, plan: dict[str, Any], config: dict[str, Any]
 ) -> str:
@@ -284,30 +294,35 @@ def _apply_plan_with_com(
                     _copy_value(source.Cells(row, column), target.Cells(row, column))
         app.CalculateFull()
         threshold = float((config.get("style") or {}).get("zero_threshold", 0.00005))
-        if str((config.get("style") or {}).get("mode", "infer")) == "infer":
-            for sheet_plan in plan["sheets"]:
-                name = sheet_plan["sheet"]
-                target = target_book.Worksheets(name)
-                styled_rows = {int(row) for row in sheet_plan["new_rows"]}
-                styled_rows.add(int(sheet_plan["summary_row"]))
-                styled_rows.update(
-                    int(item["row"]) for item in sheet_plan.get("changed_cells") or []
+        style_mode = str((config.get("style") or {}).get("mode", "infer"))
+        for sheet_plan in plan["sheets"]:
+            name = sheet_plan["sheet"]
+            target = target_book.Worksheets(name)
+            styled_rows = {int(row) for row in sheet_plan["new_rows"]}
+            styled_rows.add(int(sheet_plan["summary_row"]))
+            styled_rows.update(
+                int(item["row"]) for item in sheet_plan.get("changed_cells") or []
+            )
+            profile = (
+                _cn_return_profile()
+                if style_mode == "cn-red-up-green-down"
+                else profiles.get(
+                    name,
+                    {
+                        "positive": None,
+                        "negative": None,
+                        "zero": None,
+                        "font": None,
+                    },
                 )
-                _apply_return_style(
-                    target,
-                    styled_rows,
-                    [int(value) for value in sheet_plan.get("return_columns") or []],
-                    profiles.get(
-                        name,
-                        {
-                            "positive": None,
-                            "negative": None,
-                            "zero": None,
-                            "font": None,
-                        },
-                    ),
-                    threshold,
-                )
+            )
+            _apply_return_style(
+                target,
+                styled_rows,
+                [int(value) for value in sheet_plan.get("return_columns") or []],
+                profile,
+                threshold,
+            )
         target_book.Save()
         success = True
         return progid
@@ -344,6 +359,17 @@ def _same_cell(left: Any, right: Any) -> bool:
         return left == right
     if isinstance(left, (int, float)) and isinstance(right, (int, float)):
         return abs(float(left) - float(right)) <= 1e-9
+    if (
+        isinstance(left, str)
+        and isinstance(right, str)
+        and left.startswith("=")
+        and right.startswith("=")
+    ):
+
+        def normalize(value: str) -> str:
+            return re.sub(r"'([^']+)'!", r"\1!", value)
+
+        return normalize(left) == normalize(right)
     return left == right
 
 
@@ -484,18 +510,19 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
         if (
             header_row < 1
             or insert_before <= header_row
-            or insert_count < 1
+            or insert_count < 0
             or new_rows != list(range(insert_before, insert_before + insert_count))
         ):
             raise CommitError("The plan insertion range is invalid")
         if (
             summary_row != insert_before + insert_count
+            or populated_count < 1
             or populated_count != insert_count + len(filled_existing_rows)
             or len(item.get("new_dates") or []) != populated_count
         ):
             raise CommitError("The plan summary row or new-date count is invalid")
         if filled_existing_rows and (
-            str(item.get("sheet_mode", "summary")) != "summary"
+            str(item.get("sheet_mode", "summary")) not in {"summary", "template"}
             or filled_existing_rows != [insert_before - 1]
             or filled_existing_rows[0] <= header_row
         ):

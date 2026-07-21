@@ -32,7 +32,9 @@ HEADER_WORDS = {
     "name": ("产品名称", "基金名称", "product name", "fund name", "名称"),
     "unit": ("单位净值", "份额净值", "unit nav"),
     "cumulative": ("累计单位净值", "累计净值", "cumulative nav"),
-    "return": ("产品收益", "基金收益", "周收益", "日收益", "return"),
+    "return": ("产品收益", "基金收益", "return"),
+    "daily_return": ("日收益", "日度收益", "daily return"),
+    "weekly_return": ("周收益", "周度收益", "weekly return"),
     "benchmark_level": ("指数点位", "基准点位", "benchmark level", "index level"),
     "benchmark_return": ("指数收益", "基准收益", "benchmark return", "index return"),
     "excess": ("超额", "excess", "alpha"),
@@ -75,6 +77,8 @@ def _field(value: Any) -> str | None:
         "benchmark_return",
         "benchmark_level",
         "excess",
+        "daily_return",
+        "weekly_return",
         "return",
         "unit",
     )
@@ -152,7 +156,7 @@ def discover_layout(
     override = override or {}
     route = route or {}
     mode = str(route.get("sheet_mode", "summary"))
-    if mode not in {"summary", "append"}:
+    if mode not in {"summary", "append", "template"}:
         raise WorkbookError(f"{sheet.title}: unsupported sheet mode {mode}")
     header_row = int(override.get("header_row") or 0)
     columns: dict[str, int] = {}
@@ -204,6 +208,56 @@ def discover_layout(
             f"{sheet.title}: date and unit NAV columns are not unambiguous"
         )
     data_start = header_row + 1
+    if mode == "template":
+        frequency = str(route.get("data_frequency", "auto"))
+        if (
+            frequency == "weekly"
+            and route.get("benchmark")
+            and str(route["benchmark"].get("source_type", "level")) == "level"
+            and "benchmark_level" not in columns
+            and columns.get("benchmark_return")
+        ):
+            columns["benchmark_level"] = columns["benchmark_return"] - 1
+        required_returns = (
+            {"daily_return", "weekly_return"}
+            if frequency == "daily"
+            else {"weekly_return"}
+        )
+        if frequency not in {"daily", "weekly"}:
+            raise WorkbookError(
+                f"{sheet.title}: template mode requires explicit daily or weekly data_frequency"
+            )
+        if not required_returns <= columns.keys():
+            raise WorkbookError(
+                f"{sheet.title}: template return columns do not match {frequency} frequency"
+            )
+        if not ({"code", "name"} & columns.keys()):
+            raise WorkbookError(
+                f"{sheet.title}: template mode requires a product code or product name column"
+            )
+        if (
+            route.get("benchmark")
+            and not {
+                "benchmark_return",
+                "excess",
+            }
+            <= columns.keys()
+        ):
+            raise WorkbookError(
+                f"{sheet.title}: benchmark template is missing benchmark return or excess columns"
+            )
+        if (
+            not route.get("benchmark")
+            and {
+                "benchmark_return",
+                "benchmark_level",
+                "excess",
+            }
+            & columns.keys()
+        ):
+            raise WorkbookError(
+                f"{sheet.title}: non-benchmark template contains benchmark columns"
+            )
     headers_to_write: dict[int, str] = {}
     if mode == "append":
         _require_append_identity(sheet, columns, route)
@@ -219,6 +273,34 @@ def discover_layout(
     if not dated_rows:
         if mode == "summary":
             raise WorkbookError(f"{sheet.title}: no dated NAV rows found")
+        if mode == "template":
+            summary_row = data_start + 1
+            if header_row != 2 or sheet.max_row < summary_row:
+                raise WorkbookError(
+                    f"{sheet.title}: generated template structure is incomplete"
+                )
+            if _has_values(sheet, data_start, data_start):
+                raise WorkbookError(
+                    f"{sheet.title}: template cold-start row must be empty"
+                )
+            values = {
+                _norm(sheet.cell(summary_row, column).value)
+                for column in range(1, min(sheet.max_column, 6) + 1)
+            }
+            if not values & TOTAL_WORDS or _has_values(sheet, summary_row + 1):
+                raise WorkbookError(
+                    f"{sheet.title}: generated template must end with its cumulative row"
+                )
+            return Layout(
+                sheet.title,
+                header_row,
+                data_start,
+                summary_row,
+                header_row,
+                columns,
+                mode,
+                {},
+            )
         if _has_values(sheet, data_start):
             raise WorkbookError(
                 f"{sheet.title}: append mode found content below the header but no dated NAV rows"
@@ -369,6 +451,10 @@ def _summary_reserved_row(
 def _header_data_frequency(
     sheet: openpyxl.worksheet.worksheet.Worksheet, layout: Layout
 ) -> str | None:
+    if layout.columns.get("daily_return"):
+        return "daily"
+    if layout.columns.get("weekly_return"):
+        return "weekly"
     return_column = layout.columns.get("return")
     if not return_column:
         return None
@@ -611,6 +697,7 @@ def validate_history(
                         f"{sheet_name}: historical value conflict on {candidate.date.isoformat()}"
                     )
             summary_cold_start = reserved_date is not None
+            template_cold_start = layout.mode == "template" and matches < minimum
             if summary_cold_start:
                 if len(candidate_dates) < minimum:
                     errors.append(
@@ -619,6 +706,15 @@ def validate_history(
                 if candidate_dates and len(candidate_dates) >= minimum:
                     warnings.append(
                         f"{sheet_name}: detected a reserved summary row cold start; replace the empty placeholder with the earliest email NAV, keep the summary row, and review the first preview"
+                    )
+            elif template_cold_start:
+                if candidate_dates and not conflicts:
+                    warnings.append(
+                        f"{sheet_name}: bundled template cold start has {len(candidate_dates)} real email date(s); review the first preview, and strict validation resumes after {minimum} verified dates"
+                    )
+                else:
+                    errors.append(
+                        f"{sheet_name}: bundled template cold start needs at least one real email NAV date"
                     )
             elif matches < minimum:
                 message = f"{sheet_name}: only {matches} verified historical dates; {minimum} required"
@@ -633,10 +729,13 @@ def validate_history(
                     "sheet": sheet_name,
                     "sheet_mode": layout.mode,
                     "cold_start": summary_cold_start
+                    or template_cold_start
                     or (layout.mode == "append" and matches < minimum),
                     "cold_start_kind": (
                         "summary-reserved-row"
                         if summary_cold_start
+                        else "bundled-template"
+                        if template_cold_start
                         else "append"
                         if layout.mode == "append" and matches < minimum
                         else None
@@ -701,6 +800,28 @@ def _date_rows(
     return sorted(rows)
 
 
+def _primary_return_column(layout: Layout, route: dict[str, Any]) -> int | None:
+    frequency = str(route.get("return_frequency", "weekly"))
+    semantic = "daily_return" if frequency == "daily" else "weekly_return"
+    return layout.columns.get(semantic) or layout.columns.get("return")
+
+
+def _period_rows(
+    rows: list[tuple[dt.date, int]], frequency: str
+) -> tuple[list[int], dict[tuple[int, int], list[tuple[dt.date, int]]]]:
+    if frequency == "daily":
+        return [row for _, row in rows], {}
+    groups: dict[tuple[int, int], list[tuple[dt.date, int]]] = {}
+    for date, row in rows:
+        iso = date.isocalendar()
+        groups.setdefault((iso.year, iso.week), []).append((date, row))
+    current_iso = dt.date.today().isocalendar()
+    completed = [
+        key for key in sorted(groups) if key < (current_iso.year, current_iso.week)
+    ]
+    return [max(groups[key])[1] for key in completed], groups
+
+
 def _set_return_formulas(
     sheet: openpyxl.worksheet.worksheet.Worksheet,
     layout: Layout,
@@ -710,8 +831,16 @@ def _set_return_formulas(
     changed: set[tuple[int, int]],
     write_summary: bool = True,
 ) -> tuple[list[int], set[int]]:
-    return_column = layout.columns.get("return")
-    if not return_column:
+    primary_column = _primary_return_column(layout, route)
+    semantic_columns = {
+        "daily": layout.columns.get("daily_return"),
+        "weekly": layout.columns.get("weekly_return"),
+    }
+    if not any(semantic_columns.values()) and layout.columns.get("return"):
+        semantic_columns[str(route.get("return_frequency", "weekly"))] = layout.columns[
+            "return"
+        ]
+    if not primary_column:
         return [], set()
     basis_name = (
         "cumulative"
@@ -728,64 +857,71 @@ def _set_return_formulas(
     if not rows:
         return [], set()
     letter = get_column_letter(basis_column)
-    frequency = str(route.get("return_frequency", "weekly"))
-    period_rows: list[int] = []
-    affected_rows: set[int] = set()
-    if frequency == "daily":
-        for index, (_, row) in enumerate(rows):
-            period_rows.append(row)
-            if row in new_rows:
+    results: dict[str, tuple[list[int], set[int]]] = {}
+    for frequency, return_column in semantic_columns.items():
+        if not return_column:
+            continue
+        period_rows, groups = _period_rows(rows, frequency)
+        affected_rows: set[int] = set()
+        if frequency == "daily":
+            for index, (_, row) in enumerate(rows):
+                if row not in new_rows:
+                    continue
                 value = (
                     None
                     if index == 0
                     else f"={letter}{row}/{letter}{rows[index - 1][1]}-1"
                 )
-                sheet.cell(row, return_column).value = value
-                changed.add((row, return_column))
-                affected_rows.add(row)
-    else:
-        groups: dict[tuple[int, int], list[tuple[dt.date, int]]] = {}
-        for date, row in rows:
-            iso = date.isocalendar()
-            groups.setdefault((iso.year, iso.week), []).append((date, row))
-        current_iso = dt.date.today().isocalendar()
-        completed = [
-            key for key in sorted(groups) if key < (current_iso.year, current_iso.week)
-        ]
-        for key in completed:
-            period_rows.append(max(groups[key])[1])
-        new_week_keys = {
-            (date.isocalendar().year, date.isocalendar().week)
-            for date, row in rows
-            if row in new_rows
-        }
-        for key in new_week_keys:
-            week_rows = [row for _, row in groups[key]]
-            affected_rows.update(week_rows)
-            target = max(groups[key])[1] if key in completed else None
-            previous = (
-                period_rows[period_rows.index(target) - 1]
-                if target in period_rows and period_rows.index(target) > 0
-                else None
-            )
-            for row in week_rows:
-                value = (
-                    f"={letter}{row}/{letter}{previous}-1"
-                    if row == target and previous is not None
-                    else None
-                )
                 if sheet.cell(row, return_column).value != value:
                     sheet.cell(row, return_column).value = value
                     changed.add((row, return_column))
+                affected_rows.add(row)
+        else:
+            new_week_keys = {
+                (date.isocalendar().year, date.isocalendar().week)
+                for date, row in rows
+                if row in new_rows
+            }
+            for key in new_week_keys:
+                week_rows = [row for _, row in groups[key]]
+                affected_rows.update(week_rows)
+                target = (
+                    max(groups[key])[1]
+                    if target_key_exists(key, period_rows, groups)
+                    else None
+                )
+                previous = (
+                    period_rows[period_rows.index(target) - 1]
+                    if target in period_rows and period_rows.index(target) > 0
+                    else None
+                )
+                for row in week_rows:
+                    value = (
+                        f"={letter}{row}/{letter}{previous}-1"
+                        if row == target and previous is not None
+                        else None
+                    )
+                    if sheet.cell(row, return_column).value != value:
+                        sheet.cell(row, return_column).value = value
+                        changed.add((row, return_column))
+        results[frequency] = (period_rows, affected_rows)
+    frequency = str(route.get("return_frequency", "weekly"))
+    period_rows, affected_rows = results.get(frequency, ([], set()))
     if write_summary:
         summary_value = None
-        if frequency == "daily" and period_rows:
+        if period_rows:
             summary_value = f"={letter}{period_rows[-1]}/{letter}{period_rows[0]}-1"
-        elif frequency == "weekly" and period_rows:
-            summary_value = f"={letter}{period_rows[-1]}/{letter}{period_rows[0]}-1"
-        sheet.cell(summary_row, return_column).value = summary_value
-        changed.add((summary_row, return_column))
+        sheet.cell(summary_row, primary_column).value = summary_value
+        changed.add((summary_row, primary_column))
     return period_rows, affected_rows
+
+
+def target_key_exists(
+    key: tuple[int, int],
+    period_rows: list[int],
+    groups: dict[tuple[int, int], list[tuple[dt.date, int]]],
+) -> bool:
+    return bool(groups.get(key)) and max(groups[key])[1] in period_rows
 
 
 def _benchmark_source(
@@ -839,7 +975,7 @@ def _set_benchmark_formulas(
     source_letter = get_column_letter(source_column)
     target_return = layout.columns.get("benchmark_return")
     excess = layout.columns.get("excess")
-    product_return = layout.columns.get("return")
+    product_return = _primary_return_column(layout, route)
     if not target_return or not excess or not product_return:
         raise WorkbookError(
             f"{sheet.title}: benchmark return, product return, and excess columns are required"
@@ -884,8 +1020,6 @@ def _set_benchmark_formulas(
             ).value = f"={get_column_letter(product_return)}{row}-{get_column_letter(target_return)}{row}"
             changed.add((row, excess))
     else:
-        if not level_column:
-            raise WorkbookError(f"{sheet.title}: benchmark level column is required")
         for row in affected_targets:
             index = period_rows.index(row)
             if index == 0:
@@ -900,7 +1034,7 @@ def _set_benchmark_formulas(
                     raise WorkbookError(
                         f"{sheet.title}: benchmark is missing for {date.isoformat()}"
                     )
-                if (
+                if level_column and (
                     anchor_row == row
                     or sheet.cell(anchor_row, level_column).value is None
                 ):
@@ -908,10 +1042,18 @@ def _set_benchmark_formulas(
                         anchor_row, level_column
                     ).value = f"={source_sheet}!{source_letter}{source[0]}"
                     changed.add((anchor_row, level_column))
-            level_letter = get_column_letter(level_column)
-            sheet.cell(
-                row, target_return
-            ).value = f"={level_letter}{row}/{level_letter}{previous_level_row}-1"
+            if level_column:
+                level_letter = get_column_letter(level_column)
+                sheet.cell(
+                    row, target_return
+                ).value = f"={level_letter}{row}/{level_letter}{previous_level_row}-1"
+            else:
+                current_source = source_values[by_row[row]][0]
+                previous_source = source_values[by_row[previous_level_row]][0]
+                sheet.cell(row, target_return).value = (
+                    f"={source_sheet}!{source_letter}{current_source}/"
+                    f"{source_sheet}!{source_letter}{previous_source}-1"
+                )
             changed.add((row, target_return))
             sheet.cell(
                 row, excess
@@ -947,7 +1089,15 @@ def _ensure_summary_formula_safety(
     layout: Layout,
     route: dict[str, Any],
 ) -> None:
-    managed = {column for column in (layout.columns.get("return"),) if column}
+    managed = {
+        column
+        for column in (
+            layout.columns.get("return"),
+            layout.columns.get("daily_return"),
+            layout.columns.get("weekly_return"),
+        )
+        if column
+    }
     if route.get("benchmark"):
         managed.update(
             column
@@ -1057,6 +1207,13 @@ def build_preview(
                         f"{sheet_name}: summary-mode cold start needs at least {minimum} email NAV dates"
                     )
                 reserved_nav = candidates[0]
+            elif layout.mode == "template" and not current:
+                if not candidates:
+                    raise WorkbookError(
+                        f"{sheet_name}: bundled template cold start needs at least one real email NAV date"
+                    )
+                reserved_nav = candidates[0]
+                reserved_row = layout.data_start
             additions = (
                 candidates[1:]
                 if reserved_nav is not None
@@ -1064,7 +1221,7 @@ def build_preview(
             )
             if not additions and reserved_nav is None:
                 continue
-            if layout.mode == "summary":
+            if layout.mode in {"summary", "template"}:
                 _ensure_summary_formula_safety(sheet, layout, route)
             latest_existing = max(current) if current else None
             gaps = (
@@ -1099,10 +1256,11 @@ def build_preview(
                     changed,
                 )
                 filled_existing_rows.append(reserved_row)
-            sheet.insert_rows(old_summary, count)
+            if count:
+                sheet.insert_rows(old_summary, count)
             for offset, nav in enumerate(additions):
                 target = old_summary + offset
-                if current or layout.mode == "summary":
+                if current or layout.mode in {"summary", "template"}:
                     template = old_summary - 1 if offset == 0 else target - 1
                     _copy_row(sheet, template, target, max_column)
                 _write_nav_values(sheet, target, layout, route, nav)
@@ -1128,7 +1286,7 @@ def build_preview(
                 new_summary,
                 managed_rows,
                 changed,
-                write_summary=layout.mode == "summary",
+                write_summary=layout.mode in {"summary", "template"},
             )
             _set_benchmark_formulas(
                 workbook,
@@ -1139,7 +1297,7 @@ def build_preview(
                 period_rows,
                 affected_rows,
                 changed,
-                write_summary=layout.mode == "summary",
+                write_summary=layout.mode in {"summary", "template"},
             )
             plan_sheets.append(
                 {
@@ -1154,7 +1312,8 @@ def build_preview(
                     "new_rows": list(range(old_summary, new_summary)),
                     "filled_existing_rows": filled_existing_rows,
                     "summary_row": new_summary,
-                    "copy_template_rows": bool(current) or layout.mode == "summary",
+                    "copy_template_rows": bool(current)
+                    or layout.mode in {"summary", "template"},
                     "format_rows": sorted(
                         {
                             *([layout.header_row] if layout.headers_to_write else []),
@@ -1180,6 +1339,8 @@ def build_preview(
                         column
                         for column in (
                             layout.columns.get("return"),
+                            layout.columns.get("daily_return"),
+                            layout.columns.get("weekly_return"),
                             layout.columns.get("benchmark_return"),
                             layout.columns.get("excess"),
                         )
@@ -1272,7 +1433,8 @@ def validate_preview(config: dict[str, Any], plan: dict[str, Any]) -> None:
                     insert_before, column
                 ).value != right.cell(new_summary, column).value:
                     raise WorkbookError(
-                        f"{name}: preview changed an unapproved summary cell"
+                        f"{name}: preview changed an unapproved summary cell at "
+                        f"{get_column_letter(column)}{new_summary}"
                     )
         for sheet_plan in plan["sheets"]:
             sheet = candidate[sheet_plan["sheet"]]

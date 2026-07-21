@@ -15,6 +15,7 @@ from bootstrap import MAX_WINDOWS_DESTINATION_CHARS, pip_install_command
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "assets" / "runtime-template"
+WORKBOOK_TEMPLATE = ROOT / "assets" / "workbook-templates" / "nav-standard-cn.xlsx"
 DRIVER = ROOT / "scripts" / "selftest_driver.py"
 BOOTSTRAP = ROOT / "scripts" / "bootstrap.py"
 
@@ -187,8 +188,17 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     config_path = app / "config.json"
     original_config = config_path.read_bytes()
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    if config["workbook_path"] != str(workbook_path.resolve()) or config["routes"]:
+    if (
+        config["workbook_path"] != str(workbook_path.resolve())
+        or config["workbook_mode"] != "existing"
+        or config["style"]["mode"] != "infer"
+        or config["routes"]
+    ):
         raise AssertionError("bootstrap generated an unsafe initial configuration")
+    if not (app / "assets" / "nav-standard-cn.xlsx").is_file():
+        raise AssertionError(
+            "bootstrap did not install the sanitized workbook template"
+        )
     runtime_python = (
         app / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     )
@@ -401,6 +411,44 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
                 "bootstrap failed after creating a valid non-console-codepage path"
             )
 
+    new_destination = temporary / "模板部署运行时"
+    new_workbook = temporary / "尚未创建的净值表.xlsx"
+    new_command = [
+        sys.executable,
+        "-X",
+        "utf8",
+        str(BOOTSTRAP),
+        "--destination",
+        str(new_destination),
+        "--new-workbook",
+        str(new_workbook),
+        "--email",
+        "user@example.invalid",
+        "--imap-host",
+        "imap.example.invalid",
+        "--skip-deps",
+    ]
+    new_installation = subprocess.run(
+        new_command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+    )
+    if new_installation.returncode or new_workbook.exists():
+        raise AssertionError(
+            f"new-workbook bootstrap failed or created the workbook too early: {new_installation.stderr}"
+        )
+    new_config = json.loads(
+        (new_destination / "app" / "config.json").read_text(encoding="utf-8")
+    )
+    if (
+        new_config["workbook_mode"] != "bundled-template"
+        or new_config["workbook_path"] != str(new_workbook.resolve())
+        or new_config["style"]["mode"] != "cn-red-up-green-down"
+    ):
+        raise AssertionError("new-workbook bootstrap wrote the wrong safety profile")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="完全使用虚构数据的离线回归测试")
@@ -414,6 +462,8 @@ def main() -> int:
         runtime = Path(temporary) / "中文 路径" / "runtime"
         runtime.parent.mkdir()
         shutil.copytree(TEMPLATE, runtime)
+        (runtime / "assets").mkdir()
+        shutil.copy2(WORKBOOK_TEMPLATE, runtime / "assets" / WORKBOOK_TEMPLATE.name)
         command = [sys.executable, "-X", "utf8", str(DRIVER), "--runtime", str(runtime)]
         if args.com:
             command.append("--com")
