@@ -35,6 +35,7 @@ from nav_parse import (
     NavRow,
     ParseError,
     choose_route_rows,
+    consume_parse_library_warnings,
     deduplicate,
     rows_from_message,
 )
@@ -136,6 +137,28 @@ def _parse_diagnostic(
     }
 
 
+def _warning_summary(items: list[dict[str, str]]) -> list[dict[str, Any]]:
+    counts: dict[tuple[str, str, str, str], int] = {}
+    for item in items:
+        key = (
+            str(item.get("code") or "parser-library-warning"),
+            str(item.get("library") or "unknown"),
+            str(item.get("source_type") or "unknown"),
+            str(item.get("category") or "Warning"),
+        )
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {
+            "code": key[0],
+            "library": key[1],
+            "source_type": key[2],
+            "category": key[3],
+            "count": count,
+        }
+        for key, count in sorted(counts.items())
+    ]
+
+
 def propose_headers(config: dict[str, Any], limit: int = 25) -> dict[str, Any]:
     headers, scan = fetch_candidate_headers(config, limit)
     groups: dict[str, dict[str, Any]] = {}
@@ -189,6 +212,7 @@ def propose_routes(
     )
     groups: dict[str, dict[str, Any]] = {}
     ignored = 0
+    library_warnings: list[dict[str, str]] = []
     for message in messages:
         sender = single_from_address(message)
         if not sender:
@@ -198,6 +222,8 @@ def propose_routes(
             rows = rows_from_message(message, "auto")
         except ParseError:
             rows = []
+        finally:
+            library_warnings.extend(consume_parse_library_warnings())
         if not rows:
             ignored += 1
             continue
@@ -262,11 +288,18 @@ def propose_routes(
         )
     if scan["skipped_oversize"]:
         warnings.append(f"已跳过 {scan['skipped_oversize']} 封超过单封大小上限的邮件")
+    warning_summary = _warning_summary(library_warnings)
+    if warning_summary:
+        warnings.append(
+            f"解析库产生 {sum(item['count'] for item in warning_summary)} 条结构化警告；"
+            "请在 parser_library_warnings 中检查类别后再确认解析结果"
+        )
     report = {
         "passed": bool(candidates),
         "scan": {**scan, "messages_ignored_as_non_nav": ignored},
         "candidates": candidates,
         "warnings": warnings,
+        "parser_library_warnings": warning_summary,
         "errors": [] if candidates else ["没有发现可自动解析的净值邮件候选"],
     }
     write_json_atomic(STATE_ROOT / "route-proposals.json", report)
@@ -291,6 +324,7 @@ def collect_route_rows(
             "warnings": warnings,
             "errors": ["No active routes are configured"],
             "diagnostics": [],
+            "parser_library_warnings": [],
             "ignored_unconfigured_rows": 0,
             "messages_with_ignored_unconfigured_rows": 0,
         }
@@ -306,6 +340,7 @@ def collect_route_rows(
     route_reports: list[dict[str, Any]] = []
     errors: list[str] = []
     diagnostics: list[dict[str, Any]] = []
+    library_warnings: list[dict[str, str]] = []
     ignored_unconfigured_rows = 0
     messages_with_ignored_unconfigured_rows = 0
     for sender, routes in sender_routes.items():
@@ -337,6 +372,8 @@ def collect_route_rows(
                 except ParseError as exc:
                     parsed = []
                     parse_error = exc
+                finally:
+                    library_warnings.extend(consume_parse_library_warnings())
                 if not parsed:
                     diagnostics.append(
                         _parse_diagnostic(
@@ -436,12 +473,19 @@ def collect_route_rows(
             f"{ignored_unconfigured_rows} 行，涉及 "
             f"{messages_with_ignored_unconfigured_rows} 封邮件"
         )
+    warning_summary = _warning_summary(library_warnings)
+    if warning_summary:
+        warnings.append(
+            f"解析库产生 {sum(item['count'] for item in warning_summary)} 条结构化警告；"
+            "正式批准前应检查 parser_library_warnings"
+        )
     report = {
         "passed": not errors,
         "routes": route_reports,
         "warnings": warnings,
         "errors": errors,
         "diagnostics": diagnostics,
+        "parser_library_warnings": warning_summary,
         "ignored_unconfigured_rows": ignored_unconfigured_rows,
         "messages_with_ignored_unconfigured_rows": (
             messages_with_ignored_unconfigured_rows
@@ -481,6 +525,20 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
         "routes",
         bool(active),
         f"{len(active)} active; {len(configured_routes) - len(active)} paused",
+    )
+    unresolved_reviews = [
+        str(route["sheet"])
+        for route in active
+        if route.get("benchmark_review_only")
+    ]
+    add(
+        "write-rules-resolved",
+        not unresolved_reviews,
+        (
+            "resolved"
+            if not unresolved_reviews
+            else f"{len(unresolved_reviews)} sheet(s) require benchmark/source review"
+        ),
     )
     expected_packages = {
         "openpyxl": "3.1.5",
@@ -553,7 +611,11 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
         and by_name["routes"]
         and by_name["imap-secret"]
     )
-    commit_ready = preview_ready and by_name["spreadsheet-com"]
+    commit_ready = (
+        preview_ready
+        and by_name["spreadsheet-com"]
+        and by_name["write-rules-resolved"]
+    )
     schedule_ready = (
         commit_ready and by_name["schedule-path"] and by_name["schedule-config"]
     )

@@ -88,6 +88,7 @@
 - `configured_not_seen_in_lookback`：本次回看没有发现的已配置产品，只是诊断线索，不会自动暂停；
 - `workbook_missing_sheets`：配置引用但工作簿缺失的页面；
 - `unmanaged_workbook_sheets`：未被路由或基准使用的页面，可能是分析页，不应自动删除。
+- `review_required`：仍处于基准/超额来源审查状态的活动产品数量；大于零时可以预览，但不能提交或上线自动更新。
 
 离线复查上一次候选报告可使用 `products sync --use-existing-proposals`；只看当前状态使用 `products status`。用户不需要看报告或候选序号，由 AI 完成匹配。
 
@@ -109,6 +110,8 @@
 5. 邮件提供累计净值时使用 `require`；邮件不提供时，只有工作簿历史能证明累计净值始终等于单位净值才使用 `unit`，否则停止并报告真实业务歧义。
 
 `adopt` 只修改本地 `app/config.json`，正式工作簿字节必须完全不变。仅在候选含多个代码但 Sheet 无法唯一映射时传 `--code`；只有 Sheet 未写完整名称时才传 `--product-name`。同一发件人且代码不足以分流时才传 `--subject-contains`。
+
+目标页含空白的基准/超额预留列时正常接管，不把“有这个表头”等同于“已有基准业务”。如果这些列已有点位、数值或公式，而 AI 暂时无法证明可靠来源，程序自动增加内部 `benchmark_review_only: true`：允许验证净值并生成审查预览，但 `plan.json` 会包含 `committable: false` 和脱敏的 `blocking_reviews`，`commit` 必须拒绝，`doctor` 的 `write-rules-resolved`、`commit_ready`、`schedule_ready` 也保持失败。审查预览只在新增行和汇总行清空未确认的基准点位/收益/超额，已有历史与正式工作簿不变。AI 找到并核验来源后，以标准 `benchmark` 映射替换该内部状态，再重新运行 `preview`。不要让普通用户编辑这个字段，也不要把“来源待确认”升级成“连预览都不能生成”。
 
 ### B. 照受管 Sheet 的格式新建
 
@@ -275,6 +278,10 @@
 ```
 
 `display_name` 可选，只能在资料已核实时填写，用于把内置模板中的“基准指数”显示为“中证1000”等名称。仅当来源列已经与产品的日度或周度观察日期对齐时，才使用 `source_type: aligned_return`。日度指数收益列不是周度基准。指数点位应优先使用 `level`；周度模板可在产品页显示点位，日度模板可直接从来源点位计算日收益，不强制增加点位列。缺少必需来源日期时必须阻止正式写入。
+
+`benchmark_review_only` 不是另一种长期基准配置，也不是跳过基准的开关。它只由 `products adopt` 在已有 `summary` 页发现活跃但来源未证明的基准/超额列时临时使用，让 Agent 先得到可检查结果。审查预览不能批准为自动更新；来源解决后必须移除该字段并配置 `benchmark`。如果来源最终无法证明，应在副本中与用户确认业务口径后改用真正无基准的产品页，而不是长期保留审查状态。
+
+Excel 附件解析过程中，openpyxl 可能对不完全支持的扩展、样式或修复内容发出 Python warning。运行时不把原始 warning 文本写入报告，以免带出附件名或本地路径；`route-proposals.json` 和 `route-report.json` 的 `parser_library_warnings` 只记录固定错误码、库名、来源类型、警告类别及计数。出现记录不等于自动解析失败，但 Agent 必须结合脱敏样例和预览核查，不能静默忽略。
 
 本地来源表尚未建立或存在缺日时，AI 按 [index-data-sources.md](index-data-sources.md) 调查公共指数通道。必须先完成来源代码、指数口径、历史重叠和使用条款核验，再把核实后的日期与点位写入本地来源表；当前运行时不会直接调用公网指数接口。
 

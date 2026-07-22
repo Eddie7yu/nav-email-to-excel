@@ -146,6 +146,7 @@ def _analysis(config: dict[str, Any], report: dict[str, Any] | None) -> dict[str
             "product_name": route.get("product_name"),
             "paused": bool(route.get("paused", False)),
             "pause_reason": route.get("pause_reason"),
+            "review_required": bool(route.get("benchmark_review_only", False)),
             "sheet_present": route.get("sheet") in sheets,
         }
         for route in routes
@@ -156,6 +157,11 @@ def _analysis(config: dict[str, Any], report: dict[str, Any] | None) -> dict[str
         "configured": len(routes),
         "active": len(active_routes(config)),
         "paused": len(routes) - len(active_routes(config)),
+        "review_required": sum(
+            1
+            for route in active_routes(config)
+            if route.get("benchmark_review_only", False)
+        ),
         "routes": route_status,
         "matched_candidates": matched,
         "new_candidates": new_candidates,
@@ -388,14 +394,19 @@ def _infer_existing_sheet(
         )
         if frequency not in {"daily", "weekly"}:
             raise ProductError(f"无法从 {sheet_name} 的日期规律或表头确定日频/周频")
-        if {
-            "benchmark_level",
-            "benchmark_return",
-            "excess",
-        } & layout.columns.keys():
-            raise ProductError(
-                "目标 Sheet 含指数/超额列；必须先由 AI 从现有公式和可靠资料确定基准来源，再使用高级路由参数接管"
+        benchmark_columns = {
+            semantic: layout.columns[semantic]
+            for semantic in ("benchmark_level", "benchmark_return", "excess")
+            if layout.columns.get(semantic)
+        }
+        benchmark_review_only = bool(
+            benchmark_columns
+            and any(
+                sheet.cell(row, column).value not in (None, "")
+                for column in benchmark_columns.values()
+                for row in range(layout.data_start, layout.summary_row + 1)
             )
+        )
         observations = _candidate_observations(candidate, selected_code)
         if layout.columns.get("cumulative"):
             if observations and all(
@@ -431,6 +442,8 @@ def _infer_existing_sheet(
             "frequency_source": frequency_source,
             "cumulative_policy": cumulative_policy,
             "return_basis": return_basis,
+            "benchmark_review_only": benchmark_review_only,
+            "benchmark_columns_present": sorted(benchmark_columns),
         }
     finally:
         workbook.close()
@@ -458,6 +471,7 @@ def add(
     benchmark_source_date: str = "A",
     benchmark_source_value: str = "B",
     benchmark_display_name: str | None = None,
+    benchmark_review_only: bool = False,
 ) -> dict[str, Any]:
     candidate = _candidate(proposal_index)
     detected = {
@@ -518,6 +532,8 @@ def add(
             benchmark_display_name,
         ),
     }
+    if benchmark_review_only:
+        route["benchmark_review_only"] = True
     if cumulative_policy == "offset":
         if cumulative_offset is None:
             raise ProductError("--cumulative-offset is required for offset policy")
@@ -585,6 +601,7 @@ def adopt(
         sheet_mode=profile["sheet_mode"],
         cumulative_policy=profile["cumulative_policy"],
         return_basis=profile["return_basis"],
+        benchmark_review_only=profile["benchmark_review_only"],
     )
     result["action"] = "adopted-existing-sheet"
     result["inference"] = profile

@@ -691,6 +691,11 @@ def validate_history(
     try:
         for route in active_routes(config):
             sheet_name = str(route["sheet"])
+            if route.get("benchmark_review_only"):
+                warnings.append(
+                    f"{sheet_name}: 基准/超额来源尚未确认；本次只生成审查预览，"
+                    "AI 确认可靠来源并重新预览前不能提交或启用自动更新"
+                )
             if sheet_name not in workbook.sheetnames:
                 errors.append(f"Missing managed sheet: {sheet_name}")
                 continue
@@ -1151,7 +1156,27 @@ def _set_benchmark_formulas(
     affected_rows: set[int],
     changed: set[tuple[int, int]],
     write_summary: bool = True,
+    review_rows: set[int] | None = None,
 ) -> None:
+    if route.get("benchmark_review_only"):
+        review_columns = {
+            column
+            for column in (
+                layout.columns.get("benchmark_level"),
+                layout.columns.get("benchmark_return"),
+                layout.columns.get("excess"),
+            )
+            if column
+        }
+        rows_to_clear = set(review_rows if review_rows is not None else affected_rows)
+        if write_summary:
+            rows_to_clear.add(summary_row)
+        for row in rows_to_clear:
+            for column in review_columns:
+                if sheet.cell(row, column).value is not None:
+                    sheet.cell(row, column).value = None
+                    changed.add((row, column))
+        return
     benchmark = route.get("benchmark")
     if not benchmark:
         return
@@ -1283,10 +1308,11 @@ def _ensure_summary_formula_safety(
         )
         if column
     }
-    if route.get("benchmark"):
+    if route.get("benchmark") or route.get("benchmark_review_only"):
         managed.update(
             column
             for column in (
+                layout.columns.get("benchmark_level"),
                 layout.columns.get("benchmark_return"),
                 layout.columns.get("excess"),
             )
@@ -1402,9 +1428,14 @@ def build_preview(
     workbook = openpyxl.load_workbook(preview, data_only=False, keep_vba=keep_vba)
     plan_sheets: list[dict[str, Any]] = []
     baseline_routes: list[dict[str, Any]] = []
+    blocking_reviews: list[dict[str, str]] = []
     try:
         for route in active_routes(config):
             sheet_name = str(route["sheet"])
+            if route.get("benchmark_review_only"):
+                blocking_reviews.append(
+                    {"sheet": sheet_name, "issue": "benchmark-source-unresolved"}
+                )
             sheet = workbook[sheet_name]
             layout = discover_layout(
                 sheet, (config.get("column_overrides") or {}).get(sheet_name), route
@@ -1542,6 +1573,7 @@ def build_preview(
                 affected_rows,
                 changed,
                 write_summary=layout.mode in {"summary", "template"},
+                review_rows=managed_rows,
             )
             plan_sheets.append(
                 {
@@ -1613,6 +1645,8 @@ def build_preview(
         "review_path": None,
         "review_sha256": None,
         "warnings": list(warnings or []),
+        "committable": not blocking_reviews,
+        "blocking_reviews": blocking_reviews,
         "sheets": plan_sheets,
     }
     if not plan_sheets:
@@ -1624,7 +1658,11 @@ def build_preview(
             f"生成时间：{plan['created']}",
             "结论：邮箱历史与现有工作簿已通过校验，当前没有待写入的新日期。",
             "正式工作簿：未修改；批准本报告不会创建备份或写入工作簿。",
-            "批准用途：记录当前写表配置的自动更新权限，供后续计划任务使用。",
+            (
+                "批准用途：当前仍有待确认项，本报告不能批准为自动更新权限。"
+                if blocking_reviews
+                else "批准用途：记录当前写表配置的自动更新权限，供后续计划任务使用。"
+            ),
             "",
             f"受管产品页数量：{len(baseline_routes)}",
         ]
@@ -1643,6 +1681,17 @@ def build_preview(
             )
         if warnings:
             lines.extend(["", "警告：", *[f"- {item}" for item in warnings]])
+        if blocking_reviews:
+            lines.extend(
+                [
+                    "",
+                    "待 AI 解决后重新预览：",
+                    *[
+                        f"- {item['sheet']}：基准/超额来源尚未确认"
+                        for item in blocking_reviews
+                    ],
+                ]
+            )
         review.write_text("\n".join(lines) + "\n", encoding="utf-8")
         plan["review_path"] = str(review.resolve())
         plan["review_sha256"] = file_sha256(review)

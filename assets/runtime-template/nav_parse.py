@@ -7,7 +7,9 @@ import importlib.util
 import io
 import re
 import sys
+import warnings
 import zipfile
+from contextvars import ContextVar
 from dataclasses import dataclass
 from email.message import Message
 from html.parser import HTMLParser
@@ -42,10 +44,37 @@ MAX_CELLS = 2_000_000
 MAX_PDF_PAGES = 100
 MAX_ZIP_MEMBERS = 2_000
 MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+_PARSE_LIBRARY_WARNINGS: ContextVar[tuple[dict[str, str], ...]] = ContextVar(
+    "parse_library_warnings", default=()
+)
 
 
 class ParseError(ValueError):
     pass
+
+
+def _record_library_warnings(
+    captured: list[warnings.WarningMessage], *, library: str, source_type: str
+) -> None:
+    if not captured:
+        return
+    current = list(_PARSE_LIBRARY_WARNINGS.get())
+    current.extend(
+        {
+            "code": "parser-library-warning",
+            "library": library,
+            "source_type": source_type,
+            "category": item.category.__name__,
+        }
+        for item in captured
+    )
+    _PARSE_LIBRARY_WARNINGS.set(tuple(current))
+
+
+def consume_parse_library_warnings() -> list[dict[str, str]]:
+    recorded = list(_PARSE_LIBRARY_WARNINGS.get())
+    _PARSE_LIBRARY_WARNINGS.set(())
+    return recorded
 
 
 @dataclass(frozen=True)
@@ -243,20 +272,28 @@ def rows_from_xlsx(payload: bytes, source: str) -> list[NavRow]:
                     )
     except zipfile.BadZipFile as exc:
         raise ParseError(f"Invalid workbook archive in {source}") from exc
-    workbook = openpyxl.load_workbook(
-        io.BytesIO(payload), data_only=True, read_only=True
-    )
+    captured: list[warnings.WarningMessage] = []
     rows: list[NavRow] = []
     try:
-        if len(workbook.worksheets) > MAX_SHEETS:
-            raise ParseError(f"Worksheet limit exceeded in {source}")
-        for sheet in workbook.worksheets:
-            if sheet.max_row > MAX_ROWS or sheet.max_column > MAX_COLUMNS:
-                raise ParseError(f"Worksheet dimensions exceeded in {source}")
-            matrix = [list(row) for row in sheet.iter_rows(values_only=True)]
-            rows.extend(rows_from_matrix(matrix, f"{source}:{sheet.title}"))
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            workbook = openpyxl.load_workbook(
+                io.BytesIO(payload), data_only=True, read_only=True
+            )
+            try:
+                if len(workbook.worksheets) > MAX_SHEETS:
+                    raise ParseError(f"Worksheet limit exceeded in {source}")
+                for sheet in workbook.worksheets:
+                    if sheet.max_row > MAX_ROWS or sheet.max_column > MAX_COLUMNS:
+                        raise ParseError(f"Worksheet dimensions exceeded in {source}")
+                    matrix = [list(row) for row in sheet.iter_rows(values_only=True)]
+                    rows.extend(rows_from_matrix(matrix, f"{source}:{sheet.title}"))
+            finally:
+                workbook.close()
     finally:
-        workbook.close()
+        _record_library_warnings(
+            captured, library="openpyxl", source_type="xlsx-attachment"
+        )
     return deduplicate(rows)
 
 
@@ -564,6 +601,7 @@ def _rows_from_local_parser(message: Message, parser_name: str) -> list[NavRow]:
 
 
 def rows_from_message(message: Message, parser_name: str = "auto") -> list[NavRow]:
+    _PARSE_LIBRARY_WARNINGS.set(())
     if parser_name == "auto":
         return _rows_from_message_auto(message)
     if parser_name.startswith("local:"):

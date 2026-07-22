@@ -55,6 +55,7 @@ ROUTE_FIELDS = {
     "series_start",
     "max_staleness_days",
     "benchmark",
+    "benchmark_review_only",
 }
 BENCHMARK_FIELDS = {
     "source_sheet",
@@ -251,6 +252,15 @@ def validate_config(config: dict[str, Any]) -> None:
             errors.append(f"{prefix}.pause_reason requires paused: true")
         if not isinstance(route.get("allow_sender_only", False), bool):
             errors.append(f"{prefix}.allow_sender_only must be true or false")
+        benchmark_review_only = route.get("benchmark_review_only", False)
+        if not isinstance(benchmark_review_only, bool):
+            errors.append(f"{prefix}.benchmark_review_only must be true or false")
+        if benchmark_review_only and (
+            workbook_mode != "existing" or sheet_mode != "summary"
+        ):
+            errors.append(
+                f"{prefix}.benchmark_review_only is only valid for an existing summary sheet"
+            )
         policy = str(route.get("cumulative_policy", "require"))
         if policy not in {"require", "unit", "offset"}:
             errors.append(f"{prefix}.cumulative_policy is invalid")
@@ -299,6 +309,10 @@ def validate_config(config: dict[str, Any]) -> None:
         except (TypeError, ValueError):
             errors.append(f"{prefix}.max_staleness_days must be between 1 and 366")
         benchmark = route.get("benchmark")
+        if benchmark_review_only and benchmark is not None:
+            errors.append(
+                f"{prefix}.benchmark_review_only cannot be combined with benchmark"
+            )
         if benchmark is not None:
             if not isinstance(benchmark, dict):
                 errors.append(f"{prefix}.benchmark must be null or an object")

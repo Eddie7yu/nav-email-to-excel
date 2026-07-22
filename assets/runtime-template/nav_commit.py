@@ -444,6 +444,10 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
         raise CommitError(
             "The runtime configuration changed after preview; regenerate the preview"
         )
+    if plan.get("committable", True) is not True:
+        raise CommitError(
+            "This is a review-only preview. Resolve every blocking review and regenerate the preview before commit"
+        )
     try:
         uuid.UUID(str(plan.get("plan_id") or ""))
         created = dt.datetime.fromisoformat(str(plan["created"]))

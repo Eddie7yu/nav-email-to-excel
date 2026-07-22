@@ -9,6 +9,7 @@ import json
 import shutil
 import subprocess
 import sys
+import warnings
 from copy import deepcopy
 from email.message import EmailMessage
 from pathlib import Path
@@ -671,6 +672,30 @@ def parser_tests(runtime: Path) -> None:
     check(
         any(row.date == dt.date(2026, 1, 16) for row in parsed),
         "multi-sheet attachment parsing or 估值基准日 alias recognition failed",
+    )
+    original_openpyxl_load = nav_parse.openpyxl.load_workbook
+
+    def warning_openpyxl_load(*args, **kwargs):
+        warnings.warn("fixture workbook repair detail", UserWarning, stacklevel=2)
+        return original_openpyxl_load(*args, **kwargs)
+
+    nav_parse.openpyxl.load_workbook = warning_openpyxl_load
+    try:
+        warning_rows = rows_from_message(message)
+        library_warnings = nav_parse.consume_parse_library_warnings()
+    finally:
+        nav_parse.openpyxl.load_workbook = original_openpyxl_load
+    check(
+        warning_rows
+        and library_warnings
+        and library_warnings[0] == {
+            "code": "parser-library-warning",
+            "library": "openpyxl",
+            "source_type": "xlsx-attachment",
+            "category": "UserWarning",
+        }
+        and "fixture workbook repair detail" not in json.dumps(library_warnings),
+        "openpyxl warnings were not recorded as sanitized structured diagnostics",
     )
 
     html_body = """
@@ -2419,12 +2444,13 @@ def template_tests(runtime: Path, use_com: bool) -> str | None:
 
 def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
     from nav_automation import approve, status as approval_status
+    from nav_commit import CommitError, commit
     from nav_config import load_config, validate_config
     from nav_parse import NavRow
     from nav_product_workbook import prepare_clone_spec
     from nav_products import add, adopt, clone, pause, resume, status, sync
     from nav_template import init_template
-    from nav_workbook import validate_history
+    from nav_workbook import build_preview, validate_history
 
     target = runtime / "产品生命周期模板.xlsx"
     config_path = runtime / "product-lifecycle-config.json"
@@ -2655,10 +2681,71 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
     prepared = existing_book.create_sheet("用户新建页")
     prepared.append(["用户自行填写的产品说明", None, None, None, None, None])
     prepared.append(
-        ["产品代码", "产品名称", "单位净值", "累计单位净值", "净值日期", "收益（周度）"]
+        [
+            "产品代码",
+            "产品名称",
+            "单位净值",
+            "累计单位净值",
+            "净值日期",
+            "收益（周度）",
+            "基准点位",
+            "基准收益",
+            "超额收益",
+        ]
     )
-    prepared.append(["NEW002", "新增示例产品", 1.01, None, dt.date(2026, 1, 2), None])
+    prepared.append(
+        ["NEW002", "新增示例产品", 1.01, None, dt.date(2026, 1, 2), None]
+    )
     prepared.append(["累计", None, None, None, None, None])
+    review_sheet = existing_book.create_sheet("待审基准页")
+    review_sheet.append(["待审基准示例", None, None, None, None, None, None, None, None])
+    review_sheet.append(
+        [
+            "产品代码",
+            "产品名称",
+            "单位净值",
+            "累计单位净值",
+            "净值日期",
+            "收益（周度）",
+            "基准点位",
+            "基准收益",
+            "超额收益",
+        ]
+    )
+    review_sheet.append(
+        [
+            "REVIEW03",
+            "待审示例产品",
+            1.0,
+            1.0,
+            dt.date(2025, 12, 26),
+            "/",
+            100.0,
+            "/",
+            "/",
+        ]
+    )
+    review_sheet.append(
+        [
+            "REVIEW03",
+            "待审示例产品",
+            1.01,
+            1.01,
+            dt.date(2026, 1, 2),
+            "=D4/D3-1",
+            101.0,
+            "=G4/G3-1",
+            "=F4-H4",
+        ]
+    )
+    review_sheet.append(
+        ["累计", None, None, None, None, "=D4/D3-1", None, "=G4/G3-1", "=F5-H5"]
+    )
+    benchmark_source = existing_book.create_sheet("待审指数源")
+    benchmark_source.append(["日期", "指数点位"])
+    benchmark_source.append([dt.date(2025, 12, 26), 100.0])
+    benchmark_source.append([dt.date(2026, 1, 2), 101.0])
+    benchmark_source.append([dt.date(2026, 1, 9), 102.0])
     existing_book.create_sheet("分析页")["A1"] = "用户分析"
     existing_book.save(existing_target)
     existing_book.close()
@@ -2693,6 +2780,40 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
             "source": "body",
         }
     )
+    adopt_proposal["candidates"].append(
+        {
+            "sender": "review@example.invalid",
+            "message_count": 2,
+            "recent_message_times": [],
+            "subject_examples": ["REVIEW03 周净值"],
+            "detected_codes": ["REVIEW03"],
+            "first_date": "2025-12-26",
+            "latest_date": "2026-01-09",
+            "observations": [
+                {
+                    "date": "2025-12-26",
+                    "code": "REVIEW03",
+                    "unit": 1.0,
+                    "cumulative": 1.0,
+                    "source": "body",
+                },
+                {
+                    "date": "2026-01-02",
+                    "code": "REVIEW03",
+                    "unit": 1.01,
+                    "cumulative": 1.01,
+                    "source": "body",
+                },
+                {
+                    "date": "2026-01-09",
+                    "code": "REVIEW03",
+                    "unit": 1.02,
+                    "cumulative": 1.02,
+                    "source": "body",
+                },
+            ],
+        }
+    )
     (runtime / "route-proposals.json").write_text(
         json.dumps(adopt_proposal, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -2717,6 +2838,10 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         f"products adopt inferred the wrong layout: {existing_result['inference']}",
     )
     check(
+        not existing_result["inference"]["benchmark_review_only"],
+        "empty benchmark/excess columns incorrectly blocked a normal adoption",
+    )
+    check(
         existing_result["inference"]["code"] == "NEW002",
         "products adopt did not use the worksheet to resolve a multi-code sender",
     )
@@ -2726,7 +2851,8 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
     )
     check(
         len(existing_updated["routes"]) == 2
-        and existing_status["unmanaged_workbook_sheets"] == ["分析页"],
+        and existing_status["unmanaged_workbook_sheets"]
+        == ["待审基准页", "待审指数源", "分析页"],
         f"products adopt saved the wrong route status: {existing_status}",
     )
     adopted_validation = validate_history(
@@ -2749,6 +2875,121 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         adopted_validation["passed"]
         and adopted_report["cold_start_kind"] == "summary-reserved-row",
         f"partial user-prepared onboarding row was not accepted safely: {adopted_validation}",
+    )
+    review_before = existing_target.read_bytes()
+    review_result = adopt(
+        existing_updated,
+        existing_config_path,
+        proposal_index=2,
+        sheet="待审基准页",
+    )
+    review_config = load_config(existing_config_path)
+    check(
+        review_result["inference"]["benchmark_review_only"]
+        and review_config["routes"][-1]["benchmark_review_only"] is True
+        and status(review_config)["review_required"] == 1
+        and existing_target.read_bytes() == review_before,
+        "active unresolved benchmark columns did not enter review-only adoption safely",
+    )
+    review_rows = {
+        "参考产品": [
+            NavRow(dt.date(2025, 12, 26), 1.0, 1.0, "BASE001", "fixture"),
+            NavRow(dt.date(2026, 1, 2), 1.01, 1.01, "BASE001", "fixture"),
+        ],
+        "用户新建页": [
+            NavRow(dt.date(2026, 1, 2), 1.01, 1.01, "NEW002", "fixture"),
+            NavRow(dt.date(2026, 1, 9), 1.02, 1.02, "NEW002", "fixture"),
+        ],
+        "待审基准页": [
+            NavRow(dt.date(2025, 12, 26), 1.0, 1.0, "REVIEW03", "fixture"),
+            NavRow(dt.date(2026, 1, 2), 1.01, 1.01, "REVIEW03", "fixture"),
+            NavRow(dt.date(2026, 1, 9), 1.02, 1.02, "REVIEW03", "fixture"),
+        ],
+    }
+    review_validation = validate_history(review_config, review_rows)
+    check(
+        review_validation["passed"]
+        and any("只生成审查预览" in item for item in review_validation["warnings"]),
+        f"review-only benchmark route did not pass into supervised preview: {review_validation}",
+    )
+    baseline_config = deepcopy(review_config)
+    baseline_config["routes"] = [deepcopy(review_config["routes"][-1])]
+    baseline_rows = {
+        "待审基准页": review_rows["待审基准页"][:2],
+    }
+    baseline_validation = validate_history(baseline_config, baseline_rows)
+    baseline_plan = build_preview(
+        baseline_config, baseline_rows, baseline_validation["warnings"]
+    )
+    check(
+        baseline_validation["passed"]
+        and not baseline_plan["sheets"]
+        and baseline_plan["committable"] is False
+        and Path(baseline_plan["review_path"]).is_file(),
+        "zero-change unresolved benchmark state did not produce a review-only baseline",
+    )
+    try:
+        commit(baseline_config)
+    except CommitError:
+        pass
+    else:
+        raise AssertionError("review-only zero-change baseline was accepted for approval")
+    review_plan = build_preview(
+        review_config, review_rows, review_validation["warnings"]
+    )
+    check(
+        review_plan["committable"] is False
+        and review_plan["blocking_reviews"]
+        == [{"sheet": "待审基准页", "issue": "benchmark-source-unresolved"}],
+        f"unresolved benchmark preview was not marked non-committable: {review_plan}",
+    )
+    review_preview = openpyxl.load_workbook(review_plan["preview_path"], data_only=False)
+    try:
+        check(
+            review_preview["待审基准页"]["E5"].value.date()
+            == dt.date(2026, 1, 9)
+            and review_preview["待审基准页"]["G5"].value is None
+            and review_preview["待审基准页"]["H5"].value is None
+            and review_preview["待审基准页"]["I5"].value is None
+            and review_preview["待审基准页"]["H6"].value is None
+            and review_preview["待审基准页"]["I6"].value is None,
+            "review-only preview did not preserve NAV while blanking unresolved benchmark cells",
+        )
+    finally:
+        review_preview.close()
+    try:
+        commit(review_config)
+    except CommitError as exc:
+        check(
+            "review-only" in str(exc),
+            "review-only commit rejection did not explain the blocking state",
+        )
+    else:
+        raise AssertionError("review-only preview was accepted for formal commit")
+    check(
+        existing_target.read_bytes() == review_before,
+        "review-only preview or rejected commit changed the formal workbook",
+    )
+    resolved_config = deepcopy(review_config)
+    resolved_route = resolved_config["routes"][-1]
+    resolved_route.pop("benchmark_review_only")
+    resolved_route["benchmark"] = {
+        "source_sheet": "待审指数源",
+        "source_type": "level",
+        "source_date": "A",
+        "source_value": "B",
+        "display_name": "待审示例指数",
+    }
+    validate_config(resolved_config)
+    resolved_validation = validate_history(resolved_config, review_rows)
+    resolved_plan = build_preview(
+        resolved_config, review_rows, resolved_validation["warnings"]
+    )
+    check(
+        resolved_validation["passed"]
+        and resolved_plan["committable"] is True
+        and not resolved_plan["blocking_reviews"],
+        "verified benchmark source did not restore a normal committable preview",
     )
     spec = prepare_clone_spec(
         existing_updated, existing_updated["routes"][0], "照参考新增"
@@ -2791,7 +3032,7 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
             encoding="utf-8",
         )
         clone_result = clone(
-            existing_updated,
+            review_config,
             existing_config_path,
             proposal_index=1,
             sheet="照参考新增",
@@ -2802,7 +3043,15 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         cloned = openpyxl.load_workbook(existing_target, data_only=False)
         try:
             check(
-                cloned.sheetnames == ["参考产品", "照参考新增", "用户新建页", "分析页"]
+                cloned.sheetnames
+                == [
+                    "参考产品",
+                    "照参考新增",
+                    "用户新建页",
+                    "待审基准页",
+                    "待审指数源",
+                    "分析页",
+                ]
                 and cloned["照参考新增"]["A1"].value is None
                 and cloned["照参考新增"]["A2"].value == "产品代码"
                 and cloned["照参考新增"]["A3"].value == "CLONE003"
@@ -2820,7 +3069,7 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
             cloned.close()
         cloned_config = load_config(existing_config_path)
         check(
-            len(cloned_config["routes"]) == 3
+            len(cloned_config["routes"]) == 4
             and cloned_config["routes"][-1]["sheet"] == "照参考新增"
             and Path(clone_result["workbook"]["backup"]).is_file(),
             "products clone did not save its route or backup",
