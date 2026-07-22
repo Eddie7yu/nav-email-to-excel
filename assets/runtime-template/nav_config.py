@@ -32,6 +32,7 @@ IMAP_FIELDS = {
     "mailbox",
     "lookback_days",
     "max_messages",
+    "max_header_messages",
     "max_message_bytes",
     "max_total_bytes",
 }
@@ -137,6 +138,7 @@ def validate_config(config: dict[str, Any]) -> None:
     for field, default, minimum, maximum in (
         ("lookback_days", 180, 1, 3650),
         ("max_messages", 2000, 1, 10000),
+        ("max_header_messages", 20000, 1, 100000),
         ("max_message_bytes", 25 * 1024 * 1024, 1024, 100 * 1024 * 1024),
         ("max_total_bytes", 100 * 1024 * 1024, 1024, 1024 * 1024 * 1024),
     ):
@@ -146,6 +148,13 @@ def validate_config(config: dict[str, Any]) -> None:
                 raise ValueError
         except (TypeError, ValueError):
             errors.append(f"imap.{field} must be between {minimum} and {maximum}")
+    try:
+        if int(imap.get("max_header_messages", 20000)) < int(
+            imap.get("max_messages", 2000)
+        ):
+            errors.append("imap.max_header_messages must be at least imap.max_messages")
+    except (TypeError, ValueError):
+        pass
 
     routes = config.get("routes")
     if not isinstance(routes, list):

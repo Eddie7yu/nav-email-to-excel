@@ -21,7 +21,15 @@ from pypdf import PdfReader
 from nav_config import STATE_ROOT, normalize_code
 
 
-DATE_WORDS = ("净值日期", "估值日期", "业务日期", "navdate", "date", "日期")
+DATE_WORDS = (
+    "净值日期",
+    "估值日期",
+    "估值基准日",
+    "业务日期",
+    "navdate",
+    "date",
+    "日期",
+)
 CODE_WORDS = ("产品代码", "基金代码", "productcode", "fundcode", "代码")
 UNIT_WORDS = ("单位净值", "份额净值", "最新净值", "unitnav", "nav")
 CUM_WORDS = ("累计单位净值", "累计净值", "cumulativenav", "accumulatednav")
@@ -131,13 +139,16 @@ def rows_from_matrix(matrix: list[list[Any]], source: str) -> list[NavRow]:
         raise ParseError(f"Cell limit exceeded in {source}")
     results: list[NavRow] = []
     for header_index, row in enumerate(matrix[:50]):
-        mapping: dict[str, int] = {}
+        candidates: dict[str, list[int]] = {}
         for column, value in enumerate(row):
             field = classify_header(value)
-            if field and field not in mapping:
-                mapping[field] = column
-        if not {"date", "unit"} <= mapping.keys():
+            if field:
+                candidates.setdefault(field, []).append(column)
+        if not {"date", "unit"} <= candidates.keys():
             continue
+        if len(candidates["date"]) != 1:
+            raise ParseError(f"Ambiguous date columns in {source}")
+        mapping = {field: columns[0] for field, columns in candidates.items()}
         for data_row in matrix[header_index + 1 :]:
             if mapping["date"] >= len(data_row) or mapping["unit"] >= len(data_row):
                 continue

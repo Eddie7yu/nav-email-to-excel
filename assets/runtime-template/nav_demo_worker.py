@@ -5,6 +5,8 @@ import datetime as dt
 import json
 import os
 from email.message import EmailMessage
+from email.parser import BytesParser
+from email.policy import default
 from pathlib import Path
 from typing import Any
 
@@ -180,6 +182,22 @@ class FakeIMAP:
                 + b")"
                 for item_uid in uid.split(b",")
             ]
+        if request == "(UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])":
+            parts: list[Any] = []
+            for item_uid in uid.split(b","):
+                message = BytesParser(policy=default).parsebytes(
+                    self.messages[item_uid]
+                )
+                header = EmailMessage()
+                header["From"] = str(message.get("From") or "")
+                header["Subject"] = str(message.get("Subject") or "")
+                parts.append(
+                    (
+                        b"1 (UID " + item_uid + b" BODY[HEADER] {1})",
+                        header.as_bytes(),
+                    )
+                )
+            return "OK", parts
         payload = self.messages[uid]
         if request == "(BODY.PEEK[])":
             return "OK", [(b"1 (BODY[])", payload)]
@@ -211,8 +229,9 @@ def prepare() -> dict[str, Any]:
     rows, route_report = discover(config)
     require(route_report["passed"], "演练邮件发现失败")
     require(
-        route_report["routes"][0]["messages_filtered_by_subject"] == 1,
-        "演练主题过滤失败",
+        route_report["routes"][0]["messages_scanned"] == 3
+        and route_report["routes"][0]["messages_filtered_by_subject"] == 0,
+        "演练邮件头主题预筛选失败",
     )
     validation = validate(config, rows)
     require(validation["passed"], "演练历史核验失败")

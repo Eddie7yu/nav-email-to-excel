@@ -254,7 +254,9 @@ def _select_code(
     if len(detected) == 1:
         return next(iter(detected))
     if len(detected) > 1:
-        raise ProductError("该邮箱候选包含多个产品代码，AI 必须先按工作表证据唯一确定代码")
+        raise ProductError(
+            "该邮箱候选包含多个产品代码，AI 必须先按工作表证据唯一确定代码"
+        )
     return None
 
 
@@ -277,9 +279,7 @@ def _candidate_observations(
     return sorted(result, key=lambda item: str(item["date"]))
 
 
-def _sheet_values(
-    sheet, layout, field: str
-) -> list[str]:
+def _sheet_values(sheet, layout, field: str) -> list[str]:
     column = layout.columns.get(field)
     if not column:
         return []
@@ -411,8 +411,7 @@ def _infer_existing_sheet(
                     and values.get("cumulative") is not None
                 ]
                 if comparable and all(
-                    abs(float(values["unit"]) - float(values["cumulative"]))
-                    <= 1e-9
+                    abs(float(values["unit"]) - float(values["cumulative"])) <= 1e-9
                     for values in comparable
                 ):
                     cumulative_policy = "unit"

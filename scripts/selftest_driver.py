@@ -16,6 +16,7 @@ from typing import Any
 
 import openpyxl
 from openpyxl.styles import Border, Font, PatternFill, Side
+from openpyxl.worksheet.formula import ArrayFormula
 
 
 def check(condition: bool, message: str) -> None:
@@ -155,6 +156,7 @@ def parser_tests(runtime: Path) -> None:
     from nav_mail import (
         MailError,
         exact_from_matches,
+        fetch_authorized_messages,
         fetch_candidate_messages,
         imap_date,
         needs_imap_id,
@@ -424,6 +426,128 @@ def parser_tests(runtime: Path) -> None:
         "mailbox-wide sender discovery did not return the local NAV candidate",
     )
 
+    routed_payloads: dict[bytes, bytes] = {}
+    routed_headers: dict[bytes, bytes] = {}
+    for uid, subject in (
+        (b"1", "TARGET weekly NAV"),
+        (b"2", "unrelated custody notice"),
+        (b"3", "TARGET valuation"),
+        (b"4", "another unrelated notice"),
+    ):
+        routed = EmailMessage()
+        routed["From"] = "NAV Desk <sender@example.invalid>"
+        routed["Subject"] = subject
+        routed.set_content(
+            "Product Code | NAV Date | Unit NAV | Cumulative NAV\n"
+            f"DEMO01 | 2026-01-{int(uid) + 10:02d} | 1.0{int(uid)} | 1.0{int(uid)}"
+        )
+        routed_payloads[uid] = routed.as_bytes()
+        routed_headers[uid] = (
+            f"From: NAV Desk <sender@example.invalid>\r\nSubject: {subject}\r\n\r\n"
+        ).encode("ascii")
+    routed_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    class RoutedIMAP:
+        def uid(self, command, *_args):
+            routed_calls.append((command, _args))
+            if command == "search":
+                return "OK", [b"1 2 3 4"]
+            request = str(_args[-1])
+            requested = _args[0].split(b",")
+            if "HEADER.FIELDS" in request:
+                return "OK", [
+                    (uid + b" (UID " + uid + b" BODY[HEADER] {1})", routed_headers[uid])
+                    for uid in requested
+                ]
+            if "RFC822.SIZE" in request:
+                return "OK", [
+                    uid
+                    + b" (UID "
+                    + uid
+                    + b" RFC822.SIZE "
+                    + str(len(routed_payloads[uid])).encode("ascii")
+                    + b")"
+                    for uid in requested
+                ]
+            uid = _args[0]
+            return "OK", [(uid + b" (BODY[])", routed_payloads[uid]), b")"]
+
+        def close(self):
+            return "OK", [b""]
+
+        def logout(self):
+            return "BYE", [b""]
+
+    routed_config = {
+        "runtime_id": "00000000-0000-4000-8000-000000000001",
+        "imap": {
+            "host": "imap.example.invalid",
+            "port": 993,
+            "user": "user@example.invalid",
+            "mailbox": "INBOX",
+            "lookback_days": 30,
+            "max_messages": 2,
+            "max_message_bytes": 1024 * 1024,
+            "max_total_bytes": 2 * 1024 * 1024,
+        },
+        "routes": [
+            {
+                "sender": "sender@example.invalid",
+                "subject_contains": "TARGET",
+                "sheet": "Demo Fund",
+                "code": "DEMO01",
+            }
+        ],
+    }
+    nav_mail.connect = lambda _config: RoutedIMAP()
+    try:
+        routed_messages = fetch_authorized_messages(routed_config)
+    finally:
+        nav_mail.connect = original_connect
+    full_fetch_uids = [
+        call[1][0]
+        for call in routed_calls
+        if call[0] == "fetch" and str(call[1][-1]) == "(BODY.PEEK[])"
+    ]
+    check(
+        len(routed_messages["sender@example.invalid"]) == 2
+        and full_fetch_uids == [b"1", b"3"],
+        "authorized sender mail was not header-filtered before message limits and full download",
+    )
+    unfiltered_config = json.loads(json.dumps(routed_config))
+    unfiltered_config["routes"][0].pop("subject_contains")
+    unfiltered_config["imap"]["max_messages"] = 4
+    routed_calls.clear()
+    nav_mail.connect = lambda _config: RoutedIMAP()
+    try:
+        unfiltered_messages = fetch_authorized_messages(unfiltered_config)
+    finally:
+        nav_mail.connect = original_connect
+    check(
+        len(unfiltered_messages["sender@example.invalid"]) == 4,
+        "a route without subject_contains silently excluded authorized sender mail",
+    )
+    bounded_config = json.loads(json.dumps(routed_config))
+    bounded_config["imap"]["max_header_messages"] = 3
+    bounded_config["imap"]["max_messages"] = 2
+    routed_calls.clear()
+    nav_mail.connect = lambda _config: RoutedIMAP()
+    try:
+        fetch_authorized_messages(bounded_config)
+    except MailError as exc:
+        check(
+            "邮件头扫描边界" in str(exc)
+            and not any(
+                call[0] == "fetch" and "HEADER.FIELDS" in str(call[1][-1])
+                for call in routed_calls
+            ),
+            "oversized header scan did not stop before downloading message headers",
+        )
+    else:
+        raise AssertionError("mail header scan limit was not enforced")
+    finally:
+        nav_mail.connect = original_connect
+
     class DisconnectingIMAP(CandidateIMAP):
         def uid(self, command, *_args):
             if command == "fetch" and "BODY.PEEK" in str(_args[-1]):
@@ -460,7 +584,7 @@ def parser_tests(runtime: Path) -> None:
     data = attachment.create_sheet("Data")
     for _ in range(10):
         data.append(["Note"])
-    data.append(["Product Code", "NAV Date", "Cumulative NAV", "Unit NAV"])
+    data.append(["Product Code", "估值基准日", "Cumulative NAV", "Unit NAV"])
     data.append(["DEMO01", "2026-01-16", 1.02, 1.02])
     buffer = io.BytesIO()
     attachment.save(buffer)
@@ -476,7 +600,7 @@ def parser_tests(runtime: Path) -> None:
     parsed = rows_from_message(message)
     check(
         any(row.date == dt.date(2026, 1, 16) for row in parsed),
-        "multi-sheet attachment parsing failed",
+        "multi-sheet attachment parsing or 估值基准日 alias recognition failed",
     )
 
     parser_dir = runtime / "parsers"
@@ -486,6 +610,17 @@ def parser_tests(runtime: Path) -> None:
         "from nav_parse import NavRow\n\n"
         "def parse_message(message):\n"
         "    return [NavRow(date(2026, 1, 30), 1.03, 1.03, 'DEMO01', 'local')]\n",
+        encoding="utf-8",
+    )
+    sensitive_path = "\\".join(
+        ("C:", "Users", "Example User", "Synced Folder - Team", "客户甲", "估值表.xlsx")
+    )
+    sensitive_exception = f"{sensitive_path} user@example.invalid 产品甲净值 1.2345"
+    (parser_dir / "sensitive_failure.py").write_text(
+        "class 客户甲净值1234(Exception):\n"
+        "    pass\n\n"
+        "def parse_message(message):\n"
+        f"    raise 客户甲净值1234({sensitive_exception!r})\n",
         encoding="utf-8",
     )
     local_rows = rows_from_message(EmailMessage(), "local:fixture")
@@ -513,6 +648,29 @@ def parser_tests(runtime: Path) -> None:
         pass
     else:
         raise AssertionError("repeated labelled fields must fail closed")
+    try:
+        rows_from_text(
+            "估值日期 | 估值基准日 | 单位净值\n2026-01-09 | 2026-01-10 | 1.01",
+            "ambiguous-date-fixture",
+        )
+    except ParseError as exc:
+        check(
+            "Ambiguous date columns" in str(exc),
+            "multiple semantic date columns failed for the wrong reason",
+        )
+    else:
+        raise AssertionError("multiple semantic date columns were accepted silently")
+    explanatory_rows = rows_from_text(
+        "估值日期说明 | 业务日期口径\n"
+        "本页为说明 | 请以下表为准\n"
+        "估值基准日 | 单位净值 | 产品代码\n"
+        "2026-01-09 | 1.01 | DEMO01",
+        "cover-before-data-fixture",
+    )
+    check(
+        len(explanatory_rows) == 1 and explanatory_rows[0].date == dt.date(2026, 1, 9),
+        "a non-header explanation row with two date terms blocked the real data table",
+    )
 
 
 def route_state_tests(runtime: Path) -> None:
@@ -578,6 +736,58 @@ def route_state_tests(runtime: Path) -> None:
         and any("no routed NAV rows" in item for item in report["errors"]),
         "active route with no messages reported discovery success",
     )
+    sensitive_subject = "机密产品甲净值通知"
+    sensitive_attachment = "客户私密估值表.xlsx"
+    failed_message = EmailMessage()
+    failed_message["From"] = "NAV Desk <sender@example.invalid>"
+    failed_message["Subject"] = sensitive_subject
+    failed_message.set_content("See attachment")
+    failed_message.add_attachment(
+        b"not-an-xlsx",
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=sensitive_attachment,
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [failed_message]
+    }
+    try:
+        _, failed_report = nav_service.collect_route_rows(config)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    serialized_failure = json.dumps(failed_report, ensure_ascii=False)
+    check(
+        not failed_report["passed"]
+        and failed_report["diagnostics"]
+        and failed_report["diagnostics"][0]["stage"] == "message_parse"
+        and failed_report["diagnostics"][0]["subject_id"]
+        and failed_report["diagnostics"][0]["attachment_types"][0]["suffix"] == ".xlsx"
+        and sensitive_subject not in serialized_failure
+        and sensitive_attachment not in serialized_failure,
+        "parse diagnostics did not identify the failure without leaking sensitive names",
+    )
+    local_failure_config = json.loads(json.dumps(config))
+    local_failure_config["routes"][0]["parser"] = "local:sensitive_failure"
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [failed_message]
+    }
+    try:
+        _, local_failure_report = nav_service.collect_route_rows(local_failure_config)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    serialized_local_failure = json.dumps(local_failure_report, ensure_ascii=False)
+    check(
+        local_failure_report["diagnostics"]
+        and local_failure_report["diagnostics"][0]["error_type"] == "LocalParserError"
+        and local_failure_report["diagnostics"][0]["root_error_type"]
+        == "ControlledParseFailure"
+        and "Synced Folder" not in serialized_local_failure
+        and "客户甲" not in serialized_local_failure
+        and "客户甲净值1234" not in serialized_local_failure
+        and "1.2345" not in serialized_local_failure
+        and "user@example.invalid" not in serialized_local_failure,
+        "local parser exception text leaked through structured diagnostics",
+    )
     mixed = json.loads(json.dumps(config))
     mixed["routes"][0].update({"parser": "local:fixture", "max_staleness_days": 366})
     second_route = json.loads(json.dumps(mixed["routes"][0]))
@@ -605,7 +815,25 @@ def route_state_tests(runtime: Path) -> None:
 
 def lock_tests(runtime: Path) -> None:
     sys.path.insert(0, str(runtime))
-    from nav_schedule import record_scheduled_run, status
+    from nav_schedule import (
+        _local_timezone,
+        _task_time,
+        _task_time_detail,
+        record_scheduled_run,
+        status,
+    )
+
+    com_wall_clock = dt.datetime(2026, 7, 23, 12, 0, 0, tzinfo=dt.timezone.utc)
+    local_timezone = _local_timezone()
+    local_detail = _task_time_detail(com_wall_clock, local_timezone)
+    check(
+        _task_time(com_wall_clock) == "2026-07-23T12:00:00"
+        and local_detail is not None
+        and local_detail["datetime"] == "2026-07-23T12:00:00"
+        and local_detail["timezone_id"] == local_timezone["id"]
+        and "+00:00" not in local_detail["datetime"],
+        "Task Scheduler wall-clock time was mislabeled as UTC",
+    )
 
     holder_code = (
         "import time\n"
@@ -699,6 +927,13 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     book = runtime / "脱敏 示例.xlsx"
     create_book(book)
     config = config_for(runtime, book)
+    array_workbook = openpyxl.load_workbook(book)
+    try:
+        array_sheet = array_workbook.create_sheet("Array Audit")
+        array_sheet["A1"] = ArrayFormula(ref="A1:A1", text="=SUM(1,1)")
+        array_workbook.save(book)
+    finally:
+        array_workbook.close()
     revoke()
     check(
         not automation_status(config)["approved"],
@@ -741,6 +976,17 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     paused_config["routes"][0]["paused"] = True
     paused_config["routes"][0]["pause_reason"] = "fixture pause"
     validate_config(paused_config)
+    invalid_header_limit = json.loads(json.dumps(config))
+    invalid_header_limit["imap"]["max_messages"] = 100
+    invalid_header_limit["imap"]["max_header_messages"] = 99
+    try:
+        validate_config(invalid_header_limit)
+    except ConfigError:
+        pass
+    else:
+        raise AssertionError(
+            "max_header_messages smaller than max_messages was accepted"
+        )
     invalid_append = json.loads(json.dumps(config))
     invalid_append["routes"][0].update(
         {"sheet_mode": "append", "code": None, "product_name": None}
@@ -792,6 +1038,29 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     else:
         raise AssertionError("unmanaged summary formula must fail closed")
 
+    managed_array_book = runtime / "managed-array-formula.xlsx"
+    create_book(managed_array_book)
+    managed_array_workbook = openpyxl.load_workbook(managed_array_book)
+    try:
+        managed_array_sheet = managed_array_workbook["Demo Fund"]
+        managed_array_sheet["G4"] = None
+        managed_array_sheet["G3"] = ArrayFormula(ref="G3:G4", text="=D3:D4*2")
+        managed_array_workbook.save(managed_array_book)
+    finally:
+        managed_array_workbook.close()
+    managed_array_config = config_for(runtime, managed_array_book)
+    try:
+        build_preview(managed_array_config, rows)
+    except WorkbookError as exc:
+        check(
+            "array formula" in str(exc).lower(),
+            "managed array formula failed closed for the wrong reason",
+        )
+    else:
+        raise AssertionError(
+            "managed array formula was copied or moved during automatic insertion"
+        )
+
     validation = validate_history(config, rows)
     check(validation["passed"], f"historical validation failed: {validation['errors']}")
     plan = build_preview(config, rows)
@@ -803,6 +1072,13 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     preview = openpyxl.load_workbook(plan["preview_path"], data_only=False)
     try:
         sheet = preview["Demo Fund"]
+        array_formula = preview["Array Audit"]["A1"].value
+        check(
+            isinstance(array_formula, ArrayFormula)
+            and array_formula.ref == "A1:A1"
+            and array_formula.text == "=SUM(1,1)",
+            "unmanaged array formula was not preserved semantically",
+        )
         check(
             sheet["A4"].value == dt.datetime(2026, 1, 16, 0, 0)
             or sheet["A4"].value == dt.date(2026, 1, 16),
@@ -2048,9 +2324,7 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
     prepared.append(
         ["产品代码", "产品名称", "单位净值", "累计单位净值", "净值日期", "收益（周度）"]
     )
-    prepared.append(
-        ["NEW002", "新增示例产品", 1.01, None, dt.date(2026, 1, 2), None]
-    )
+    prepared.append(["NEW002", "新增示例产品", 1.01, None, dt.date(2026, 1, 2), None])
     prepared.append(["累计", None, None, None, None, None])
     existing_book.create_sheet("分析页")["A1"] = "用户分析"
     existing_book.save(existing_target)
@@ -2126,9 +2400,7 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         existing_updated,
         {
             "参考产品": [
-                NavRow(
-                    dt.date(2025, 12, 26), 1.0, 1.0, "BASE001", "fixture"
-                ),
+                NavRow(dt.date(2025, 12, 26), 1.0, 1.0, "BASE001", "fixture"),
                 NavRow(dt.date(2026, 1, 2), 1.01, 1.01, "BASE001", "fixture"),
             ],
             "用户新建页": [
@@ -2138,9 +2410,7 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         },
     )
     adopted_report = next(
-        item
-        for item in adopted_validation["routes"]
-        if item["sheet"] == "用户新建页"
+        item for item in adopted_validation["routes"] if item["sheet"] == "用户新建页"
     )
     check(
         adopted_validation["passed"]
@@ -2151,9 +2421,7 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         existing_updated, existing_updated["routes"][0], "照参考新增"
     )
     check(
-        spec.header_row == 2
-        and spec.data_row == 3
-        and spec.target_summary_row == 4,
+        spec.header_row == 2 and spec.data_row == 3 and spec.target_summary_row == 4,
         "clone specification did not preserve the reference sheet structure",
     )
 
@@ -2201,16 +2469,14 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         cloned = openpyxl.load_workbook(existing_target, data_only=False)
         try:
             check(
-                cloned.sheetnames
-                == ["参考产品", "照参考新增", "用户新建页", "分析页"]
+                cloned.sheetnames == ["参考产品", "照参考新增", "用户新建页", "分析页"]
                 and cloned["照参考新增"]["A1"].value is None
                 and cloned["照参考新增"]["A2"].value == "产品代码"
                 and cloned["照参考新增"]["A3"].value == "CLONE003"
                 and cloned["照参考新增"]["B3"].value == "复制新增示例产品"
                 and cloned["照参考新增"]["C3"].value is None
                 and cloned["照参考新增"]["D3"].value is None
-                and cloned["照参考新增"]["E3"].value.date()
-                == dt.date(2026, 2, 6)
+                and cloned["照参考新增"]["E3"].value.date() == dt.date(2026, 2, 6)
                 and cloned["照参考新增"]["F3"].value is None
                 and cloned["照参考新增"]["A4"].value == "累计"
                 and cloned["照参考新增"]["F4"].value is None

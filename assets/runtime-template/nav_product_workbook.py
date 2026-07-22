@@ -130,9 +130,7 @@ def _apply_clone_with_com(
         target.Name = spec.target_sheet
 
         if spec.source_summary_row > spec.data_row + 1:
-            target.Rows(
-                f"{spec.data_row + 1}:{spec.source_summary_row - 1}"
-            ).Delete()
+            target.Rows(f"{spec.data_row + 1}:{spec.source_summary_row - 1}").Delete()
         if spec.header_row > 1:
             target.Range(
                 target.Cells(1, 1),
@@ -151,7 +149,9 @@ def _apply_clone_with_com(
             target.Cells(spec.data_row, spec.columns["code"]).Value2 = code
         if spec.columns.get("name"):
             target.Cells(spec.data_row, spec.columns["name"]).Value2 = product_name
-        date_base = dt.date(1904, 1, 1) if bool(book.Date1904) else dt.date(1899, 12, 30)
+        date_base = (
+            dt.date(1904, 1, 1) if bool(book.Date1904) else dt.date(1899, 12, 30)
+        )
         target.Cells(spec.data_row, spec.columns["date"]).Value2 = (
             first_date - date_base
         ).days
@@ -254,16 +254,13 @@ def verify_clone(
         source = before[spec.source_sheet]
         target = after[spec.target_sheet]
         for column in range(1, spec.max_column + 1):
-            if target.cell(spec.header_row, column).value != source.cell(
-                spec.header_row, column
-            ).value:
+            if (
+                target.cell(spec.header_row, column).value
+                != source.cell(spec.header_row, column).value
+            ):
                 raise ProductWorkbookError("复制结果没有保留参考 Sheet 的表头")
-            target_header_style = _style_signature(
-                target.cell(spec.header_row, column)
-            )
-            source_header_style = _style_signature(
-                source.cell(spec.header_row, column)
-            )
+            target_header_style = _style_signature(target.cell(spec.header_row, column))
+            source_header_style = _style_signature(source.cell(spec.header_row, column))
             if target_header_style != source_header_style:
                 raise ProductWorkbookError(
                     "复制结果没有保留参考 Sheet 的表头样式："
@@ -280,24 +277,23 @@ def verify_clone(
             raise ProductWorkbookError("复制结果残留了参考产品说明")
         allowed = {
             spec.columns["date"],
-            *(
-                [spec.columns["code"]]
-                if code and spec.columns.get("code")
-                else []
-            ),
+            *([spec.columns["code"]] if code and spec.columns.get("code") else []),
             *([spec.columns["name"]] if spec.columns.get("name") else []),
         }
         for column in range(1, spec.max_column + 1):
             value = target.cell(spec.data_row, column).value
             if column not in allowed and value not in {None, ""}:
                 raise ProductWorkbookError("复制结果残留了参考产品历史数据或公式")
-        if code and spec.columns.get("code") and str(
-            target.cell(spec.data_row, spec.columns["code"]).value
-        ) != str(code):
+        if (
+            code
+            and spec.columns.get("code")
+            and str(target.cell(spec.data_row, spec.columns["code"]).value) != str(code)
+        ):
             raise ProductWorkbookError("复制结果的产品代码不正确")
-        if spec.columns.get("name") and target.cell(
-            spec.data_row, spec.columns["name"]
-        ).value != product_name:
+        if (
+            spec.columns.get("name")
+            and target.cell(spec.data_row, spec.columns["name"]).value != product_name
+        ):
             raise ProductWorkbookError("复制结果的产品名称不正确")
         date_value = target.cell(spec.data_row, spec.columns["date"]).value
         if isinstance(date_value, dt.datetime):
