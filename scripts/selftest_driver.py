@@ -9,12 +9,13 @@ import json
 import shutil
 import subprocess
 import sys
+from copy import deepcopy
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
 import openpyxl
-from openpyxl.styles import Font
+from openpyxl.styles import Border, Font, PatternFill, Side
 from openpyxl.worksheet.formula import ArrayFormula
 
 
@@ -2041,27 +2042,452 @@ def template_tests(runtime: Path, use_com: bool) -> str | None:
     return application
 
 
+def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
+    from nav_automation import approve, status as approval_status
+    from nav_config import load_config, validate_config
+    from nav_parse import NavRow
+    from nav_product_workbook import prepare_clone_spec
+    from nav_products import add, adopt, clone, pause, resume, status, sync
+    from nav_template import init_template
+    from nav_workbook import validate_history
+
+    target = runtime / "产品生命周期模板.xlsx"
+    config_path = runtime / "product-lifecycle-config.json"
+    initial_route = {
+        "sender": "initial@example.invalid",
+        "subject_contains": "BASE001",
+        "sheet": "初始产品",
+        "sheet_mode": "template",
+        "code": "BASE001",
+        "product_name": "初始示例产品",
+        "parser": "auto",
+        "paused": False,
+        "allow_sender_only": False,
+        "cumulative_policy": "require",
+        "return_basis": "cumulative",
+        "return_frequency": "weekly",
+        "data_frequency": "weekly",
+        "max_staleness_days": 14,
+        "benchmark": {
+            "source_sheet": "指数数据",
+            "source_type": "level",
+            "source_date": "A",
+            "source_value": "B",
+            "display_name": "示例指数",
+        },
+    }
+    config = {
+        "schema_version": 1,
+        "runtime_id": "00000000-0000-4000-8000-000000000171",
+        "workbook_path": str(target.resolve()),
+        "workbook_mode": "bundled-template",
+        "imap": {
+            "host": "imap.example.invalid",
+            "port": 993,
+            "user": "user@example.invalid",
+            "mailbox": "INBOX",
+            "lookback_days": 180,
+        },
+        "routes": [initial_route],
+        "column_overrides": {},
+        "style": {"mode": "cn-red-up-green-down", "zero_threshold": 0.00005},
+        "schedule": [{"days": ["MON", "WED", "FRI"], "time": "09:00"}],
+        "validation": {"minimum_history_dates": 2, "tolerance": 0.000001},
+    }
+    validate_config(config)
+    init_template(config)
+    config_path.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    proposal = {
+        "passed": True,
+        "scan": {},
+        "candidates": [
+            {
+                "sender": "new@example.invalid",
+                "message_count": 3,
+                "recent_message_times": [],
+                "subject_examples": ["NEW002 周净值"],
+                "detected_codes": ["NEW002"],
+                "first_date": "2026-01-02",
+                "latest_date": "2026-01-16",
+                "observations": [
+                    {
+                        "date": "2026-01-02",
+                        "code": "NEW002",
+                        "unit": 1.01,
+                        "cumulative": 1.01,
+                        "source": "body",
+                    },
+                    {
+                        "date": "2026-01-09",
+                        "code": "NEW002",
+                        "unit": 1.02,
+                        "cumulative": 1.02,
+                        "source": "body",
+                    },
+                ],
+            }
+        ],
+        "warnings": [],
+        "errors": [],
+    }
+    (runtime / "route-proposals.json").write_text(
+        json.dumps(proposal, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    before = sync(config, refresh=False)
+    check(
+        before["passed"]
+        and len(before["new_candidates"]) == 1
+        and before["new_candidates"][0]["code"] == "NEW002",
+        "products sync did not identify the new candidate",
+    )
+    result = add(
+        config,
+        config_path,
+        proposal_index=1,
+        sheet="新增产品",
+        frequency="weekly",
+        product_name="新增示例产品",
+        benchmark_source_sheet="新增指数数据",
+        benchmark_display_name="新增示例指数",
+    )
+    check(
+        result["changed"]
+        and result["requires_preview_approval"]
+        and result["template"]["product_sheet"] == "新增产品"
+        and Path(result["template"]["backup"]).is_file(),
+        "products add did not create a backed-up template page",
+    )
+    updated = load_config(config_path)
+    workbook = openpyxl.load_workbook(target, data_only=False)
+    try:
+        check(
+            workbook.sheetnames == ["初始产品", "新增产品", "指数数据", "新增指数数据"]
+            and workbook["新增产品"]["F3"].fill.fgColor.rgb.endswith("FFF2CC")
+            and workbook["新增产品"]["G2"].value == "新增示例指数"
+            and workbook["新增指数数据"]["B1"].value == "新增示例指数点位"
+            and sum(
+                len(item.rules) for item in workbook["新增产品"].conditional_formatting
+            )
+            >= 2,
+            "new template product page has wrong order or style",
+        )
+    finally:
+        workbook.close()
+    check(
+        len(updated["routes"]) == 2
+        and not approval_status(updated)["approved"]
+        and not sync(updated, refresh=False)["new_candidates"],
+        "new product route or approval state is wrong",
+    )
+
+    approve(updated)
+    paused_result = pause(
+        updated, config_path, sheet="新增产品", reason="示例产品暂时停更"
+    )
+    paused = load_config(config_path)
+    check(
+        paused_result["approval_preserved"]
+        and approval_status(paused)["approved"]
+        and paused["routes"][1]["paused"]
+        and target.is_file(),
+        "pausing one product did not preserve history and narrowed approval",
+    )
+    resumed_result = resume(paused, config_path, sheet="新增产品")
+    resumed = load_config(config_path)
+    check(
+        resumed_result["requires_preview_approval"]
+        and not approval_status(resumed)["approved"]
+        and not resumed["routes"][1]["paused"],
+        "resuming a product did not require renewed preview approval",
+    )
+    report = status(resumed)
+    check(
+        report["active"] == 2
+        and report["paused"] == 0
+        and not report["workbook_missing_sheets"],
+        "products status returned the wrong lifecycle state",
+    )
+    cli_status = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            "navctl.py",
+            "--config",
+            str(config_path),
+            "products",
+            "status",
+        ],
+        cwd=runtime,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    check(
+        cli_status.returncode == 0 and json.loads(cli_status.stdout)["active"] == 2,
+        "navctl products status CLI is not wired correctly",
+    )
+
+    workbook_before = target.read_bytes()
+    config_before = config_path.read_bytes()
+    try:
+        add(
+            resumed,
+            config_path,
+            proposal_index=1,
+            sheet="新增产品",
+            frequency="weekly",
+        )
+    except (RuntimeError, ValueError):
+        pass
+    else:
+        raise AssertionError("products add accepted a duplicate managed worksheet")
+    check(
+        target.read_bytes() == workbook_before
+        and config_path.read_bytes() == config_before,
+        "duplicate product rejection changed the workbook or configuration",
+    )
+
+    existing_target = runtime / "产品生命周期已有表.xlsx"
+    existing_book = openpyxl.Workbook()
+    source_sheet = existing_book.active
+    source_sheet.title = "参考产品"
+    source_sheet.append(["参考产品费率说明", None, None, None, None, None])
+    source_sheet.append(
+        ["产品代码", "产品名称", "单位净值", "累计单位净值", "净值日期", "收益（周度）"]
+    )
+    source_sheet.append(
+        ["BASE001", "参考示例产品", 1.0, 1.0, dt.date(2025, 12, 26), "/"]
+    )
+    source_sheet.append(
+        ["BASE001", "参考示例产品", 1.01, 1.01, dt.date(2026, 1, 2), "=D4/D3-1"]
+    )
+    source_sheet.append(["累计", None, None, None, None, "=D4/D3-1"])
+    thin = Side(style="thin", color="000000")
+    for row in range(1, 6):
+        for column in range(1, 7):
+            cell = source_sheet.cell(row, column)
+            cell.font = Font(name="等线", size=10, bold=row == 2)
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            if row == 2:
+                cell.fill = PatternFill("solid", fgColor="9BC2E6")
+            if column == 6 and row >= 3:
+                cell.fill = PatternFill("solid", fgColor="FFF2CC")
+                cell.number_format = "0.00%"
+    source_sheet.column_dimensions["B"].width = 28
+    prepared = existing_book.create_sheet("用户新建页")
+    prepared.append(["用户自行填写的产品说明", None, None, None, None, None])
+    prepared.append(
+        ["产品代码", "产品名称", "单位净值", "累计单位净值", "净值日期", "收益（周度）"]
+    )
+    prepared.append(
+        ["NEW002", "新增示例产品", 1.01, None, dt.date(2026, 1, 2), None]
+    )
+    prepared.append(["累计", None, None, None, None, None])
+    existing_book.create_sheet("分析页")["A1"] = "用户分析"
+    existing_book.save(existing_target)
+    existing_book.close()
+    existing_config_path = runtime / "existing-product-config.json"
+    existing_config = deepcopy(config)
+    existing_config["runtime_id"] = "00000000-0000-4000-8000-000000000172"
+    existing_config["workbook_path"] = str(existing_target.resolve())
+    existing_config["workbook_mode"] = "existing"
+    existing_config["style"] = {"mode": "infer", "zero_threshold": 0.00005}
+    existing_config["routes"] = [
+        {
+            **initial_route,
+            "sheet": "参考产品",
+            "sheet_mode": "summary",
+            "data_frequency": "auto",
+            "benchmark": None,
+        }
+    ]
+    validate_config(existing_config)
+    existing_config_path.write_text(
+        json.dumps(existing_config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    adopt_proposal = deepcopy(proposal)
+    adopt_proposal["candidates"][0]["detected_codes"] = ["NEW002", "OTHER999"]
+    adopt_proposal["candidates"][0]["observations"].append(
+        {
+            "date": "2026-01-02",
+            "code": "OTHER999",
+            "unit": 2.01,
+            "cumulative": 2.01,
+            "source": "body",
+        }
+    )
+    (runtime / "route-proposals.json").write_text(
+        json.dumps(adopt_proposal, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    existing_before = existing_target.read_bytes()
+    existing_result = adopt(
+        existing_config,
+        existing_config_path,
+        proposal_index=1,
+        sheet="用户新建页",
+    )
+    existing_updated = load_config(existing_config_path)
+    existing_status = status(existing_updated)
+    check(
+        existing_result["changed"]
+        and existing_result["action"] == "adopted-existing-sheet",
+        "products adopt did not report a successful adoption",
+    )
+    check(
+        existing_result["inference"]["sheet_mode"] == "summary"
+        and existing_result["inference"]["frequency"] == "weekly",
+        f"products adopt inferred the wrong layout: {existing_result['inference']}",
+    )
+    check(
+        existing_result["inference"]["code"] == "NEW002",
+        "products adopt did not use the worksheet to resolve a multi-code sender",
+    )
+    check(
+        existing_target.read_bytes() == existing_before,
+        "products adopt changed the user workbook",
+    )
+    check(
+        len(existing_updated["routes"]) == 2
+        and existing_status["unmanaged_workbook_sheets"] == ["分析页"],
+        f"products adopt saved the wrong route status: {existing_status}",
+    )
+    adopted_validation = validate_history(
+        existing_updated,
+        {
+            "参考产品": [
+                NavRow(
+                    dt.date(2025, 12, 26), 1.0, 1.0, "BASE001", "fixture"
+                ),
+                NavRow(dt.date(2026, 1, 2), 1.01, 1.01, "BASE001", "fixture"),
+            ],
+            "用户新建页": [
+                NavRow(dt.date(2026, 1, 2), 1.01, 1.01, "NEW002", "fixture"),
+                NavRow(dt.date(2026, 1, 9), 1.02, 1.02, "NEW002", "fixture"),
+            ],
+        },
+    )
+    adopted_report = next(
+        item
+        for item in adopted_validation["routes"]
+        if item["sheet"] == "用户新建页"
+    )
+    check(
+        adopted_validation["passed"]
+        and adopted_report["cold_start_kind"] == "summary-reserved-row",
+        f"partial user-prepared onboarding row was not accepted safely: {adopted_validation}",
+    )
+    spec = prepare_clone_spec(
+        existing_updated, existing_updated["routes"][0], "照参考新增"
+    )
+    check(
+        spec.header_row == 2
+        and spec.data_row == 3
+        and spec.target_summary_row == 4,
+        "clone specification did not preserve the reference sheet structure",
+    )
+
+    application = None
+    if use_com:
+        clone_proposal = deepcopy(proposal)
+        clone_proposal["candidates"][0] = {
+            "sender": "clone@example.invalid",
+            "message_count": 2,
+            "recent_message_times": [],
+            "subject_examples": ["CLONE003 周净值"],
+            "detected_codes": ["CLONE003"],
+            "first_date": "2026-02-06",
+            "latest_date": "2026-02-13",
+            "observations": [
+                {
+                    "date": "2026-02-06",
+                    "code": "CLONE003",
+                    "unit": 1.1,
+                    "cumulative": 1.1,
+                    "source": "body",
+                },
+                {
+                    "date": "2026-02-13",
+                    "code": "CLONE003",
+                    "unit": 1.2,
+                    "cumulative": 1.2,
+                    "source": "body",
+                },
+            ],
+        }
+        (runtime / "route-proposals.json").write_text(
+            json.dumps(clone_proposal, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        clone_result = clone(
+            existing_updated,
+            existing_config_path,
+            proposal_index=1,
+            sheet="照参考新增",
+            copy_from="参考产品",
+            product_name="复制新增示例产品",
+        )
+        application = clone_result["workbook"]["application"]
+        cloned = openpyxl.load_workbook(existing_target, data_only=False)
+        try:
+            check(
+                cloned.sheetnames
+                == ["参考产品", "照参考新增", "用户新建页", "分析页"]
+                and cloned["照参考新增"]["A1"].value is None
+                and cloned["照参考新增"]["A2"].value == "产品代码"
+                and cloned["照参考新增"]["A3"].value == "CLONE003"
+                and cloned["照参考新增"]["B3"].value == "复制新增示例产品"
+                and cloned["照参考新增"]["C3"].value is None
+                and cloned["照参考新增"]["D3"].value is None
+                and cloned["照参考新增"]["E3"].value.date()
+                == dt.date(2026, 2, 6)
+                and cloned["照参考新增"]["F3"].value is None
+                and cloned["照参考新增"]["A4"].value == "累计"
+                and cloned["照参考新增"]["F4"].value is None
+                and cloned["参考产品"]["A1"].value == "参考产品费率说明",
+                "products clone did not preserve the format or clear source business data",
+            )
+        finally:
+            cloned.close()
+        cloned_config = load_config(existing_config_path)
+        check(
+            len(cloned_config["routes"]) == 3
+            and cloned_config["routes"][-1]["sheet"] == "照参考新增"
+            and Path(clone_result["workbook"]["backup"]).is_file(),
+            "products clone did not save its route or backup",
+        )
+    return application
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime", required=True)
     parser.add_argument("--com", action="store_true")
     args = parser.parse_args()
     runtime = Path(args.runtime).resolve()
-    print("[1/5] 检查自动解析、本地解析器、精确发件人和冲突拦截")
+    print("[1/6] 检查自动解析、本地解析器、精确发件人和冲突拦截")
     parser_tests(runtime)
     print("      PASS")
-    print("[2/5] 检查空路由、暂停路由和无邮件失败关闭")
+    print("[2/6] 检查空路由、暂停路由和无邮件失败关闭")
     route_state_tests(runtime)
     print("      PASS")
-    print("[3/5] 检查崩溃恢复和并发运行锁")
+    print("[3/6] 检查崩溃恢复和并发运行锁")
     lock_tests(runtime)
     print("      PASS")
-    print("[4/5] 检查严格表、空表冷启动、分析页保留、补录、基准和幂等性")
+    print("[4/6] 检查严格表、空表冷启动、分析页保留、补录、基准和幂等性")
     application = workbook_tests(runtime, args.com)
     print("      PASS")
-    print("[5/5] 检查四类脱敏模板、共享指数、冷启动、增量和拒绝覆盖")
+    print("[5/6] 检查四类脱敏模板、共享指数、冷启动、增量和拒绝覆盖")
     template_application = template_tests(runtime, args.com)
     application = template_application or application
+    print("      PASS")
+    print("[6/6] 检查产品发现、接管已建 Sheet、照参考新建、暂停、恢复和备份")
+    product_application = product_lifecycle_tests(runtime, args.com)
+    application = product_application or application
     print("      PASS")
     if args.com:
         print(f"      Excel/WPS COM、文件占用提示及缓存数值：PASS（{application}）")

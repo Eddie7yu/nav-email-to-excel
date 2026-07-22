@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import datetime as dt
 import os
 import re
+import shutil
 import uuid
 from copy import copy
 from pathlib import Path
@@ -13,7 +15,7 @@ from openpyxl.styles import Font
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.workbook.properties import CalcProperties
 
-from nav_config import STATE_ROOT, active_routes
+from nav_config import ROOT, STATE_ROOT, active_routes
 
 
 ASSET_NAME = "nav-standard-cn.xlsx"
@@ -71,6 +73,71 @@ def _add_return_rules(sheet, columns: list[int], threshold: float) -> None:
                 font=Font(color="FF00B050"),
             ),
         )
+
+
+def _copy_template_sheet(source, workbook, title: str, index: int | None = None):
+    sheet = workbook.create_sheet(title=title, index=index)
+    for row in source.iter_rows():
+        for source_cell in row:
+            target = sheet.cell(source_cell.row, source_cell.column)
+            target.value = source_cell.value
+            if source_cell.has_style:
+                target._style = copy(source_cell._style)
+            target.number_format = source_cell.number_format
+            target.alignment = copy(source_cell.alignment)
+            target.protection = copy(source_cell.protection)
+    for merged in source.merged_cells.ranges:
+        sheet.merge_cells(str(merged))
+    for key, dimension in source.column_dimensions.items():
+        target = sheet.column_dimensions[key]
+        target.width = dimension.width
+        target.hidden = dimension.hidden
+        target.bestFit = dimension.bestFit
+        target.outlineLevel = dimension.outlineLevel
+    for key, dimension in source.row_dimensions.items():
+        target = sheet.row_dimensions[key]
+        target.height = dimension.height
+        target.hidden = dimension.hidden
+        target.outlineLevel = dimension.outlineLevel
+    sheet.freeze_panes = source.freeze_panes
+    sheet.sheet_format = copy(source.sheet_format)
+    sheet.sheet_properties = copy(source.sheet_properties)
+    sheet.page_margins = copy(source.page_margins)
+    sheet.page_setup = copy(source.page_setup)
+    sheet.print_options = copy(source.print_options)
+    sheet.sheet_view.showGridLines = source.sheet_view.showGridLines
+    sheet.auto_filter.ref = source.auto_filter.ref
+    return sheet
+
+
+def _configure_product_sheet(sheet, route: dict[str, Any], threshold: float) -> None:
+    frequency = str(route["data_frequency"])
+    has_benchmark = bool(route.get("benchmark"))
+    sheet["A1"] = None
+    display = str(
+        (route.get("benchmark") or {}).get("display_name") or "基准指数"
+    ).strip()
+    if frequency == "weekly" and has_benchmark:
+        sheet["G2"] = display
+        sheet["H2"] = "指数收益(周度)"
+    elif frequency == "daily" and has_benchmark:
+        sheet["H2"] = (
+            f"{display}收益(日度)" if display != "基准指数" else "指数收益(日度)"
+        )
+    _add_return_rules(sheet, _return_columns(frequency, has_benchmark), threshold)
+
+
+def _sanitize_metadata(workbook) -> None:
+    workbook.properties.creator = ""
+    workbook.properties.lastModifiedBy = ""
+    workbook.properties.title = ""
+    workbook.properties.subject = ""
+    workbook.properties.description = ""
+    if workbook.calculation is None:
+        workbook.calculation = CalcProperties()
+    workbook.calculation.fullCalcOnLoad = True
+    workbook.calculation.forceFullCalc = True
+    workbook.calculation.calcMode = "auto"
 
 
 def _set_index_headers(sheet, benchmark: dict[str, Any]) -> None:
@@ -204,22 +271,7 @@ def init_template(config: dict[str, Any]) -> dict[str, Any]:
             source_title = TEMPLATE_SHEETS[(frequency, has_benchmark)]
             sheet = workbook.copy_worksheet(workbook[source_title])
             sheet.title = str(route["sheet"])
-            sheet["A1"] = None
-            display = str(
-                (route.get("benchmark") or {}).get("display_name") or "基准指数"
-            ).strip()
-            if frequency == "weekly" and has_benchmark:
-                sheet["G2"] = display
-                sheet["H2"] = "指数收益(周度)"
-            elif frequency == "daily" and has_benchmark:
-                sheet["H2"] = (
-                    f"{display}收益(日度)"
-                    if display != "基准指数"
-                    else "指数收益(日度)"
-                )
-            _add_return_rules(
-                sheet, _return_columns(frequency, has_benchmark), threshold
-            )
+            _configure_product_sheet(sheet, route, threshold)
             created_products.append(sheet.title)
         for source_name, benchmark in sources.items():
             sheet = workbook.copy_worksheet(workbook[INDEX_TEMPLATE])
@@ -228,16 +280,7 @@ def init_template(config: dict[str, Any]) -> dict[str, Any]:
             created_sources.append(sheet.title)
         for title in list(TEMPLATE_SHEETS.values()) + [INDEX_TEMPLATE]:
             del workbook[title]
-        workbook.properties.creator = ""
-        workbook.properties.lastModifiedBy = ""
-        workbook.properties.title = ""
-        workbook.properties.subject = ""
-        workbook.properties.description = ""
-        if workbook.calculation is None:
-            workbook.calculation = CalcProperties()
-        workbook.calculation.fullCalcOnLoad = True
-        workbook.calculation.forceFullCalc = True
-        workbook.calculation.calcMode = "auto"
+        _sanitize_metadata(workbook)
         workbook.save(temporary)
         try:
             os.link(temporary, target)
@@ -263,4 +306,108 @@ def init_template(config: dict[str, Any]) -> dict[str, Any]:
         "benchmark_source_sheets": created_sources,
         "style_mode": "cn-red-up-green-down",
         "overwrote_existing": False,
+    }
+
+
+def add_template_product(
+    config: dict[str, Any], route: dict[str, Any]
+) -> dict[str, Any]:
+    if str(config.get("workbook_mode", "existing")) != "bundled-template":
+        raise TemplateError(
+            "Only a workbook created from the bundled template can add a template product page"
+        )
+    target = Path(config["workbook_path"]).expanduser().resolve()
+    if not target.is_file() or target.suffix.lower() != ".xlsx":
+        raise TemplateError("The initialized bundled-template workbook is missing")
+    title = str(route.get("sheet") or "").strip()
+    frequency = str(route.get("data_frequency", "auto"))
+    if not _valid_sheet_name(title):
+        raise TemplateError(
+            "Product sheet name must be 1-31 characters and contain no \\ / * ? : [ ]"
+        )
+    if str(route.get("sheet_mode", "")) != "template":
+        raise TemplateError("A bundled-template product must use sheet_mode: template")
+    if frequency not in {"daily", "weekly"}:
+        raise TemplateError("A bundled-template product must be daily or weekly")
+
+    routes = active_routes(config)
+    sources = _source_definitions(routes)
+    asset_path = STATE_ROOT / "assets" / ASSET_NAME
+    if not asset_path.is_file():
+        raise TemplateError(f"Bundled workbook template is missing: {asset_path}")
+
+    workbook = openpyxl.load_workbook(target, data_only=False, read_only=False)
+    asset = openpyxl.load_workbook(asset_path, data_only=False, read_only=False)
+    temporary = (
+        target.parent
+        / f".{target.stem}.product-{uuid.uuid4().hex[:8]}.tmp{target.suffix.lower()}"
+    )
+    backup_directory = ROOT / "backups"
+    backup_directory.mkdir(parents=True, exist_ok=True)
+    backup = backup_directory / (
+        f"before-product-add-{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+        f"{target.suffix.lower()}"
+    )
+    created_sources: list[str] = []
+    try:
+        if title in workbook.sheetnames:
+            raise TemplateError(f"Workbook already contains sheet: {title}")
+        conflicting_sources = set(sources) & {title}
+        if conflicting_sources:
+            raise TemplateError(
+                "Product sheet and benchmark source sheet names conflict"
+            )
+        for source_name in sources:
+            if not _valid_sheet_name(source_name):
+                raise TemplateError(
+                    f"Invalid benchmark source sheet name: {source_name}"
+                )
+
+        source_positions = [
+            workbook.sheetnames.index(name)
+            for name in sources
+            if name in workbook.sheetnames
+        ]
+        insert_at = (
+            min(source_positions) if source_positions else len(workbook.sheetnames)
+        )
+        source_title = TEMPLATE_SHEETS[(frequency, bool(route.get("benchmark")))]
+        sheet = _copy_template_sheet(asset[source_title], workbook, title, insert_at)
+        threshold = float((config.get("style") or {}).get("zero_threshold", 0.00005))
+        _configure_product_sheet(sheet, route, threshold)
+
+        for source_name, definition in sources.items():
+            if source_name in workbook.sheetnames:
+                continue
+            source = _copy_template_sheet(
+                asset[INDEX_TEMPLATE], workbook, source_name, len(workbook.sheetnames)
+            )
+            _set_index_headers(source, definition)
+            created_sources.append(source_name)
+
+        _sanitize_metadata(workbook)
+        shutil.copy2(target, backup)
+        workbook.save(temporary)
+        check = openpyxl.load_workbook(temporary, read_only=True, data_only=False)
+        try:
+            if title not in check.sheetnames:
+                raise TemplateError("Saved workbook is missing the new product sheet")
+        finally:
+            check.close()
+        os.replace(temporary, target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        if backup.is_file() and not target.is_file():
+            shutil.copy2(backup, target)
+        raise
+    finally:
+        asset.close()
+        workbook.close()
+    return {
+        "created": True,
+        "workbook_path": str(target),
+        "product_sheet": title,
+        "benchmark_source_sheets_created": created_sources,
+        "backup": str(backup),
+        "overwrote_existing_sheet": False,
     }

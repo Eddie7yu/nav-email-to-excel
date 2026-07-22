@@ -35,6 +35,8 @@ APP_FILES = (
     "nav_demo_worker.py",
     "nav_mail.py",
     "nav_parse.py",
+    "nav_product_workbook.py",
+    "nav_products.py",
     "nav_schedule.py",
     "nav_service.py",
     "nav_template.py",
