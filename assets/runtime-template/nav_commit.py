@@ -471,7 +471,10 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
         ):
             raise CommitError("The no-change baseline plan metadata is invalid")
         review = Path(str(plan.get("review_path") or "")).resolve()
-        if review.parent != (ROOT / "previews").resolve() or review.suffix.lower() != ".txt":
+        if (
+            review.parent != (ROOT / "previews").resolve()
+            or review.suffix.lower() != ".txt"
+        ):
             raise CommitError(
                 "The no-change review path is outside the runtime preview directory"
             )

@@ -1489,9 +1489,7 @@ def build_preview(
         "master_sha256": file_sha256(master),
         "preview_path": str(preview.resolve()) if plan_sheets else None,
         "preview_sha256": file_sha256(preview) if plan_sheets else None,
-        "approval_kind": (
-            "workbook-preview" if plan_sheets else "validated-no-change"
-        ),
+        "approval_kind": ("workbook-preview" if plan_sheets else "validated-no-change"),
         "review_path": None,
         "review_sha256": None,
         "warnings": list(warnings or []),
