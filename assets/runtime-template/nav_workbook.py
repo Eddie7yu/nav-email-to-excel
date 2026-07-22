@@ -33,8 +33,8 @@ HEADER_WORDS = {
     "unit": ("单位净值", "份额净值", "unit nav"),
     "cumulative": ("累计单位净值", "累计净值", "cumulative nav"),
     "return": ("产品收益", "基金收益", "return"),
-    "daily_return": ("日收益", "日度收益", "daily return"),
-    "weekly_return": ("周收益", "周度收益", "weekly return"),
+    "daily_return": ("日收益", "日度收益", "收益（日度）", "daily return"),
+    "weekly_return": ("周收益", "周度收益", "收益（周度）", "weekly return"),
     "benchmark_level": ("指数点位", "基准点位", "benchmark level", "index level"),
     "benchmark_return": ("指数收益", "基准收益", "benchmark return", "index return"),
     "excess": ("超额", "excess", "alpha"),
@@ -408,9 +408,11 @@ def _summary_reserved_row(
 ) -> tuple[dt.date, int] | None:
     """Identify a strictly bounded summary-mode cold-start placeholder.
 
-    A real data row is never treated as a placeholder.  The only accepted shape is
-    one dated row immediately above the summary row, with a matching configured
-    identity and no content other than that identity and the date.
+    A complete real data row is never treated as a placeholder. The accepted shape
+    is one dated row immediately above the summary row, with a matching configured
+    identity, no return/formula content, and at least one missing NAV field. A user
+    may prefill the unit or cumulative NAV; validation must prove that partial value
+    against the email for the same date before the row can be replaced.
     """
 
     if layout.mode != "summary" or len(existing) != 1:
@@ -440,7 +442,19 @@ def _summary_reserved_row(
     if not identity_columns:
         return None
 
-    allowed_columns = {layout.columns["date"], *identity_columns}
+    nav_columns = {
+        column
+        for column in (
+            layout.columns.get("unit"),
+            layout.columns.get("cumulative"),
+        )
+        if column
+    }
+    if nav_columns and all(
+        sheet.cell(row, column).value not in {None, ""} for column in nav_columns
+    ):
+        return None
+    allowed_columns = {layout.columns["date"], *identity_columns, *nav_columns}
     for column in range(1, sheet.max_column + 1):
         value = sheet.cell(row, column).value
         if column not in allowed_columns and value is not None and value != "":
@@ -610,6 +624,34 @@ def validate_history(
             reserved = _summary_reserved_row(
                 workbook[sheet_name], layout, route, existing
             )
+            if reserved:
+                reserved_date = reserved[0]
+                observed = existing[reserved_date]
+                matching = [
+                    candidate
+                    for candidate in candidates
+                    if candidate.date == reserved_date
+                ]
+                if observed.get("unit") is not None:
+                    if not matching or all(
+                        abs(float(observed["unit"]) - candidate.unit) > tolerance
+                        for candidate in matching
+                    ):
+                        errors.append(
+                            f"{sheet_name}: partial onboarding unit NAV cannot be verified on {reserved_date.isoformat()}"
+                        )
+                if observed.get("cumulative") is not None:
+                    if not matching or all(
+                        abs(
+                            float(observed["cumulative"])
+                            - effective_cumulative(candidate, route)
+                        )
+                        > tolerance
+                        for candidate in matching
+                    ):
+                        errors.append(
+                            f"{sheet_name}: partial onboarding cumulative NAV cannot be verified on {reserved_date.isoformat()}"
+                        )
             selected_candidates, data_frequency, frequency_source = _select_data_rows(
                 workbook[sheet_name],
                 layout,

@@ -21,6 +21,13 @@ from nav_demo import commit as commit_demo
 from nav_demo import list_runs as list_demo_runs
 from nav_demo import prepare as prepare_demo
 from nav_demo import remove as remove_demo
+from nav_products import add as add_product
+from nav_products import adopt as adopt_product
+from nav_products import clone as clone_product
+from nav_products import pause as pause_product
+from nav_products import resume as resume_product
+from nav_products import status as product_status
+from nav_products import sync as sync_products
 from nav_schedule import install as install_schedule
 from nav_schedule import record_scheduled_run
 from nav_schedule import remove as remove_schedule
@@ -297,6 +304,71 @@ def command_workbook(config: dict[str, Any], args: argparse.Namespace) -> int:
     raise RuntimeError(f"Unsupported workbook action: {args.workbook_action}")
 
 
+def command_products(config: dict[str, Any], args: argparse.Namespace) -> int:
+    config_path = Path(args.config).expanduser().resolve()
+    if args.products_action == "status":
+        emit(product_status(config))
+        return 0
+    with run_lock():
+        if args.products_action == "sync":
+            result = sync_products(config, refresh=not args.use_existing_proposals)
+        elif args.products_action == "add":
+            result = add_product(
+                config,
+                config_path,
+                proposal_index=args.proposal_index,
+                sheet=args.sheet,
+                frequency=args.frequency,
+                code=args.code,
+                product_name=args.product_name,
+                subject_contains=args.subject_contains,
+                sheet_mode=args.sheet_mode,
+                parser=args.parser,
+                cumulative_policy=args.cumulative_policy,
+                cumulative_offset=args.cumulative_offset,
+                return_basis=args.return_basis,
+                series_start=args.series_start,
+                max_staleness_days=args.max_staleness_days,
+                benchmark_source_sheet=args.benchmark_source_sheet,
+                benchmark_source_type=args.benchmark_source_type,
+                benchmark_source_date=args.benchmark_source_date,
+                benchmark_source_value=args.benchmark_source_value,
+                benchmark_display_name=args.benchmark_display_name,
+            )
+        elif args.products_action == "adopt":
+            result = adopt_product(
+                config,
+                config_path,
+                proposal_index=args.proposal_index,
+                sheet=args.sheet,
+                code=args.code,
+                product_name=args.product_name,
+                subject_contains=args.subject_contains,
+            )
+        elif args.products_action == "clone":
+            result = clone_product(
+                config,
+                config_path,
+                proposal_index=args.proposal_index,
+                sheet=args.sheet,
+                copy_from=args.copy_from,
+                code=args.code,
+                product_name=args.product_name,
+                subject_contains=args.subject_contains,
+                inherit_benchmark=args.inherit_benchmark,
+            )
+        elif args.products_action == "pause":
+            result = pause_product(
+                config, config_path, sheet=args.sheet, reason=args.reason
+            )
+        elif args.products_action == "resume":
+            result = resume_product(config, config_path, sheet=args.sheet)
+        else:
+            raise RuntimeError(f"Unsupported products action: {args.products_action}")
+    emit(result)
+    return 0 if result.get("passed", True) else 2
+
+
 def command_demo(args: argparse.Namespace) -> int:
     if args.demo_action == "prepare":
         emit(prepare_demo())
@@ -335,6 +407,67 @@ def parser() -> argparse.ArgumentParser:
     automation.add_argument("automation_action", choices=("status", "revoke"))
     workbook = commands.add_parser("workbook")
     workbook.add_argument("workbook_action", choices=("init-template",))
+    products = commands.add_parser("products")
+    product_actions = products.add_subparsers(dest="products_action", required=True)
+    product_actions.add_parser("status", help="查看当前活动、暂停及工作表状态")
+    product_sync = product_actions.add_parser(
+        "sync", help="扫描邮箱并比较新增候选与当前产品"
+    )
+    product_sync.add_argument("--use-existing-proposals", action="store_true")
+    product_add = product_actions.add_parser(
+        "add", help="从 products sync 的候选新增受管产品"
+    )
+    product_add.add_argument("--proposal-index", type=int, required=True)
+    product_add.add_argument("--sheet", required=True)
+    product_add.add_argument("--frequency", choices=("daily", "weekly"), required=True)
+    product_add.add_argument("--code")
+    product_add.add_argument("--product-name")
+    product_add.add_argument("--subject-contains")
+    product_add.add_argument("--sheet-mode", choices=("summary", "append"))
+    product_add.add_argument("--parser", default="auto")
+    product_add.add_argument(
+        "--cumulative-policy", choices=("require", "unit", "offset"), default="require"
+    )
+    product_add.add_argument("--cumulative-offset", type=float)
+    product_add.add_argument(
+        "--return-basis", choices=("unit", "cumulative"), default="cumulative"
+    )
+    product_add.add_argument("--series-start")
+    product_add.add_argument("--max-staleness-days", type=int, default=14)
+    product_add.add_argument("--benchmark-source-sheet")
+    product_add.add_argument(
+        "--benchmark-source-type",
+        choices=("level", "aligned_return"),
+        default="level",
+    )
+    product_add.add_argument("--benchmark-source-date", default="A")
+    product_add.add_argument("--benchmark-source-value", default="B")
+    product_add.add_argument("--benchmark-display-name")
+    product_adopt = product_actions.add_parser(
+        "adopt", help="接管用户已经建好的产品 Sheet"
+    )
+    product_adopt.add_argument("--proposal-index", type=int, required=True)
+    product_adopt.add_argument("--sheet", required=True)
+    product_adopt.add_argument("--code")
+    product_adopt.add_argument("--product-name")
+    product_adopt.add_argument("--subject-contains")
+    product_clone = product_actions.add_parser(
+        "clone", help="照现有受管 Sheet 的格式新建并接管产品"
+    )
+    product_clone.add_argument("--proposal-index", type=int, required=True)
+    product_clone.add_argument("--sheet", required=True)
+    product_clone.add_argument("--copy-from", required=True)
+    product_clone.add_argument("--code")
+    product_clone.add_argument("--product-name")
+    product_clone.add_argument("--subject-contains")
+    product_clone.add_argument("--inherit-benchmark", action="store_true")
+    product_pause = product_actions.add_parser(
+        "pause", help="暂停产品但保留工作表和历史"
+    )
+    product_pause.add_argument("--sheet", required=True)
+    product_pause.add_argument("--reason", required=True)
+    product_resume = product_actions.add_parser("resume", help="恢复已暂停产品")
+    product_resume.add_argument("--sheet", required=True)
     demo = commands.add_parser(
         "demo", help="使用虚构邮箱和工作簿进行完全离线的安全演练"
     )
@@ -372,6 +505,7 @@ def main() -> int:
             "schedule": command_schedule,
             "automation": command_automation,
             "workbook": command_workbook,
+            "products": command_products,
         }
         return commands[args.command](config, args)
     except (ConfigError, RuntimeError, ValueError, OSError) as exc:
