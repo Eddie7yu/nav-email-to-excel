@@ -53,7 +53,21 @@
 
 ## 自动发现发件人和产品
 
-用户保存授权码后，由 AI 运行：
+用户保存授权码后，优先由 AI 运行只读头部预筛选：
+
+```powershell
+.\.venv\Scripts\python.exe navctl.py propose --headers-only --header-limit 25
+```
+
+它只读取最近指定数量邮件的 `From/Subject`，不查询大小、不下载正文或附件，并把本地候选写入 `app/route-proposal-headers.json`。AI 将其与工作簿中的产品名称、代码和 Sheet 语义比较；样本不足时可以按明确诊断目的扩大 `--header-limit`，不得无边界扫描。
+
+能确定精确发件人和稳定主题片段时，运行：
+
+```powershell
+.\.venv\Scripts\python.exe navctl.py propose --sender "sender@example.com" --subject-contains "稳定主题片段"
+```
+
+程序会对整个回看期先读取最小邮件头，然后只为同时命中精确发件人和主题片段的邮件查询大小、下载完整 MIME 并解析。产品身份只存在于正文或附件、邮件头无法可靠收窄时，Agent 可以基于本地证据改用普通候选扫描：
 
 ```powershell
 .\.venv\Scripts\python.exe navctl.py propose
@@ -61,7 +75,7 @@
 
 命令会在本机按 `lookback_days` 扫描邮箱，忽略不能解析成净值的普通邮件，把可解析候选的真实发件人、主题样例、产品代码、净值日期/数值和近期到达时间写入 `app/route-proposals.json`。这些数据只存在于本地运行目录。AI 应读取该报告；已有工作簿时再读取其结构，自动生成 `routes`、`column_overrides` 和 `schedule`。没有工作簿时，AI 从邮件日期规律判断日频/周频，只有证据冲突才询问。不得要求用户手工抄写发件人邮箱、产品代码或逐项填写列号。
 
-成功生成候选报告后不要立即重复运行 `propose`。完成路由配置后直接运行一次 `preview`；它会在同一次授权邮件扫描结果上完成发现、历史验证和预览。`discover`、`validate` 仅用于分阶段诊断，不应在每次 `preview` 前固定串行执行。运行时会按批次读取邮件大小，避免为每封邮件额外发送一次大小查询。
+头部预筛选和紧接的一次选择式完整解析属于同一轮候选发现。成功生成完整候选报告后不要再次重复运行 `propose`。完成路由配置后直接运行一次 `preview`；它会在同一次授权邮件扫描结果上完成发现、历史验证和预览。`discover`、`validate` 仅用于分阶段诊断，不应在每次 `preview` 前固定串行执行。
 
 候选与工作表能通过产品代码、名称和至少两个历史日期唯一匹配时直接配置。只有多个映射同样合理、累计净值规则无法从历史证明，或一个发件人包含多个无代码产品且主题也无法分流时才询问用户。
 
@@ -175,7 +189,7 @@
 
 | `sheet_mode` | 适用结构 | 历史要求 | 汇总行 |
 | --- | --- | --- | --- |
-| `summary`（默认） | 已有历史数据、固定汇总行和受管理公式的复杂表；也支持严格识别的单一预留数据行冷启动 | 普通表至少匹配 `minimum_history_dates` 个不同日期；预留行冷启动则要求邮件至少有该数量的不同日期 | 数据区后必须紧跟可识别汇总行，冷启动也保留该行 |
+| `summary`（默认） | 已有历史数据、固定汇总行和受管理公式的复杂表；也支持严格识别的单一预留数据行及向后追加冷启动 | 通常至少匹配 `minimum_history_dates` 个日期；零重叠仅在精确代码、主题范围、双方至少两期且邮件日期全部晚于表内最新日期时允许 | 数据区后必须紧跟可识别汇总行，冷启动也保留该行 |
 | `append` | 空白、只有表头，或没有汇总行的简单追加表 | 允许历史不足的冷启动，但验证报告会显示警告 | 不需要；数据区下方不得有页脚内容 |
 | `template` | 只能用于 `workbook init-template` 生成的新表，一只产品一个工作表 | 一个真实邮件日期即可生成带警告的首次预览；两个日期写入并核实后恢复严格验证 | 固定保留累计行，程序只管理收益、基准和超额公式 |
 
@@ -189,6 +203,8 @@
 冷启动不等于跳过检查。未来日期、同日冲突、重复日期、异常净值跳变、邮件路由歧义和累计净值口径错误仍会阻止预览。用户必须亲自检查新表头、产品标识、日期和净值后，才能批准第一次写入。复杂汇总、图表或专业指标应放在未托管的独立分析工作表或单独文件中，不要放在 `append` 数据区下面。
 
 `summary` 还有一个程序自动识别的冷启动状态：表头下只有一条预留数据行，该行仅含与路由精确一致的产品名称或代码及一个预留日期，单位/累计净值为空，其下立即是“累计/合计”行。邮件至少含 `minimum_history_dates` 个不同日期、预留行没有备注或其他业务内容时，程序用最早真实邮件替换预留日期并补全该行，再把其余日期插入汇总行之前。AI 不得把这种结构改成 `append`，不得询问用户删除“累计”行，也不得为凑门槛伪造历史数据。
+
+另一种受限冷启动是“工作簿有历史，但回看期邮件从下一期才开始”。程序仅在以下条件全部成立时允许进入首次预览：`summary` 表已有至少 `minimum_history_dates` 条完整净值历史；配置和工作簿代码列都唯一指向同一非空产品代码；路由的 `subject_contains` 自身包含同一个产品代码；邮件至少有 `minimum_history_dates` 个不同落表日期、每条代码精确一致且全部晚于工作簿最新日期；没有同日冲突、异常跳变或累计净值错误。报告标记 `cold_start_kind: summary-forward-only`。缺少其中任一证据仍返回 `only 0 verified historical dates`，不得人工降低门槛。
 
 `template` 只能与顶层 `workbook_mode: bundled-template` 一起使用，且要求非空 `code` 或 `product_name`。路由确认后运行：
 
@@ -315,13 +331,13 @@ AI 应先采用一致、可解释的行业常用口径并在交付中说明：
 
 ## 验证与保留
 
-`validation.minimum_history_dates` 不得低于 `2`，并作为普通 `summary` 模式的工作簿历史匹配门槛，以及预留行冷启动的邮件历史数量门槛。`append` 模式达不到该数量时会标记为冷启动。程序生成的 `template` 允许从一个真实邮件日期开始，但持续警告，直到至少两个已写入日期通过历史核验；这不放宽未来日期、冲突、重复、异常跳变、路由或累计口径检查。`max_future_days` 与 `max_period_change` 只能依据有记录的产品行为调整，不能为了让失败运行通过而放宽。
+`validation.minimum_history_dates` 不得低于 `2`，并作为普通 `summary` 模式的工作簿历史匹配门槛、预留行冷启动邮件数量门槛，以及向后追加冷启动中工作簿与邮件各自的最低历史数量。`append` 模式达不到该数量时会标记为冷启动。程序生成的 `template` 允许从一个真实邮件日期开始，但持续警告，直到至少两个已写入日期通过历史核验；这不放宽未来日期、冲突、重复、异常跳变、路由或累计口径检查。`max_future_days` 与 `max_period_change` 只能依据有记录的产品行为调整，不能为了让失败运行通过而放宽。
 
 `retention.backup_count`、`preview_count` 和 `log_days` 用于限制本地敏感文件。运行程序只会清理自身 `backups/`、`previews/` 和 `logs/` 目录中的文件。
 
 ## 本地敏感文件
 
-以下文件仅能存在于本地运行目录，并应被 Git 忽略：`app/config.json`、`app/route-proposals.json`、`app/route-report.json`、`app/validation-report.json`、`app/plan.json`、`app/automation-approval.json`、`app/scheduled_tasks.json`、`app/last-scheduled-run.json`、`app/run.lock`、本地 `app/parsers/`、根目录中的预览工作簿、`logs/` 和 `backups/`。正式工作簿保留在用户指定的原路径。Windows 密钥保存在当前用户的本地应用数据目录，并使用 DPAPI 加密。目录分层见 [runtime-layout.md](runtime-layout.md)。
+以下文件仅能存在于本地运行目录，并应被 Git 忽略：`app/config.json`、`app/route-proposal-headers.json`、`app/route-proposals.json`、`app/route-report.json`、`app/validation-report.json`、`app/plan.json`、`app/automation-approval.json`、`app/scheduled_tasks.json`、`app/last-scheduled-run.json`、`app/run.lock`、本地 `app/parsers/`、根目录中的预览工作簿、`logs/` 和 `backups/`。正式工作簿保留在用户指定的原路径。Windows 密钥保存在当前用户的本地应用数据目录，并使用 DPAPI 加密。目录分层见 [runtime-layout.md](runtime-layout.md)。
 
 `app/run.lock` 在正常运行结束后保留一条 `idle` 诊断记录，不代表仍被锁定。真正的并发保护由操作系统持有；进程崩溃或断电后会自动释放，不需要手动删除文件。
 

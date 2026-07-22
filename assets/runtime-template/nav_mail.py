@@ -270,6 +270,51 @@ def _max_header_messages(config: dict[str, Any]) -> int:
     return int(imap.get("max_header_messages", 20000))
 
 
+def fetch_candidate_headers(
+    config: dict[str, Any], limit: int = 25
+) -> tuple[list[Message], dict[str, Any]]:
+    """Read only From/Subject headers for a bounded recent mailbox sample."""
+
+    lookback, _, _, _ = _limits(config)
+    max_header_messages = _max_header_messages(config)
+    if isinstance(limit, bool) or not 1 <= int(limit) <= max_header_messages:
+        raise MailError(f"候选邮件头数量必须在 1 到 {max_header_messages} 之间")
+    since = imap_date(dt.date.today() - dt.timedelta(days=lookback))
+    client = connect(config)
+    found = 0
+    stage = "搜索候选邮件头"
+    try:
+        status, data = client.uid("search", None, f"(SINCE {since})")
+        if status != "OK":
+            raise _mail_read_error(
+                "搜索候选邮件头",
+                "IMAP 服务器拒绝了候选搜索请求",
+                "稍后重试；若持续失败，请检查服务商 IMAP 兼容性",
+            )
+        all_uids = (data[0] or b"").split()
+        found = len(all_uids)
+        selected_uids = all_uids[-int(limit) :]
+        stage = "读取最小候选邮件头"
+        headers = _message_headers(client, selected_uids)
+        return [headers[uid] for uid in reversed(selected_uids)], {
+            "messages_found": found,
+            "headers_fetched": len(selected_uids),
+            "messages_fetched": 0,
+            "bytes_fetched": 0,
+            "truncated": found > len(selected_uids),
+        }
+    except MailError:
+        raise
+    except (imaplib.IMAP4.error, OSError, ssl.SSLError) as exc:
+        raise _mail_read_error(
+            stage,
+            "IMAP 会话意外断开，本次没有生成可用邮件头报告",
+            "检查网络和邮箱服务状态后重试",
+        ) from exc
+    finally:
+        _close(client)
+
+
 def _close(client: imaplib.IMAP4_SSL) -> None:
     try:
         client.close()
@@ -283,9 +328,16 @@ def _close(client: imaplib.IMAP4_SSL) -> None:
 
 def fetch_candidate_messages(
     config: dict[str, Any],
+    *,
+    sender: str | None = None,
+    subject_contains: str | None = None,
 ) -> tuple[list[Message], dict[str, Any]]:
     lookback, max_messages, max_message_bytes, max_total_bytes = _limits(config)
     since = imap_date(dt.date.today() - dt.timedelta(days=lookback))
+    selected_sender = str(sender or "").strip().casefold()
+    selected_subject = str(subject_contains or "").strip().casefold()
+    if selected_subject and not selected_sender:
+        raise MailError("按主题选择候选邮件时必须同时指定精确发件人")
     client = connect(config)
     messages: list[Message] = []
     total_bytes = 0
@@ -299,9 +351,39 @@ def fetch_candidate_messages(
             raise MailError("IMAP search failed while discovering NAV senders")
         all_uids = (data[0] or b"").split()
         found = len(all_uids)
-        if len(all_uids) > max_messages:
-            truncated = True
-        selected_uids = all_uids[-max_messages:]
+        if selected_sender:
+            max_header_messages = _max_header_messages(config)
+            if len(all_uids) > max_header_messages:
+                raise _mail_read_error(
+                    "候选邮件头扫描边界",
+                    "回看期内邮件数量超过候选邮件头扫描上限",
+                    "缩短回看窗口，或先用更小的 lookback_days 重新生成头部报告",
+                )
+            header_uids = all_uids
+        else:
+            if len(all_uids) > max_messages:
+                truncated = True
+            header_uids = all_uids[-max_messages:]
+        stage = "读取最小候选邮件头"
+        headers = _message_headers(client, header_uids)
+        if selected_sender:
+            selected_uids = []
+            for uid in header_uids:
+                header = headers[uid]
+                if not exact_from_matches(header, selected_sender):
+                    continue
+                subject = decoded(header.get("Subject")).casefold()
+                if selected_subject and selected_subject not in subject:
+                    continue
+                selected_uids.append(uid)
+            if len(selected_uids) > max_messages:
+                raise _mail_read_error(
+                    "候选邮件选择后计数",
+                    "符合发件人和主题范围的候选邮件超过配置上限",
+                    "缩短回看窗口或使用更精确的 subject_contains",
+                )
+        else:
+            selected_uids = header_uids
         stage = "批量读取候选邮件大小"
         sizes = _message_sizes(client, selected_uids)
         for uid in reversed(selected_uids):
@@ -313,7 +395,15 @@ def fetch_candidate_messages(
                 truncated = True
                 break
             stage = "读取候选邮件内容"
-            messages.append(_message_payload(client, uid))
+            message = _message_payload(client, uid)
+            header_sender = single_from_address(headers[uid])
+            if single_from_address(message) != header_sender:
+                raise _mail_read_error(
+                    "复核完整候选邮件",
+                    "完整邮件的 From 与已读取的最小邮件头不一致",
+                    "停止本次读取并检查邮箱服务商返回内容",
+                )
+            messages.append(message)
             total_bytes += size
     except MailError:
         raise
@@ -325,10 +415,13 @@ def fetch_candidate_messages(
         _close(client)
     return messages, {
         "messages_found": found,
+        "headers_fetched": len(header_uids),
+        "messages_selected": len(selected_uids),
         "messages_fetched": len(messages),
         "bytes_fetched": total_bytes,
         "skipped_oversize": skipped_oversize,
         "truncated": truncated,
+        "selection_applied": bool(selected_sender),
     }
 
 

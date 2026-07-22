@@ -32,7 +32,14 @@ from nav_schedule import install as install_schedule
 from nav_schedule import record_scheduled_run
 from nav_schedule import remove as remove_schedule
 from nav_schedule import status as schedule_status
-from nav_service import discover, doctor, preview, propose_routes, validate
+from nav_service import (
+    discover,
+    doctor,
+    preview,
+    propose_headers,
+    propose_routes,
+    validate,
+)
 from nav_template import init_template
 from runtime_secret import (
     SecretInputCancelled,
@@ -217,9 +224,20 @@ def command_discover(config: dict[str, Any], _args: argparse.Namespace) -> int:
     return 0 if report["passed"] else 2
 
 
-def command_propose(config: dict[str, Any], _args: argparse.Namespace) -> int:
+def command_propose(config: dict[str, Any], args: argparse.Namespace) -> int:
     with run_lock():
-        report = propose_routes(config)
+        if args.headers_only:
+            if args.sender or args.subject_contains:
+                raise ValueError(
+                    "--headers-only 不能与 --sender 或 --subject-contains 同时使用"
+                )
+            report = propose_headers(config, args.header_limit)
+        else:
+            report = propose_routes(
+                config,
+                sender=args.sender,
+                subject_contains=args.subject_contains,
+            )
     emit(report)
     return 0 if report["passed"] else 2
 
@@ -396,7 +414,20 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("doctor")
     secret = commands.add_parser("secret")
     secret.add_argument("secret_action", choices=("launch", "set", "status", "remove"))
-    commands.add_parser("propose")
+    propose = commands.add_parser("propose")
+    propose.add_argument(
+        "--headers-only",
+        action="store_true",
+        help="只读取有界的 From/Subject，不下载正文或附件",
+    )
+    propose.add_argument(
+        "--header-limit",
+        type=int,
+        default=25,
+        help="头部预筛选读取的最近邮件数量（默认 25）",
+    )
+    propose.add_argument("--sender", help="完整解析时限定精确发件人")
+    propose.add_argument("--subject-contains", help="完整解析时限定稳定主题片段")
     commands.add_parser("discover")
     commands.add_parser("validate")
     commands.add_parser("preview")

@@ -27,6 +27,7 @@ from nav_config import (
 from nav_mail import (
     decoded,
     fetch_authorized_messages,
+    fetch_candidate_headers,
     fetch_candidate_messages,
     single_from_address,
 )
@@ -135,8 +136,57 @@ def _parse_diagnostic(
     }
 
 
-def propose_routes(config: dict[str, Any]) -> dict[str, Any]:
-    messages, scan = fetch_candidate_messages(config)
+def propose_headers(config: dict[str, Any], limit: int = 25) -> dict[str, Any]:
+    headers, scan = fetch_candidate_headers(config, limit)
+    groups: dict[str, dict[str, Any]] = {}
+    ignored = 0
+    for header in headers:
+        sender = single_from_address(header)
+        if not sender:
+            ignored += 1
+            continue
+        group = groups.setdefault(sender, {"subjects": [], "messages": 0})
+        group["messages"] += 1
+        subject = decoded(header.get("Subject")).strip()
+        if subject and subject not in group["subjects"]:
+            group["subjects"].append(subject)
+    candidates = [
+        {
+            "sender": sender,
+            "message_count": group["messages"],
+            "subject_examples": group["subjects"][:20],
+        }
+        for sender, group in sorted(groups.items())
+    ]
+    report = {
+        "passed": bool(candidates),
+        "header_only": True,
+        "scan": {**scan, "headers_ignored_without_single_sender": ignored},
+        "candidates": candidates,
+        "warnings": (
+            ["候选邮件头报告受到数量上限限制；需要时扩大 header_limit 后重试"]
+            if scan["truncated"]
+            else []
+        ),
+        "errors": [] if candidates else ["候选邮件头中没有可唯一识别的发件人"],
+    }
+    write_json_atomic(STATE_ROOT / "route-proposal-headers.json", report)
+    return report
+
+
+def propose_routes(
+    config: dict[str, Any],
+    *,
+    sender: str | None = None,
+    subject_contains: str | None = None,
+) -> dict[str, Any]:
+    messages, scan = (
+        fetch_candidate_messages(
+            config, sender=sender, subject_contains=subject_contains
+        )
+        if sender or subject_contains
+        else fetch_candidate_messages(config)
+    )
     groups: dict[str, dict[str, Any]] = {}
     ignored = 0
     for message in messages:

@@ -478,6 +478,59 @@ def _summary_reserved_row(
     return date, row
 
 
+def _summary_forward_only_onboarding(
+    layout: Layout,
+    route: dict[str, Any],
+    existing: dict[dt.date, dict[str, Any]],
+    selected_dates: set[dt.date],
+    candidates: list[NavRow],
+    minimum: int,
+    matches: int,
+    conflicts: int,
+) -> bool:
+    """Allow a narrowly proven first preview when mailbox history starts after Excel."""
+
+    expected_code = normalize_code(route.get("code"))
+    subject_filter = str(route.get("subject_contains") or "").strip()
+    subject_has_exact_code = bool(
+        expected_code
+        and re.search(
+            r"(?<![A-Za-z0-9])"
+            + r"[^A-Za-z0-9]*".join(re.escape(char) for char in expected_code)
+            + r"(?![A-Za-z0-9])",
+            subject_filter,
+            re.IGNORECASE,
+        )
+    )
+    observed_codes = {
+        values["code"] for values in existing.values() if values.get("code")
+    }
+    complete_history = all(
+        values.get("unit") is not None
+        and (
+            not layout.columns.get("cumulative") or values.get("cumulative") is not None
+        )
+        for values in existing.values()
+    )
+    return bool(
+        layout.mode == "summary"
+        and matches == 0
+        and conflicts == 0
+        and expected_code
+        and layout.columns.get("code")
+        and observed_codes == {expected_code}
+        and subject_has_exact_code
+        and len(existing) >= minimum
+        and complete_history
+        and len(selected_dates) >= minimum
+        and selected_dates
+        and max(existing) < min(selected_dates)
+        and candidates
+        and all(candidate.code == expected_code for candidate in candidates)
+        and all(candidate.date > max(existing) for candidate in candidates)
+    )
+
+
 def _header_data_frequency(
     sheet: openpyxl.worksheet.worksheet.Worksheet, layout: Layout
 ) -> str | None:
@@ -756,6 +809,19 @@ def validate_history(
                     )
             summary_cold_start = reserved_date is not None
             template_cold_start = layout.mode == "template" and matches < minimum
+            summary_forward_only = (
+                reserved_date is None
+                and _summary_forward_only_onboarding(
+                    layout,
+                    route,
+                    existing,
+                    selected_dates,
+                    candidates,
+                    minimum,
+                    matches,
+                    conflicts,
+                )
+            )
             if summary_cold_start:
                 if len(candidate_dates) < minimum:
                     errors.append(
@@ -774,6 +840,10 @@ def validate_history(
                     errors.append(
                         f"{sheet_name}: bundled template cold start needs at least one real email NAV date"
                     )
+            elif summary_forward_only:
+                warnings.append(
+                    f"{sheet_name}: no overlapping NAV dates were available, but exact product-code and subject-scoped evidence proves a forward-only append; review the first preview"
+                )
             elif matches < minimum:
                 message = f"{sheet_name}: only {matches} verified historical dates; {minimum} required"
                 if layout.mode == "append":
@@ -788,12 +858,15 @@ def validate_history(
                     "sheet_mode": layout.mode,
                     "cold_start": summary_cold_start
                     or template_cold_start
+                    or summary_forward_only
                     or (layout.mode == "append" and matches < minimum),
                     "cold_start_kind": (
                         "summary-reserved-row"
                         if summary_cold_start
                         else "bundled-template"
                         if template_cold_start
+                        else "summary-forward-only"
+                        if summary_forward_only
                         else "append"
                         if layout.mode == "append" and matches < minimum
                         else None

@@ -159,6 +159,7 @@ def parser_tests(runtime: Path) -> None:
         MailError,
         exact_from_matches,
         fetch_authorized_messages,
+        fetch_candidate_headers,
         fetch_candidate_messages,
         imap_date,
         needs_imap_id,
@@ -385,6 +386,9 @@ def parser_tests(runtime: Path) -> None:
         "DEMO01 | 2026-01-09 | 1.01 | 1.01"
     )
     candidate_payload = candidate_message.as_bytes()
+    candidate_header_payload = (
+        b"From: NAV Desk <sender@example.invalid>\r\nSubject: NAV update\r\n\r\n"
+    )
     candidate_calls: list[tuple[str, tuple[Any, ...]]] = []
 
     class CandidateIMAP:
@@ -393,6 +397,15 @@ def parser_tests(runtime: Path) -> None:
             if command == "search":
                 return "OK", [b"1 2"]
             query = str(_args[-1])
+            if "HEADER.FIELDS" in query:
+                requested = _args[0].split(b",")
+                return "OK", [
+                    (
+                        uid + b" (UID " + uid + b" BODY[HEADER] {1})",
+                        candidate_header_payload,
+                    )
+                    for uid in requested
+                ]
             if "RFC822.SIZE" in query:
                 return "OK", [
                     f"1 (UID 1 RFC822.SIZE {len(candidate_payload)})".encode(),
@@ -426,6 +439,39 @@ def parser_tests(runtime: Path) -> None:
         )
         == 1,
         "mailbox-wide sender discovery did not return the local NAV candidate",
+    )
+    header_call_index = next(
+        index
+        for index, call in enumerate(candidate_calls)
+        if call[0] == "fetch" and "HEADER.FIELDS" in str(call[1][-1])
+    )
+    size_call_index = next(
+        index
+        for index, call in enumerate(candidate_calls)
+        if call[0] == "fetch" and "RFC822.SIZE" in str(call[1][-1])
+    )
+    check(
+        header_call_index < size_call_index,
+        "candidate discovery downloaded size/body data before minimum headers",
+    )
+    candidate_calls.clear()
+    nav_mail.connect = lambda _config: CandidateIMAP()
+    try:
+        headers, header_scan = fetch_candidate_headers(mail_config, limit=1)
+    finally:
+        nav_mail.connect = original_connect
+    check(
+        len(headers) == 1
+        and header_scan["headers_fetched"] == 1
+        and header_scan["messages_fetched"] == 0
+        and not any(
+            call[0] == "fetch"
+            and (
+                "RFC822.SIZE" in str(call[1][-1]) or str(call[1][-1]) == "(BODY.PEEK[])"
+            )
+            for call in candidate_calls
+        ),
+        "header-only proposal scan downloaded full message data",
     )
 
     routed_payloads: dict[bytes, bytes] = {}
@@ -515,6 +561,28 @@ def parser_tests(runtime: Path) -> None:
         len(routed_messages["sender@example.invalid"]) == 2
         and full_fetch_uids == [b"1", b"3"],
         "authorized sender mail was not header-filtered before message limits and full download",
+    )
+    routed_calls.clear()
+    nav_mail.connect = lambda _config: RoutedIMAP()
+    try:
+        selected_candidates, selected_scan = fetch_candidate_messages(
+            routed_config,
+            sender="sender@example.invalid",
+            subject_contains="TARGET",
+        )
+    finally:
+        nav_mail.connect = original_connect
+    selected_full_fetch_uids = [
+        call[1][0]
+        for call in routed_calls
+        if call[0] == "fetch" and str(call[1][-1]) == "(BODY.PEEK[])"
+    ]
+    check(
+        len(selected_candidates) == 2
+        and selected_scan["headers_fetched"] == 4
+        and selected_scan["messages_selected"] == 2
+        and selected_full_fetch_uids == [b"3", b"1"],
+        "selected proposal scan downloaded messages outside the exact sender/subject scope",
     )
     unfiltered_config = json.loads(json.dumps(routed_config))
     unfiltered_config["routes"][0].pop("subject_contains")
@@ -1203,6 +1271,62 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
 
     validation = validate_history(config, rows)
     check(validation["passed"], f"historical validation failed: {validation['errors']}")
+
+    forward_only_config = json.loads(json.dumps(config))
+    forward_only_config["routes"][0]["subject_contains"] = "DEMO01 NAV statement"
+    forward_only_rows = {
+        "Demo Fund": [
+            NavRow(dt.date(2026, 1, 16), 1.02, 1.02, "DEMO01", "fixture"),
+            NavRow(dt.date(2026, 1, 23), 1.015, 1.015, "DEMO01", "fixture"),
+        ]
+    }
+    forward_validation = validate_history(forward_only_config, forward_only_rows)
+    check(
+        forward_validation["passed"]
+        and forward_validation["routes"][0]["cold_start_kind"] == "summary-forward-only"
+        and forward_validation["routes"][0]["matched_history_dates"] == 0
+        and forward_validation["warnings"],
+        "exact-code forward-only summary onboarding did not reach first preview",
+    )
+    forward_plan = build_preview(forward_only_config, forward_only_rows)
+    check(
+        forward_plan["sheets"][0]["new_dates"] == ["2026-01-16", "2026-01-23"],
+        "forward-only onboarding preview did not append both new dates",
+    )
+    unscoped_forward = json.loads(json.dumps(forward_only_config))
+    unscoped_forward["routes"][0].pop("subject_contains")
+    unscoped_validation = validate_history(unscoped_forward, forward_only_rows)
+    check(
+        not unscoped_validation["passed"]
+        and any(
+            "only 0 verified historical dates" in error
+            for error in unscoped_validation["errors"]
+        ),
+        "zero-overlap summary onboarding was accepted without a subject scope",
+    )
+    code_free_subject = json.loads(json.dumps(forward_only_config))
+    code_free_subject["routes"][0]["subject_contains"] = "weekly NAV statement"
+    code_free_validation = validate_history(code_free_subject, forward_only_rows)
+    check(
+        not code_free_validation["passed"],
+        "zero-overlap summary onboarding accepted a subject scope without the product code",
+    )
+    embedded_code_subject = json.loads(json.dumps(forward_only_config))
+    embedded_code_subject["routes"][0]["subject_contains"] = "XDEMO01Y NAV statement"
+    embedded_code_validation = validate_history(
+        embedded_code_subject, forward_only_rows
+    )
+    check(
+        not embedded_code_validation["passed"],
+        "zero-overlap summary onboarding accepted a product code embedded in another token",
+    )
+    wrong_code_forward = json.loads(json.dumps(forward_only_config))
+    wrong_code_forward["routes"][0]["code"] = "OTHER01"
+    wrong_code_validation = validate_history(wrong_code_forward, forward_only_rows)
+    check(
+        not wrong_code_validation["passed"],
+        "zero-overlap summary onboarding was accepted with conflicting product identity",
+    )
     plan = build_preview(config, rows)
     check(
         len(plan["sheets"]) == 1
