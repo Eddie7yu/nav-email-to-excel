@@ -300,9 +300,21 @@ def commit_demo() -> dict[str, Any]:
     require(route_report["passed"], "演练写入后的邮件发现失败")
     second = preview(config, rows)
     require(
-        not second["sheets"] and second["preview_path"] is None, "演练重复运行不幂等"
+        not second["sheets"]
+        and second["preview_path"] is None
+        and second["approval_kind"] == "validated-no-change"
+        and Path(second["review_path"]).is_file(),
+        "演练重复运行没有生成零新增基线报告",
     )
-    require(not (ROOT / "plan.json").exists(), "无新增数据仍留下了提交计划")
+    before_no_change = Path(config["workbook_path"]).read_bytes()
+    no_change = commit(config)
+    require(
+        not no_change["changed"]
+        and no_change["approved_baseline"]
+        and "backup" not in no_change
+        and Path(config["workbook_path"]).read_bytes() == before_no_change,
+        "零新增基线批准意外写入或备份了工作簿",
+    )
     state["committed"] = True
     write_json_atomic(STATE_PATH, state)
     return {
@@ -316,7 +328,7 @@ def commit_demo() -> dict[str, Any]:
             {"name": "Excel/WPS COM 写入虚构副本", "passed": True},
             {"name": "产品、基准和超额收益复核", "passed": True},
             {"name": "第二次运行无重复写入", "passed": True},
-            {"name": "无新增数据不保留提交计划", "passed": True},
+            {"name": "零新增基线报告批准且不写工作簿", "passed": True},
         ],
     }
 

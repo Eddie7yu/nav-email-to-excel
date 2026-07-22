@@ -237,6 +237,8 @@ def command_preview(config: dict[str, Any], _args: argparse.Namespace) -> int:
     emit(
         {
             "preview_path": plan["preview_path"],
+            "review_path": plan.get("review_path"),
+            "approval_kind": plan.get("approval_kind"),
             "warnings": plan.get("warnings") or [],
             "sheets": [
                 {"sheet": item["sheet"], "new_dates": item["new_dates"]}

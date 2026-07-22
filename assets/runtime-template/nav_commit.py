@@ -464,7 +464,32 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
             "The master workbook changed after preview; regenerate the preview"
         )
     if not plan.get("sheets"):
-        return {"changed": False, "message": "No rows require commit"}
+        if (
+            plan.get("approval_kind") != "validated-no-change"
+            or plan.get("preview_path") is not None
+            or plan.get("preview_sha256") is not None
+        ):
+            raise CommitError("The no-change baseline plan metadata is invalid")
+        review = Path(str(plan.get("review_path") or "")).resolve()
+        if (
+            review.parent != (ROOT / "previews").resolve()
+            or review.suffix.lower() != ".txt"
+        ):
+            raise CommitError(
+                "The no-change review path is outside the runtime preview directory"
+            )
+        if not review.is_file() or file_sha256(review) != plan.get("review_sha256"):
+            raise CommitError(
+                "The reviewed no-change baseline report is missing or changed; regenerate the preview"
+            )
+        return {
+            "changed": False,
+            "approved_baseline": True,
+            "message": "Validated current baseline; no rows require commit",
+            "review_path": str(review),
+            "sheets": 0,
+            "rows": 0,
+        }
     preview = Path(str(plan.get("preview_path") or "")).resolve()
     if (
         preview.parent != (ROOT / "previews").resolve()

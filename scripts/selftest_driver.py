@@ -1304,14 +1304,70 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     second_validation = validate_history(config, rows)
     check(second_validation["passed"], "post-commit history validation failed")
     second = build_preview(config, rows)
+    review_path = Path(second["review_path"])
     check(
-        not second["sheets"] and second["preview_path"] is None,
-        "second run must be idempotent and leave no workbook copy",
+        not second["sheets"]
+        and second["preview_path"] is None
+        and second["approval_kind"] == "validated-no-change"
+        and review_path.is_file()
+        and "待写入日期数：0" in review_path.read_text(encoding="utf-8"),
+        "second run must produce a reviewable no-change baseline without a workbook copy",
     )
     check(
-        not (runtime / "plan.json").exists(),
-        "a no-op preview must not leave a committable plan",
+        (runtime / "plan.json").is_file(),
+        "a validated no-change preview must leave an approvable plan",
     )
+    no_change_master = book.read_bytes()
+    no_change_backups = set((runtime / "backups").glob("*"))
+    review_path.write_text(
+        review_path.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8"
+    )
+    try:
+        commit(config)
+    except CommitError:
+        pass
+    else:
+        raise AssertionError("commit accepted a changed no-change baseline report")
+    check(
+        book.read_bytes() == no_change_master,
+        "tampered no-change approval changed the master workbook",
+    )
+    second = build_preview(config, rows)
+    reviewed = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            "navctl.py",
+            "commit",
+            "--yes-reviewed-preview",
+        ],
+        cwd=runtime,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    reviewed_report = json.loads(reviewed.stdout)
+    check(
+        reviewed.returncode == 0
+        and not reviewed_report["changed"]
+        and reviewed_report["approved_baseline"]
+        and reviewed_report["automatic_updates"]["approved"],
+        "reviewed no-change baseline did not approve automatic updates",
+    )
+    check(
+        book.read_bytes() == no_change_master
+        and set((runtime / "backups").glob("*")) == no_change_backups,
+        "no-change baseline approval wrote the workbook or created a backup",
+    )
+    automatic_noop = automatic_update(config, rows)
+    check(
+        not automatic_noop["changed"]
+        and automatic_noop["rows"] == 0
+        and not (runtime / "plan.json").exists(),
+        "approved scheduled no-op did not finish successfully and clean its staging plan",
+    )
+    revoke()
 
     level_book = runtime / "level-benchmark.xlsx"
     create_book(level_book)
