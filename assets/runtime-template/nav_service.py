@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import importlib.metadata
 import platform
+import re
 import sys
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -42,6 +43,96 @@ from runtime_secret import read_password
 
 def _sender_id(sender: str) -> str:
     return hashlib.sha256(sender.lower().encode("utf-8")).hexdigest()[:12]
+
+
+def _short_id(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _route_ref(route: dict[str, Any], sender: str) -> dict[str, str]:
+    sheet = str(route["sheet"])
+    identity = "\x1f".join(
+        (
+            sender.lower(),
+            sheet,
+            str(route.get("code") or ""),
+            str(route.get("parser", "auto")),
+        )
+    )
+    return {"route_id": _short_id(identity), "sheet": sheet}
+
+
+def _attachment_metadata(message: Any) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for part in message.walk():
+        raw_name = part.get_filename()
+        if not raw_name:
+            continue
+        name = decoded(raw_name).strip()
+        suffix = Path(name).suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+            suffix = "(none)"
+        content_type = str(part.get_content_type() or "application/octet-stream")
+        if not re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", content_type.lower()):
+            content_type = "application/octet-stream"
+        key = (suffix, content_type.lower())
+        item = grouped.setdefault(
+            key,
+            {
+                "suffix": suffix,
+                "content_type": content_type.lower(),
+                "count": 0,
+                "name_ids": [],
+            },
+        )
+        item["count"] += 1
+        name_id = _short_id(name.casefold())
+        if name_id not in item["name_ids"]:
+            item["name_ids"].append(name_id)
+    return list(grouped.values())
+
+
+def _parse_diagnostic(
+    message: Any,
+    sender: str,
+    routes: list[dict[str, Any]],
+    parser_name: str,
+    exc: BaseException | None,
+) -> dict[str, Any]:
+    subject = decoded(message.get("Subject")).strip()
+    attachments = _attachment_metadata(message)
+    message_identity = "\x1f".join(
+        (
+            sender.lower(),
+            str(message.get("Message-ID") or ""),
+            str(message.get("Date") or ""),
+            subject,
+        )
+    )
+    if exc is None:
+        error_type = "NoRowsParsed"
+        root_error_type = "NoRowsParsed"
+        safe_message = "Parser returned no NAV rows"
+    else:
+        error_type = (
+            "LocalParserError"
+            if parser_name.startswith("local:")
+            else "AutomaticParserError"
+        )
+        root_error_type = "ControlledParseFailure"
+        safe_message = "Parser failed; use the controlled error types and local message identifiers"
+    return {
+        "stage": "message_parse",
+        "message_id": _short_id(message_identity),
+        "subject_id": _short_id(subject.casefold()),
+        "routes": [_route_ref(route, sender) for route in routes],
+        "parser": parser_name,
+        "attachment_count": sum(item["count"] for item in attachments),
+        "attachment_types": attachments,
+        "error_type": error_type,
+        "root_error_type": root_error_type,
+        "safe_message": safe_message,
+    }
 
 
 def propose_routes(config: dict[str, Any]) -> dict[str, Any]:
@@ -149,6 +240,7 @@ def collect_route_rows(
             "routes": [],
             "warnings": warnings,
             "errors": ["No active routes are configured"],
+            "diagnostics": [],
         }
         write_json_atomic(STATE_ROOT / "route-report.json", report)
         return {}, report
@@ -161,6 +253,7 @@ def collect_route_rows(
     }
     route_reports: list[dict[str, Any]] = []
     errors: list[str] = []
+    diagnostics: list[dict[str, Any]] = []
     for sender, routes in sender_routes.items():
         route_message_counts = {str(route["sheet"]): 0 for route in routes}
         route_filtered_counts = {str(route["sheet"]): 0 for route in routes}
@@ -184,11 +277,26 @@ def collect_route_rows(
             for parser_name in sorted(
                 {str(route.get("parser", "auto")) for route in applicable}
             ):
+                parse_error: ParseError | None = None
                 try:
                     parsed = rows_from_message(message, parser_name)
-                except ParseError:
+                except ParseError as exc:
                     parsed = []
+                    parse_error = exc
                 if not parsed:
+                    diagnostics.append(
+                        _parse_diagnostic(
+                            message,
+                            sender,
+                            [
+                                route
+                                for route in applicable
+                                if str(route.get("parser", "auto")) == parser_name
+                            ],
+                            parser_name,
+                            parse_error,
+                        )
+                    )
                     parse_failed = True
                     break
                 message_rows.extend(parsed)
@@ -260,6 +368,7 @@ def collect_route_rows(
         "routes": route_reports,
         "warnings": warnings,
         "errors": errors,
+        "diagnostics": diagnostics,
     }
     write_json_atomic(STATE_ROOT / "route-report.json", report)
     return output, report

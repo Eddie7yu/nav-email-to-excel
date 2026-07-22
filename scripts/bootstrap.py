@@ -163,6 +163,7 @@ def config_payload(args: argparse.Namespace, workbook: Path) -> dict:
             "mailbox": args.mailbox,
             "lookback_days": args.lookback_days,
             "max_messages": 2000,
+            "max_header_messages": 20000,
             "max_message_bytes": 25 * 1024 * 1024,
             "max_total_bytes": 100 * 1024 * 1024,
         },

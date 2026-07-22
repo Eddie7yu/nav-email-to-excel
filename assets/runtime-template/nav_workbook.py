@@ -14,7 +14,13 @@ from typing import Any
 
 import openpyxl
 from openpyxl.formula.translate import Translator
-from openpyxl.utils import column_index_from_string, get_column_letter, quote_sheetname
+from openpyxl.utils import (
+    column_index_from_string,
+    get_column_letter,
+    quote_sheetname,
+    range_boundaries,
+)
+from openpyxl.worksheet.formula import ArrayFormula
 
 from nav_config import (
     ROOT,
@@ -45,6 +51,16 @@ TOTAL_WORDS = {"累计", "合计", "total", "cumulative"}
 
 class WorkbookError(RuntimeError):
     pass
+
+
+def _cell_values_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, ArrayFormula) or isinstance(right, ArrayFormula):
+        return (
+            type(left) is type(right)
+            and left.ref == right.ref
+            and left.text == right.text
+        )
+    return left == right
 
 
 @dataclass
@@ -773,6 +789,11 @@ def _copy_row(
         cell.number_format = original.number_format
         cell.alignment = copy(original.alignment)
         cell.protection = copy(original.protection)
+        if isinstance(original.value, ArrayFormula):
+            raise WorkbookError(
+                f"{sheet.title}: array formula at {original.coordinate} cannot be "
+                "copied safely during automatic row insertion"
+            )
         if isinstance(original.value, str) and original.value.startswith("="):
             try:
                 cell.value = Translator(
@@ -1109,12 +1130,50 @@ def _ensure_summary_formula_safety(
         )
     for column in range(1, sheet.max_column + 1):
         value = sheet.cell(layout.summary_row, column).value
+        if isinstance(value, ArrayFormula):
+            coordinate = sheet.cell(layout.summary_row, column).coordinate
+            raise WorkbookError(
+                f"{sheet.title}: array formula at {coordinate} cannot be moved "
+                "safely during automatic row insertion"
+            )
         if isinstance(value, str) and value.startswith("=") and column not in managed:
             coordinate = sheet.cell(layout.summary_row, column).coordinate
             raise WorkbookError(
                 f"{sheet.title}: summary formula at {coordinate} is not managed; "
                 "automatic insertion cannot prove that its range will expand safely"
             )
+
+
+def _ensure_array_formula_insertion_safety(
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    insert_before: int,
+) -> None:
+    template_row = insert_before - 1
+    for row in sheet.iter_rows():
+        for cell in row:
+            value = cell.value
+            if not isinstance(value, ArrayFormula):
+                continue
+            try:
+                min_column, min_row, max_column, max_row = range_boundaries(value.ref)
+            except (TypeError, ValueError) as exc:
+                raise WorkbookError(
+                    f"{sheet.title}: array formula at {cell.coordinate} has an invalid range"
+                ) from exc
+            if not (
+                min_column <= cell.column <= max_column
+                and min_row <= cell.row <= max_row
+            ):
+                raise WorkbookError(
+                    f"{sheet.title}: array formula anchor {cell.coordinate} is outside "
+                    f"its declared range {value.ref}"
+                )
+            if cell.row == template_row or max_row >= insert_before:
+                raise WorkbookError(
+                    f"{sheet.title}: array formula at {cell.coordinate} with range "
+                    f"{value.ref} cannot be copied or moved safely during automatic "
+                    "row insertion"
+                )
 
 
 def _write_nav_values(
@@ -1257,6 +1316,7 @@ def build_preview(
                 )
                 filled_existing_rows.append(reserved_row)
             if count:
+                _ensure_array_formula_insertion_safety(sheet, old_summary)
                 sheet.insert_rows(old_summary, count)
             for offset, nav in enumerate(additions):
                 target = old_summary + offset
@@ -1405,9 +1465,9 @@ def validate_preview(config: dict[str, Any], plan: dict[str, Any]) -> None:
                     raise WorkbookError(f"{name}: preview changed an unmanaged sheet")
                 for row in range(1, left.max_row + 1):
                     for column in range(1, left.max_column + 1):
-                        if (
-                            left.cell(row, column).value
-                            != right.cell(row, column).value
+                        if not _cell_values_equal(
+                            left.cell(row, column).value,
+                            right.cell(row, column).value,
                         ):
                             raise WorkbookError(
                                 f"{name}: preview changed an unmanaged cell"
@@ -1422,16 +1482,18 @@ def validate_preview(config: dict[str, Any], plan: dict[str, Any]) -> None:
             max_column = max(left.max_column, right.max_column)
             for row in range(1, insert_before):
                 for column in range(1, max_column + 1):
-                    if (row, column) not in allowed and left.cell(
-                        row, column
-                    ).value != right.cell(row, column).value:
+                    if (row, column) not in allowed and not _cell_values_equal(
+                        left.cell(row, column).value,
+                        right.cell(row, column).value,
+                    ):
                         raise WorkbookError(
                             f"{name}: preview changed an unapproved historical cell"
                         )
             for column in range(1, max_column + 1):
-                if (new_summary, column) not in allowed and left.cell(
-                    insert_before, column
-                ).value != right.cell(new_summary, column).value:
+                if (new_summary, column) not in allowed and not _cell_values_equal(
+                    left.cell(insert_before, column).value,
+                    right.cell(new_summary, column).value,
+                ):
                     raise WorkbookError(
                         f"{name}: preview changed an unapproved summary cell at "
                         f"{get_column_letter(column)}{new_summary}"
