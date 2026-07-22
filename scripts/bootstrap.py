@@ -58,6 +58,15 @@ def runtime_python(root: Path) -> Path:
     )
 
 
+def copy_runtime_file(source: Path, destination: Path) -> None:
+    if source.suffix.lower() in {".bat", ".cmd"}:
+        text = source.read_text(encoding="ascii")
+        payload = ("\r\n".join(text.splitlines()) + "\r\n").encode("ascii")
+        destination.write_bytes(payload)
+        return
+    shutil.copy2(source, destination)
+
+
 def normalize_index_url(value: str | None) -> str | None:
     if value is None:
         return None
@@ -211,12 +220,12 @@ def create_runtime(args: argparse.Namespace, destination: Path, workbook: Path) 
             source = TEMPLATE / source_name
             if not source.is_file():
                 raise RuntimeError(f"Bundled runtime file is missing: {source_name}")
-            shutil.copy2(source, staging / destination_name)
+            copy_runtime_file(source, staging / destination_name)
         for name in APP_FILES:
             source = TEMPLATE / name
             if not source.is_file():
                 raise RuntimeError(f"Bundled runtime file is missing: {name}")
-            shutil.copy2(source, app / name)
+            copy_runtime_file(source, app / name)
         for name in WORKBOOK_ASSETS:
             source = WORKBOOK_TEMPLATES / name
             if not source.is_file():

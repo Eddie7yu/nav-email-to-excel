@@ -27,11 +27,13 @@ BOOTSTRAP = ROOT / "scripts" / "bootstrap.py"
 def bootstrap_test(temporary: Path, use_com: bool) -> None:
     import openpyxl
 
-    workbook_path = temporary / "输入 工作簿.xlsx"
+    workbook_parent = temporary / "部署 空格 & 括号 (测试)"
+    workbook_parent.mkdir()
+    workbook_path = workbook_parent / "输入 工作簿.xlsx"
     workbook = openpyxl.Workbook()
     workbook.active.append(["NAV Date", "Unit NAV"])
     workbook.save(workbook_path)
-    destination = temporary / DEFAULT_RUNTIME_DIRECTORY
+    destination = workbook_parent / DEFAULT_RUNTIME_DIRECTORY
     command = [
         sys.executable,
         "-X",
@@ -240,6 +242,48 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
             raise AssertionError(
                 f"{wrapper.name} does not use Windows CRLF line endings"
             )
+    if os.name == "nt":
+        command_processor = Path(
+            os.environ.get("COMSPEC")
+            or Path(os.environ.get("SystemRoot", r"C:\Windows"))
+            / "System32"
+            / "cmd.exe"
+        )
+        if not command_processor.is_file():
+            raise AssertionError("Windows command processor was not found")
+        expected_codes = {
+            "查看状态.bat": 0,
+            "手动更新.bat": 2,
+            "首次授权.bat": 2,
+        }
+        for launcher_name, expected_code in expected_codes.items():
+            launched = subprocess.run(
+                [
+                    str(command_processor),
+                    "/d",
+                    "/s",
+                    "/c",
+                    launcher_name,
+                ],
+                cwd=destination,
+                input="\n\n",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+                timeout=20,
+            )
+            output = f"{launched.stdout}\n{launched.stderr}".lower()
+            if (
+                launched.returncode != expected_code
+                or "not recognized as an internal or external command" in output
+                or "不是内部或外部命令" in output
+            ):
+                raise AssertionError(
+                    f"Windows launcher failed from a special-character path: "
+                    f"{launcher_name}: {output}"
+                )
     doctor = subprocess.run(
         [str(runtime_python), "-X", "utf8", "navctl.py", "doctor"],
         cwd=app,

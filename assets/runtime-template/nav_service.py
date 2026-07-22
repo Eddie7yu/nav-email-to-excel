@@ -241,6 +241,8 @@ def collect_route_rows(
             "warnings": warnings,
             "errors": ["No active routes are configured"],
             "diagnostics": [],
+            "ignored_unconfigured_rows": 0,
+            "messages_with_ignored_unconfigured_rows": 0,
         }
         write_json_atomic(STATE_ROOT / "route-report.json", report)
         return {}, report
@@ -254,6 +256,8 @@ def collect_route_rows(
     route_reports: list[dict[str, Any]] = []
     errors: list[str] = []
     diagnostics: list[dict[str, Any]] = []
+    ignored_unconfigured_rows = 0
+    messages_with_ignored_unconfigured_rows = 0
     for sender, routes in sender_routes.items():
         route_message_counts = {str(route["sheet"]): 0 for route in routes}
         route_filtered_counts = {str(route["sheet"]): 0 for route in routes}
@@ -305,6 +309,8 @@ def collect_route_rows(
                 continue
             message_rows = deduplicate(message_rows)
             used_sheets: set[str] = set()
+            message_ignored_unconfigured_rows = 0
+            message_routing_errors = 0
             for row in message_rows:
                 matches: list[dict[str, Any]] = []
                 for route in applicable:
@@ -319,16 +325,27 @@ def collect_route_rows(
                         matches.append(route)
                     elif expected is None and len(applicable) == 1:
                         matches.append(route)
+                if not matches and row.code is not None:
+                    ignored_unconfigured_rows += 1
+                    message_ignored_unconfigured_rows += 1
+                    continue
                 if len(matches) != 1:
                     errors.append(
                         "An in-scope NAV row was not routed to exactly one authorized sheet"
                     )
+                    message_routing_errors += 1
                     continue
                 route = matches[0]
                 sheet = str(route["sheet"])
                 output[sheet].append(row)
                 used_sheets.add(sheet)
-            if not used_sheets:
+            if message_ignored_unconfigured_rows:
+                messages_with_ignored_unconfigured_rows += 1
+            if (
+                not used_sheets
+                and not message_ignored_unconfigured_rows
+                and not message_routing_errors
+            ):
                 errors.append(
                     "An in-scope authorized message produced no routed NAV rows"
                 )
@@ -363,12 +380,22 @@ def collect_route_rows(
                     "candidate_dates": [row.date.isoformat() for row in selected],
                 }
             )
+    if ignored_unconfigured_rows:
+        warnings.append(
+            "已忽略带有明确代码、但不属于任何活动路由的净值行："
+            f"{ignored_unconfigured_rows} 行，涉及 "
+            f"{messages_with_ignored_unconfigured_rows} 封邮件"
+        )
     report = {
         "passed": not errors,
         "routes": route_reports,
         "warnings": warnings,
         "errors": errors,
         "diagnostics": diagnostics,
+        "ignored_unconfigured_rows": ignored_unconfigured_rows,
+        "messages_with_ignored_unconfigured_rows": (
+            messages_with_ignored_unconfigured_rows
+        ),
     }
     write_json_atomic(STATE_ROOT / "route-report.json", report)
     return output, report

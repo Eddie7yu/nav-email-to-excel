@@ -303,14 +303,167 @@ def rows_from_pdf(payload: bytes, source: str, subject: str) -> list[NavRow]:
 
 class _HTMLText(HTMLParser):
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() in {"br", "div", "li", "p", "td", "th", "tr"}:
+            self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
         self.parts.append(data)
 
 
-def message_text(message: Message) -> str:
+class _HTMLTables(HTMLParser):
+    def __init__(self, source: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.source = source
+        self.tables: list[list[list[tuple[str, int, int]]]] = []
+        self.stack: list[dict[str, Any]] = []
+
+    def _span(self, attrs: list[tuple[str, str | None]], name: str, limit: int) -> int:
+        raw = dict(attrs).get(name, "1")
+        try:
+            value = int(str(raw or "1"))
+        except ValueError as exc:
+            raise ParseError(f"Invalid HTML {name} in {self.source}") from exc
+        if not 1 <= value <= limit:
+            raise ParseError(f"Invalid HTML {name} in {self.source}")
+        return value
+
+    def _finish_cell(self, context: dict[str, Any]) -> None:
+        cell = context.get("cell")
+        if cell is None:
+            return
+        text = " ".join(part.strip() for part in cell["parts"] if str(part).strip())
+        context["row"].append((text, cell["rowspan"], cell["colspan"]))
+        context["cell"] = None
+
+    def _finish_row(self, context: dict[str, Any]) -> None:
+        self._finish_cell(context)
+        row = context.get("row")
+        if row:
+            context["rows"].append(row)
+        context["row"] = None
+
+    def _finish_table(self) -> None:
+        if not self.stack:
+            return
+        context = self.stack.pop()
+        self._finish_row(context)
+        if context["rows"]:
+            self.tables.append(context["rows"])
+            if len(self.tables) > MAX_SHEETS:
+                raise ParseError(f"HTML table limit exceeded in {self.source}")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.casefold()
+        if tag == "table":
+            self.stack.append({"rows": [], "row": None, "cell": None})
+            if len(self.stack) > MAX_SHEETS:
+                raise ParseError(f"Nested HTML table limit exceeded in {self.source}")
+            return
+        if not self.stack:
+            return
+        context = self.stack[-1]
+        if tag == "tr":
+            self._finish_row(context)
+            context["row"] = []
+        elif tag in {"td", "th"}:
+            if context["row"] is None:
+                context["row"] = []
+            self._finish_cell(context)
+            context["cell"] = {
+                "parts": [],
+                "rowspan": self._span(attrs, "rowspan", MAX_ROWS),
+                "colspan": self._span(attrs, "colspan", MAX_COLUMNS),
+            }
+        elif tag == "br":
+            for active in self.stack:
+                if active.get("cell") is not None:
+                    active["cell"]["parts"].append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.casefold()
+        if tag == "table":
+            self._finish_table()
+        elif self.stack and tag in {"td", "th"}:
+            self._finish_cell(self.stack[-1])
+        elif self.stack and tag == "tr":
+            self._finish_row(self.stack[-1])
+
+    def handle_data(self, data: str) -> None:
+        for context in self.stack:
+            if context.get("cell") is not None:
+                context["cell"]["parts"].append(data)
+
+    def finish(self) -> None:
+        while self.stack:
+            self._finish_table()
+
+
+def _expand_html_table(
+    rows: list[list[tuple[str, int, int]]], source: str
+) -> list[list[str]]:
+    occupied: dict[tuple[int, int], str] = {}
+    for row_index, row in enumerate(rows):
+        column = 0
+        for value, rowspan, colspan in row:
+            while (row_index, column) in occupied:
+                column += 1
+            if column + colspan > MAX_COLUMNS or row_index + rowspan > MAX_ROWS:
+                raise ParseError(f"HTML table dimensions exceeded in {source}")
+            for target_row in range(row_index, row_index + rowspan):
+                for target_column in range(column, column + colspan):
+                    key = (target_row, target_column)
+                    if key in occupied:
+                        raise ParseError(f"Overlapping HTML spans in {source}")
+                    occupied[key] = (
+                        value if colspan == 1 and target_column == column else ""
+                    )
+            column += colspan
+    if not occupied:
+        return []
+    row_count = max(row for row, _ in occupied) + 1
+    column_count = max(column for _, column in occupied) + 1
+    if row_count * column_count > MAX_CELLS:
+        raise ParseError(f"Cell limit exceeded in {source}")
+    return [
+        [occupied.get((row, column), "") for column in range(column_count)]
+        for row in range(row_count)
+    ]
+
+
+def rows_from_html(text: str, source: str, subject: str = "") -> list[NavRow]:
+    if len(text) > MAX_TEXT_CHARS:
+        raise ParseError(f"Text limit exceeded in {source}")
+    extractor = _HTMLTables(source)
+    try:
+        extractor.feed(text)
+        extractor.close()
+        extractor.finish()
+    except ParseError:
+        raise
+    except Exception as exc:
+        raise ParseError(f"Invalid HTML body in {source}") from exc
+    results: list[NavRow] = []
+    total_cells = 0
+    for index, raw_table in enumerate(extractor.tables, start=1):
+        table_source = f"{source}:table:{index}"
+        matrix = _expand_html_table(raw_table, table_source)
+        total_cells += sum(len(row) for row in matrix)
+        if total_cells > MAX_CELLS:
+            raise ParseError(f"Cell limit exceeded in {source}")
+        results.extend(rows_from_matrix(matrix, table_source))
+
+    flattened = _HTMLText()
+    flattened.feed(text)
+    flattened.close()
+    results.extend(rows_from_text("".join(flattened.parts), source, subject))
+    return deduplicate(results)
+
+
+def _message_body_parts(message: Message) -> tuple[list[str], list[str]]:
     plain: list[str] = []
     rich: list[str] = []
     parts: Iterable[Message] = message.walk() if message.is_multipart() else [message]
@@ -329,15 +482,31 @@ def message_text(message: Message) -> str:
         if kind == "text/plain":
             plain.append(text)
         else:
-            parser = _HTMLText()
-            parser.feed(text)
-            rich.append("\n".join(parser.parts))
-    return "\n".join(plain or rich)
+            rich.append(text)
+    return plain, rich
+
+
+def message_text(message: Message) -> str:
+    plain, rich = _message_body_parts(message)
+    if plain:
+        return "\n".join(plain)
+    flattened: list[str] = []
+    for text in rich:
+        parser = _HTMLText()
+        parser.feed(text)
+        parser.close()
+        flattened.append("".join(parser.parts))
+    return "\n".join(flattened)
 
 
 def _rows_from_message_auto(message: Message) -> list[NavRow]:
     subject = str(message.get("Subject") or "")
-    rows = rows_from_text(message_text(message), "body", subject)
+    rows: list[NavRow] = []
+    plain, rich = _message_body_parts(message)
+    for text in plain:
+        rows.extend(rows_from_text(text, "body:text", subject))
+    for text in rich:
+        rows.extend(rows_from_html(text, "body:html", subject))
     for part in message.walk():
         filename = part.get_filename()
         if not filename:

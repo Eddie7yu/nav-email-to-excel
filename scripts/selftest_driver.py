@@ -145,11 +145,13 @@ def config_for(runtime: Path, book: Path) -> dict:
 def parser_tests(runtime: Path) -> None:
     sys.path.insert(0, str(runtime))
     import nav_mail
+    import nav_parse
     import navctl
     from nav_parse import (
         ParseError,
         choose_route_rows,
         parse_number,
+        rows_from_html,
         rows_from_message,
         rows_from_text,
     )
@@ -603,6 +605,60 @@ def parser_tests(runtime: Path) -> None:
         "multi-sheet attachment parsing or 估值基准日 alias recognition failed",
     )
 
+    html_body = """
+    <html><body><table>
+      <tr>
+        <th rowspan="2"><span>Product</span> Code</th>
+        <th rowspan="2">NAV Date</th>
+        <th colspan="2">NAV</th>
+      </tr>
+      <tr><th>Unit NAV</th><th>Cumulative NAV</th></tr>
+      <tr><td><span>DEMO</span>&nbsp;01</td><td>2026-01-09</td>
+          <td><strong>1.0100</strong></td><td>1.0100</td></tr>
+      <tr><td>OTHER01</td><td>2026-01-09</td><td>2.0200</td><td>2.0200</td></tr>
+    </table></body></html>
+    """
+    html_message = EmailMessage()
+    html_message["Subject"] = "HTML NAV fixture"
+    html_message.set_content(html_body, subtype="html")
+    html_rows = rows_from_message(html_message)
+    check(
+        len(html_rows) == 2
+        and {row.code for row in html_rows} == {"DEMO01", "OTHER01"}
+        and html_rows[0].date == dt.date(2026, 1, 9),
+        "HTML-only table, nested markup, entities, or merged headers were not parsed",
+    )
+    alternative = EmailMessage()
+    alternative["Subject"] = "Multipart NAV fixture"
+    alternative.set_content(
+        "Product Code | NAV Date | Unit NAV | Cumulative NAV\n"
+        "DEMO01 | 2026-01-09 | 1.0100 | 1.0100"
+    )
+    alternative.add_alternative(html_body, subtype="html")
+    alternative_rows = rows_from_message(alternative)
+    check(
+        len(alternative_rows) == 2,
+        "plain-text and HTML alternatives were not parsed and deduplicated together",
+    )
+    try:
+        rows_from_html(
+            '<table><tr><td rowspan="0">invalid</td></tr></table>',
+            "invalid-html-fixture",
+        )
+    except ParseError:
+        pass
+    else:
+        raise AssertionError("invalid HTML spans did not fail closed")
+    try:
+        rows_from_html(
+            "x" * (nav_parse.MAX_TEXT_CHARS + 1),
+            "oversize-html-fixture",
+        )
+    except ParseError:
+        pass
+    else:
+        raise AssertionError("oversized HTML body did not fail closed")
+
     parser_dir = runtime / "parsers"
     parser_dir.mkdir(exist_ok=True)
     (parser_dir / "fixture.py").write_text(
@@ -810,6 +866,90 @@ def route_state_tests(runtime: Path) -> None:
         and len(mixed_rows["Demo Fund"]) == 1
         and len(mixed_rows["Second Fund"]) == 1,
         "multiple trusted parsers for one sender were not merged and routed safely",
+    )
+
+    selective = json.loads(json.dumps(config))
+    selective["routes"][0]["max_staleness_days"] = 3660
+    paused_route = json.loads(json.dumps(selective["routes"][0]))
+    paused_route.update(
+        {
+            "sheet": "Paused Fund",
+            "code": "PAUSED01",
+            "paused": True,
+            "pause_reason": "fixture pause",
+        }
+    )
+    selective["routes"].append(paused_route)
+    selective_message = EmailMessage()
+    selective_message["Subject"] = "Bulk HTML NAV fixture"
+    selective_message.set_content(
+        """
+        <table>
+          <tr><th>Product Code</th><th>NAV Date</th><th>Unit NAV</th><th>Cumulative NAV</th></tr>
+          <tr><td>DEMO01</td><td>2026-07-17</td><td>1.10</td><td>1.10</td></tr>
+          <tr><td>PAUSED01</td><td>2026-07-17</td><td>1.20</td><td>1.20</td></tr>
+          <tr><td>OTHER01</td><td>2026-07-17</td><td>1.30</td><td>1.30</td></tr>
+        </table>
+        """,
+        subtype="html",
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [selective_message]
+    }
+    try:
+        selective_rows, selective_report = nav_service.collect_route_rows(selective)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    serialized_selective = json.dumps(selective_report, ensure_ascii=False)
+    check(
+        selective_report["passed"]
+        and len(selective_rows["Demo Fund"]) == 1
+        and "Paused Fund" not in selective_rows
+        and selective_report["ignored_unconfigured_rows"] == 2
+        and selective_report["messages_with_ignored_unconfigured_rows"] == 1
+        and "PAUSED01" not in serialized_selective
+        and "OTHER01" not in serialized_selective,
+        "explicit unconfigured or paused product rows were not ignored safely",
+    )
+
+    unrelated_message = EmailMessage()
+    unrelated_message.set_content(
+        "Product Code | NAV Date | Unit NAV | Cumulative NAV\n"
+        "OTHER01 | 2026-07-17 | 1.30 | 1.30"
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [unrelated_message]
+    }
+    try:
+        unrelated_rows, unrelated_report = nav_service.collect_route_rows(selective)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    check(
+        not unrelated_report["passed"]
+        and not unrelated_rows["Demo Fund"]
+        and unrelated_report["ignored_unconfigured_rows"] == 1
+        and any("no routed NAV rows" in item for item in unrelated_report["errors"]),
+        "an all-unconfigured lookback incorrectly reported managed data success",
+    )
+
+    ambiguous_message = EmailMessage()
+    ambiguous_message.set_content(
+        "NAV Date | Unit NAV | Cumulative NAV\n2026-07-17 | 1.10 | 1.10"
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [ambiguous_message]
+    }
+    try:
+        _, ambiguous_report = nav_service.collect_route_rows(selective)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    check(
+        not ambiguous_report["passed"]
+        and ambiguous_report["ignored_unconfigured_rows"] == 0
+        and any(
+            "not routed to exactly one" in item for item in ambiguous_report["errors"]
+        ),
+        "a code-less ambiguous NAV row was ignored instead of failing closed",
     )
 
 

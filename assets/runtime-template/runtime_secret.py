@@ -84,7 +84,7 @@ def launch_secret_prompt() -> int:
     if not command_processor.is_file():
         raise RuntimeError("找不到 Windows 命令处理程序，无法打开授权码窗口")
     process = subprocess.Popen(
-        [str(command_processor), "/d", "/c", str(launcher)],
+        [str(command_processor), "/d", "/s", "/c", launcher.name],
         cwd=launcher.parent,
         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010),
         close_fds=True,
