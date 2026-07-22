@@ -615,9 +615,7 @@ def parser_tests(runtime: Path) -> None:
     sensitive_path = "\\".join(
         ("C:", "Users", "Example User", "Synced Folder - Team", "客户甲", "估值表.xlsx")
     )
-    sensitive_exception = (
-        f"{sensitive_path} user@example.invalid 产品甲净值 1.2345"
-    )
+    sensitive_exception = f"{sensitive_path} user@example.invalid 产品甲净值 1.2345"
     (parser_dir / "sensitive_failure.py").write_text(
         "class 客户甲净值1234(Exception):\n"
         "    pass\n\n"
@@ -652,8 +650,7 @@ def parser_tests(runtime: Path) -> None:
         raise AssertionError("repeated labelled fields must fail closed")
     try:
         rows_from_text(
-            "估值日期 | 估值基准日 | 单位净值\n"
-            "2026-01-09 | 2026-01-10 | 1.01",
+            "估值日期 | 估值基准日 | 单位净值\n2026-01-09 | 2026-01-10 | 1.01",
             "ambiguous-date-fixture",
         )
     except ParseError as exc:
@@ -671,8 +668,7 @@ def parser_tests(runtime: Path) -> None:
         "cover-before-data-fixture",
     )
     check(
-        len(explanatory_rows) == 1
-        and explanatory_rows[0].date == dt.date(2026, 1, 9),
+        len(explanatory_rows) == 1 and explanatory_rows[0].date == dt.date(2026, 1, 9),
         "a non-header explanation row with two date terms blocked the real data table",
     )
 
@@ -765,8 +761,7 @@ def route_state_tests(runtime: Path) -> None:
         and failed_report["diagnostics"]
         and failed_report["diagnostics"][0]["stage"] == "message_parse"
         and failed_report["diagnostics"][0]["subject_id"]
-        and failed_report["diagnostics"][0]["attachment_types"][0]["suffix"]
-        == ".xlsx"
+        and failed_report["diagnostics"][0]["attachment_types"][0]["suffix"] == ".xlsx"
         and sensitive_subject not in serialized_failure
         and sensitive_attachment not in serialized_failure,
         "parse diagnostics did not identify the failure without leaking sensitive names",
@@ -777,18 +772,13 @@ def route_state_tests(runtime: Path) -> None:
         "sender@example.invalid": [failed_message]
     }
     try:
-        _, local_failure_report = nav_service.collect_route_rows(
-            local_failure_config
-        )
+        _, local_failure_report = nav_service.collect_route_rows(local_failure_config)
     finally:
         nav_service.fetch_authorized_messages = original_fetch
-    serialized_local_failure = json.dumps(
-        local_failure_report, ensure_ascii=False
-    )
+    serialized_local_failure = json.dumps(local_failure_report, ensure_ascii=False)
     check(
         local_failure_report["diagnostics"]
-        and local_failure_report["diagnostics"][0]["error_type"]
-        == "LocalParserError"
+        and local_failure_report["diagnostics"][0]["error_type"] == "LocalParserError"
         and local_failure_report["diagnostics"][0]["root_error_type"]
         == "ControlledParseFailure"
         and "Synced Folder" not in serialized_local_failure
@@ -833,9 +823,7 @@ def lock_tests(runtime: Path) -> None:
         status,
     )
 
-    com_wall_clock = dt.datetime(
-        2026, 7, 23, 12, 0, 0, tzinfo=dt.timezone.utc
-    )
+    com_wall_clock = dt.datetime(2026, 7, 23, 12, 0, 0, tzinfo=dt.timezone.utc)
     local_timezone = _local_timezone()
     local_detail = _task_time_detail(com_wall_clock, local_timezone)
     check(
@@ -1056,9 +1044,7 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     try:
         managed_array_sheet = managed_array_workbook["Demo Fund"]
         managed_array_sheet["G4"] = None
-        managed_array_sheet["G3"] = ArrayFormula(
-            ref="G3:G4", text="=D3:D4*2"
-        )
+        managed_array_sheet["G3"] = ArrayFormula(ref="G3:G4", text="=D3:D4*2")
         managed_array_workbook.save(managed_array_book)
     finally:
         managed_array_workbook.close()
@@ -2282,9 +2268,7 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
     prepared.append(
         ["产品代码", "产品名称", "单位净值", "累计单位净值", "净值日期", "收益（周度）"]
     )
-    prepared.append(
-        ["NEW002", "新增示例产品", 1.01, None, dt.date(2026, 1, 2), None]
-    )
+    prepared.append(["NEW002", "新增示例产品", 1.01, None, dt.date(2026, 1, 2), None])
     prepared.append(["累计", None, None, None, None, None])
     existing_book.create_sheet("分析页")["A1"] = "用户分析"
     existing_book.save(existing_target)
@@ -2360,9 +2344,7 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         existing_updated,
         {
             "参考产品": [
-                NavRow(
-                    dt.date(2025, 12, 26), 1.0, 1.0, "BASE001", "fixture"
-                ),
+                NavRow(dt.date(2025, 12, 26), 1.0, 1.0, "BASE001", "fixture"),
                 NavRow(dt.date(2026, 1, 2), 1.01, 1.01, "BASE001", "fixture"),
             ],
             "用户新建页": [
@@ -2372,9 +2354,7 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         },
     )
     adopted_report = next(
-        item
-        for item in adopted_validation["routes"]
-        if item["sheet"] == "用户新建页"
+        item for item in adopted_validation["routes"] if item["sheet"] == "用户新建页"
     )
     check(
         adopted_validation["passed"]
@@ -2385,9 +2365,7 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         existing_updated, existing_updated["routes"][0], "照参考新增"
     )
     check(
-        spec.header_row == 2
-        and spec.data_row == 3
-        and spec.target_summary_row == 4,
+        spec.header_row == 2 and spec.data_row == 3 and spec.target_summary_row == 4,
         "clone specification did not preserve the reference sheet structure",
     )
 
@@ -2435,16 +2413,14 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         cloned = openpyxl.load_workbook(existing_target, data_only=False)
         try:
             check(
-                cloned.sheetnames
-                == ["参考产品", "照参考新增", "用户新建页", "分析页"]
+                cloned.sheetnames == ["参考产品", "照参考新增", "用户新建页", "分析页"]
                 and cloned["照参考新增"]["A1"].value is None
                 and cloned["照参考新增"]["A2"].value == "产品代码"
                 and cloned["照参考新增"]["A3"].value == "CLONE003"
                 and cloned["照参考新增"]["B3"].value == "复制新增示例产品"
                 and cloned["照参考新增"]["C3"].value is None
                 and cloned["照参考新增"]["D3"].value is None
-                and cloned["照参考新增"]["E3"].value.date()
-                == dt.date(2026, 2, 6)
+                and cloned["照参考新增"]["E3"].value.date() == dt.date(2026, 2, 6)
                 and cloned["照参考新增"]["F3"].value is None
                 and cloned["照参考新增"]["A4"].value == "累计"
                 and cloned["照参考新增"]["F4"].value is None
