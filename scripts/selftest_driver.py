@@ -1272,60 +1272,94 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     validation = validate_history(config, rows)
     check(validation["passed"], f"historical validation failed: {validation['errors']}")
 
-    forward_only_config = json.loads(json.dumps(config))
-    forward_only_config["routes"][0]["subject_contains"] = "DEMO01 NAV statement"
-    forward_only_rows = {
+    reviewed_config = json.loads(json.dumps(config))
+    reviewed_rows = {
         "Demo Fund": [
             NavRow(dt.date(2026, 1, 16), 1.02, 1.02, "DEMO01", "fixture"),
-            NavRow(dt.date(2026, 1, 23), 1.015, 1.015, "DEMO01", "fixture"),
         ]
     }
-    forward_validation = validate_history(forward_only_config, forward_only_rows)
+    reviewed_validation = validate_history(reviewed_config, reviewed_rows)
     check(
-        forward_validation["passed"]
-        and forward_validation["routes"][0]["cold_start_kind"] == "summary-forward-only"
-        and forward_validation["routes"][0]["matched_history_dates"] == 0
-        and forward_validation["warnings"],
-        "exact-code forward-only summary onboarding did not reach first preview",
+        reviewed_validation["passed"]
+        and reviewed_validation["routes"][0]["cold_start_kind"]
+        == "summary-reviewed-preview"
+        and reviewed_validation["routes"][0]["matched_history_dates"] == 0
+        and reviewed_validation["warnings"],
+        "a unique product-code match with one new date did not reach first preview",
     )
-    forward_plan = build_preview(forward_only_config, forward_only_rows)
+    reviewed_plan = build_preview(reviewed_config, reviewed_rows)
     check(
-        forward_plan["sheets"][0]["new_dates"] == ["2026-01-16", "2026-01-23"],
-        "forward-only onboarding preview did not append both new dates",
+        reviewed_plan["sheets"][0]["new_dates"] == ["2026-01-16"],
+        "review-gated onboarding preview did not append its new date",
     )
-    unscoped_forward = json.loads(json.dumps(forward_only_config))
-    unscoped_forward["routes"][0].pop("subject_contains")
-    unscoped_validation = validate_history(unscoped_forward, forward_only_rows)
+
+    name_only_config = json.loads(json.dumps(config))
+    name_only_config["routes"][0].update(
+        {"code": None, "product_name": "Example Fund", "allow_sender_only": True}
+    )
+    name_only_rows = {
+        "Demo Fund": [
+            NavRow(dt.date(2026, 1, 16), 1.02, 1.02, None, "fixture"),
+        ]
+    }
+    name_only_validation = validate_history(name_only_config, name_only_rows)
     check(
-        not unscoped_validation["passed"]
-        and any(
-            "only 0 verified historical dates" in error
-            for error in unscoped_validation["errors"]
-        ),
-        "zero-overlap summary onboarding was accepted without a subject scope",
+        name_only_validation["passed"]
+        and name_only_validation["routes"][0]["cold_start_kind"]
+        == "summary-reviewed-preview",
+        "a unique product-name match did not reach first preview without a code",
     )
-    code_free_subject = json.loads(json.dumps(forward_only_config))
-    code_free_subject["routes"][0]["subject_contains"] = "weekly NAV statement"
-    code_free_validation = validate_history(code_free_subject, forward_only_rows)
+    name_only_plan = build_preview(name_only_config, name_only_rows)
+    name_only_preview = openpyxl.load_workbook(
+        name_only_plan["preview_path"], data_only=False
+    )
+    try:
+        check(
+            name_only_preview["Demo Fund"]["C4"].value == "Example Fund",
+            "name-only onboarding did not preserve the product identity in preview",
+        )
+    finally:
+        name_only_preview.close()
+
+    mixed_name_rows = {
+        "Demo Fund": [
+            NavRow(dt.date(2026, 1, 16), 1.02, 1.02, "CODEA", "fixture"),
+            NavRow(dt.date(2026, 1, 23), 1.03, 1.03, "CODEB", "fixture"),
+        ]
+    }
+    mixed_name_validation = validate_history(name_only_config, mixed_name_rows)
     check(
-        not code_free_validation["passed"],
-        "zero-overlap summary onboarding accepted a subject scope without the product code",
+        not mixed_name_validation["passed"],
+        "name-only onboarding accepted multiple product codes in one routed range",
     )
-    embedded_code_subject = json.loads(json.dumps(forward_only_config))
-    embedded_code_subject["routes"][0]["subject_contains"] = "XDEMO01Y NAV statement"
-    embedded_code_validation = validate_history(
-        embedded_code_subject, forward_only_rows
-    )
+
+    one_match_config = json.loads(json.dumps(config))
+    one_match_rows = {
+        "Demo Fund": [
+            NavRow(dt.date(2026, 1, 9), 1.01, 1.01, "DEMO01", "fixture"),
+            NavRow(dt.date(2026, 1, 16), 1.02, 1.02, "DEMO01", "fixture"),
+        ]
+    }
+    one_match_validation = validate_history(one_match_config, one_match_rows)
     check(
-        not embedded_code_validation["passed"],
-        "zero-overlap summary onboarding accepted a product code embedded in another token",
+        one_match_validation["passed"]
+        and one_match_validation["routes"][0]["matched_history_dates"] == 1,
+        "one matching historical date still blocked a review-gated preview",
     )
-    wrong_code_forward = json.loads(json.dumps(forward_only_config))
-    wrong_code_forward["routes"][0]["code"] = "OTHER01"
-    wrong_code_validation = validate_history(wrong_code_forward, forward_only_rows)
+
+    wrong_name_config = json.loads(json.dumps(name_only_config))
+    wrong_name_config["routes"][0]["product_name"] = "Different Example Fund"
+    wrong_name_validation = validate_history(wrong_name_config, name_only_rows)
+    check(
+        not wrong_name_validation["passed"],
+        "review-gated onboarding accepted a conflicting product name",
+    )
+    wrong_code_config = json.loads(json.dumps(reviewed_config))
+    wrong_code_config["routes"][0]["code"] = "OTHER01"
+    wrong_code_validation = validate_history(wrong_code_config, reviewed_rows)
     check(
         not wrong_code_validation["passed"],
-        "zero-overlap summary onboarding was accepted with conflicting product identity",
+        "review-gated onboarding accepted a conflicting product code",
     )
     plan = build_preview(config, rows)
     check(
@@ -1678,7 +1712,12 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     plain_workbook.close()
     plain_config = config_for(runtime, plain_book)
     plain_config["routes"][0].update(
-        {"sheet": "Plain Fund", "code": None, "benchmark": None}
+        {
+            "sheet": "Plain Fund",
+            "code": None,
+            "product_name": "Plain Fund",
+            "benchmark": None,
+        }
     )
     plain_rows = {
         "Plain Fund": [
@@ -1691,6 +1730,16 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     check(
         plain_plan["sheets"][0]["new_dates"] == ["2026-01-16"],
         "workbook without a return column could not produce a preview",
+    )
+    plain_sparse_rows = {
+        "Plain Fund": [NavRow(dt.date(2026, 1, 16), 1.02, 1.02, None, "fixture")]
+    }
+    plain_sparse_validation = validate_history(plain_config, plain_sparse_rows)
+    check(
+        plain_sparse_validation["passed"]
+        and plain_sparse_validation["routes"][0]["cold_start_kind"]
+        == "summary-reviewed-preview",
+        "a worksheet-name product identity did not unlock a sparse first preview",
     )
 
     reserved_book = runtime / "summary-reserved-cold-start.xlsx"
@@ -1712,6 +1761,26 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
             "benchmark": None,
             "return_basis": "cumulative",
         }
+    )
+    single_reserved_rows = {
+        "Reserved Fund": [NavRow(dt.date(2026, 1, 2), 1.0, 1.0, "DEMO43", "fixture")]
+    }
+    single_reserved_validation = validate_history(reserved_config, single_reserved_rows)
+    check(
+        single_reserved_validation["passed"]
+        and single_reserved_validation["routes"][0]["cold_start_kind"]
+        == "summary-reserved-row",
+        "one real email date did not unlock a reserved-row first preview",
+    )
+    single_reserved_plan = build_preview(
+        reserved_config,
+        single_reserved_rows,
+        single_reserved_validation["warnings"],
+    )
+    check(
+        single_reserved_plan["sheets"][0]["filled_existing_rows"] == [2]
+        and single_reserved_plan["sheets"][0]["new_dates"] == ["2026-01-02"],
+        "one-date reserved-row preview did not populate the placeholder",
     )
     reserved_rows = {
         "Reserved Fund": [

@@ -410,6 +410,11 @@ def existing_rows(
             "code": normalize_code(sheet.cell(row, layout.columns.get("code", 0)).value)
             if layout.columns.get("code")
             else None,
+            "name": str(
+                sheet.cell(row, layout.columns.get("name", 0)).value or ""
+            ).strip()
+            if layout.columns.get("name")
+            else None,
         }
     if ordered_dates != sorted(ordered_dates):
         raise WorkbookError(f"{sheet.title}: dated NAV rows are not in ascending order")
@@ -478,33 +483,37 @@ def _summary_reserved_row(
     return date, row
 
 
-def _summary_forward_only_onboarding(
+def _summary_reviewed_onboarding(
     layout: Layout,
     route: dict[str, Any],
     existing: dict[dt.date, dict[str, Any]],
     selected_dates: set[dt.date],
     candidates: list[NavRow],
-    minimum: int,
-    matches: int,
     conflicts: int,
-) -> bool:
-    """Allow a narrowly proven first preview when mailbox history starts after Excel."""
+) -> str | None:
+    """Allow a review-gated preview when identity is unique but history is sparse."""
 
     expected_code = normalize_code(route.get("code"))
-    subject_filter = str(route.get("subject_contains") or "").strip()
-    subject_has_exact_code = bool(
-        expected_code
-        and re.search(
-            r"(?<![A-Za-z0-9])"
-            + r"[^A-Za-z0-9]*".join(re.escape(char) for char in expected_code)
-            + r"(?![A-Za-z0-9])",
-            subject_filter,
-            re.IGNORECASE,
-        )
-    )
+    expected_name = _norm(route.get("product_name"))
     observed_codes = {
         values["code"] for values in existing.values() if values.get("code")
     }
+    observed_names = {
+        _norm(values["name"]) for values in existing.values() if values.get("name")
+    }
+    candidate_codes = {candidate.code for candidate in candidates if candidate.code}
+    code_identity = bool(
+        expected_code
+        and layout.columns.get("code")
+        and observed_codes == {expected_code}
+    )
+    name_identity = bool(
+        expected_name
+        and (
+            _norm(layout.sheet) == expected_name
+            or (layout.columns.get("name") and observed_names == {expected_name})
+        )
+    )
     complete_history = all(
         values.get("unit") is not None
         and (
@@ -512,23 +521,35 @@ def _summary_forward_only_onboarding(
         )
         for values in existing.values()
     )
-    return bool(
+    if not (
         layout.mode == "summary"
-        and matches == 0
         and conflicts == 0
-        and expected_code
-        and layout.columns.get("code")
-        and observed_codes == {expected_code}
-        and subject_has_exact_code
-        and len(existing) >= minimum
+        and existing
         and complete_history
-        and len(selected_dates) >= minimum
         and selected_dates
-        and max(existing) < min(selected_dates)
         and candidates
-        and all(candidate.code == expected_code for candidate in candidates)
-        and all(candidate.date > max(existing) for candidate in candidates)
+        and len(candidate_codes) <= 1
+        and (code_identity or name_identity)
+        and all(
+            candidate.date in existing or candidate.date > max(existing)
+            for candidate in candidates
+        )
+    ):
+        return None
+    if (
+        code_identity
+        and expected_code
+        and any(candidate.code not in {None, expected_code} for candidate in candidates)
+    ):
+        return None
+    identity = (
+        "product code and product name"
+        if code_identity and name_identity
+        else "product code"
+        if code_identity
+        else "product name"
     )
+    return identity
 
 
 def _header_data_frequency(
@@ -795,12 +816,41 @@ def validate_history(
                         and abs(float(observed["cumulative"]) - expected_cumulative)
                         <= tolerance
                     )
-                code_ok = (
-                    not route.get("code")
-                    or not layout.columns.get("code")
-                    or observed["code"] == normalize_code(route.get("code"))
+                expected_code = normalize_code(route.get("code"))
+                code_verified = bool(
+                    expected_code
+                    and layout.columns.get("code")
+                    and observed["code"] == expected_code
                 )
-                if unit_ok and cumulative_ok and code_ok:
+                expected_name = _norm(route.get("product_name"))
+                name_verified = bool(
+                    expected_name
+                    and (
+                        _norm(layout.sheet) == expected_name
+                        or (
+                            layout.columns.get("name")
+                            and _norm(observed.get("name")) == expected_name
+                        )
+                    )
+                )
+                code_conflict = bool(
+                    expected_code
+                    and layout.columns.get("code")
+                    and observed["code"]
+                    and observed["code"] != expected_code
+                )
+                name_conflict = bool(
+                    expected_name
+                    and layout.columns.get("name")
+                    and observed.get("name")
+                    and _norm(observed["name"]) != expected_name
+                )
+                identity_ok = (
+                    code_verified
+                    or name_verified
+                    or not (code_conflict or name_conflict)
+                )
+                if unit_ok and cumulative_ok and identity_ok:
                     matches += 1
                 else:
                     conflicts += 1
@@ -809,27 +859,26 @@ def validate_history(
                     )
             summary_cold_start = reserved_date is not None
             template_cold_start = layout.mode == "template" and matches < minimum
-            summary_forward_only = (
+            summary_review_identity = (
                 reserved_date is None
-                and _summary_forward_only_onboarding(
+                and matches < minimum
+                and _summary_reviewed_onboarding(
                     layout,
                     route,
                     existing,
                     selected_dates,
                     candidates,
-                    minimum,
-                    matches,
                     conflicts,
                 )
             )
             if summary_cold_start:
-                if len(candidate_dates) < minimum:
+                if not candidate_dates:
                     errors.append(
-                        f"{sheet_name}: summary-mode cold start found only {len(candidate_dates)} email dates; {minimum} required"
+                        f"{sheet_name}: summary-mode cold start needs at least one real email NAV date"
                     )
-                if candidate_dates and len(candidate_dates) >= minimum:
+                else:
                     warnings.append(
-                        f"{sheet_name}: detected a reserved summary row cold start; replace the empty placeholder with the earliest email NAV, keep the summary row, and review the first preview"
+                        f"{sheet_name}: detected a reserved summary row cold start with {len(candidate_dates)} email date(s); replace the empty placeholder with the earliest email NAV, keep the summary row, and review the first preview"
                     )
             elif template_cold_start:
                 if candidate_dates and not conflicts:
@@ -840,9 +889,9 @@ def validate_history(
                     errors.append(
                         f"{sheet_name}: bundled template cold start needs at least one real email NAV date"
                     )
-            elif summary_forward_only:
+            elif summary_review_identity:
                 warnings.append(
-                    f"{sheet_name}: no overlapping NAV dates were available, but exact product-code and subject-scoped evidence proves a forward-only append; review the first preview"
+                    f"{sheet_name}: only {matches} historical date(s) were verified, but a unique {summary_review_identity} match allows a review-gated preview; verify the product, dates and NAV values before approval"
                 )
             elif matches < minimum:
                 message = f"{sheet_name}: only {matches} verified historical dates; {minimum} required"
@@ -858,15 +907,15 @@ def validate_history(
                     "sheet_mode": layout.mode,
                     "cold_start": summary_cold_start
                     or template_cold_start
-                    or summary_forward_only
+                    or bool(summary_review_identity)
                     or (layout.mode == "append" and matches < minimum),
                     "cold_start_kind": (
                         "summary-reserved-row"
                         if summary_cold_start
                         else "bundled-template"
                         if template_cold_start
-                        else "summary-forward-only"
-                        if summary_forward_only
+                        else "summary-reviewed-preview"
+                        if summary_review_identity
                         else "append"
                         if layout.mode == "append" and matches < minimum
                         else None
@@ -1305,8 +1354,9 @@ def _write_nav_values(
     ]
     if layout.columns.get("cumulative"):
         values.append((layout.columns["cumulative"], effective_cumulative(nav, route)))
-    if layout.columns.get("code") and route.get("code"):
-        values.append((layout.columns["code"], normalize_code(route["code"])))
+    code_value = normalize_code(route.get("code")) or nav.code
+    if layout.columns.get("code") and code_value:
+        values.append((layout.columns["code"], code_value))
     if layout.columns.get("name") and route.get("product_name"):
         values.append((layout.columns["name"], str(route["product_name"]).strip()))
     for column, value in values:
@@ -1374,12 +1424,9 @@ def build_preview(
             reserved_nav: NavRow | None = None
             if reserved_date is not None:
                 distinct_dates = {row.date for row in candidates}
-                minimum = int(
-                    (config.get("validation") or {}).get("minimum_history_dates", 2)
-                )
-                if len(distinct_dates) < minimum:
+                if not distinct_dates:
                     raise WorkbookError(
-                        f"{sheet_name}: summary-mode cold start needs at least {minimum} email NAV dates"
+                        f"{sheet_name}: summary-mode cold start needs at least one real email NAV date"
                     )
                 reserved_nav = candidates[0]
             elif layout.mode == "template" and not current:
