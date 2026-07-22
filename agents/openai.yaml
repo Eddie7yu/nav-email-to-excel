@@ -1,4 +1,4 @@
 interface:
   display_name: "净值邮件写入 Excel"
-  short_description: "授权一次，保留既有表，支持新增产品并持续安全更新"
-  default_prompt: "请使用 $nav-email-to-excel 部署或维护净值邮件自动化：保留已有工作簿，自动发现并接管产品；新增产品时沿用用户指定格式，首次预览由我验收后再自动备份更新。"
+  short_description: "成熟路径加自主探索，保留既有表并持续安全更新"
+  default_prompt: "请使用 $nav-email-to-excel 部署或维护净值邮件自动化：优先复用已验证路径，未覆盖情况在本机自主诊断和扩展；保留已有工作簿，首次预览由我验收，正式更新继续验证、备份并在异常时保持原表不变。"
