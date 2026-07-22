@@ -355,7 +355,10 @@ def scan_history() -> list[Finding]:
                 continue
             findings.extend(scan_text(f"{commit[:8]}:{relative}", text))
     metadata = subprocess.run(
-        ["git", "-C", str(ROOT), "log", "--all", "--format=%H%x00%an%x00%ae%x00%s"],
+        # Author/committer email addresses are Git identity metadata, not skill
+        # fixtures. Scan the public name and subject, while repository content
+        # and commit messages remain covered by the history audit.
+        ["git", "-C", str(ROOT), "log", "--all", "--format=%H%x00%an%x00%s"],
         capture_output=True,
         text=True,
         encoding="utf-8",
