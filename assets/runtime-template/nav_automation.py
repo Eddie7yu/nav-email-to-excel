@@ -74,7 +74,7 @@ def require_approved(config: dict[str, Any]) -> None:
     current = status(config)
     if not current["approved"]:
         raise AutomationError(
-            "自动更新尚未启用：请先检查第一次预览并完成一次人工批准写入；"
+            "自动更新尚未启用：请先检查第一次预览或零新增基线报告并完成一次人工批准；"
             "如果配置刚被修改，请重新预览和批准一次"
         )
 
@@ -87,8 +87,10 @@ def revoke() -> dict[str, Any]:
 
 def discard_staging(plan: dict[str, Any] | None) -> None:
     if plan:
-        value = plan.get("preview_path")
-        if value:
+        for field in ("preview_path", "review_path"):
+            value = plan.get(field)
+            if not value:
+                continue
             preview = Path(str(value)).resolve()
             if preview.parent == (ROOT / "previews").resolve():
                 preview.unlink(missing_ok=True)

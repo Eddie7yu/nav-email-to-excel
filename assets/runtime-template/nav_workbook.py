@@ -1204,7 +1204,7 @@ def build_preview(
         (
             path
             for path in preview_dir.glob("preview-*")
-            if path.suffix.lower() in {".xlsx", ".xlsm"}
+            if path.suffix.lower() in {".xlsx", ".xlsm", ".txt"}
         ),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
@@ -1219,6 +1219,7 @@ def build_preview(
     keep_vba = master.suffix.lower() == ".xlsm"
     workbook = openpyxl.load_workbook(preview, data_only=False, keep_vba=keep_vba)
     plan_sheets: list[dict[str, Any]] = []
+    baseline_routes: list[dict[str, Any]] = []
     try:
         for route in active_routes(config):
             sheet_name = str(route["sheet"])
@@ -1260,6 +1261,27 @@ def build_preview(
                 candidates[1:]
                 if reserved_nav is not None
                 else [row for row in candidates if row.date not in current]
+            )
+            baseline_routes.append(
+                {
+                    "sheet": sheet_name,
+                    "sheet_mode": layout.mode,
+                    "data_frequency": data_frequency,
+                    "data_frequency_source": frequency_source,
+                    "matched_history_dates": len(
+                        set(current) & {row.date for row in candidates}
+                    ),
+                    "workbook_latest_date": (
+                        max(current).isoformat() if current else None
+                    ),
+                    "email_latest_date": (
+                        max(row.date for row in candidates).isoformat()
+                        if candidates
+                        else None
+                    ),
+                    "pending_dates": len(additions)
+                    + (1 if reserved_nav is not None else 0),
+                }
             )
             if not additions and reserved_nav is None:
                 continue
@@ -1407,12 +1429,46 @@ def build_preview(
         "master_sha256": file_sha256(master),
         "preview_path": str(preview.resolve()) if plan_sheets else None,
         "preview_sha256": file_sha256(preview) if plan_sheets else None,
+        "approval_kind": (
+            "workbook-preview" if plan_sheets else "validated-no-change"
+        ),
+        "review_path": None,
+        "review_sha256": None,
         "warnings": list(warnings or []),
         "sheets": plan_sheets,
     }
     if not plan_sheets:
         preview.unlink(missing_ok=True)
-        (STATE_ROOT / "plan.json").unlink(missing_ok=True)
+        review = preview.with_suffix(".txt")
+        lines = [
+            "零新增基线验收报告",
+            "",
+            f"生成时间：{plan['created']}",
+            "结论：邮箱历史与现有工作簿已通过校验，当前没有待写入的新日期。",
+            "正式工作簿：未修改；批准本报告不会创建备份或写入工作簿。",
+            "批准用途：记录当前写表配置的自动更新权限，供后续计划任务使用。",
+            "",
+            f"受管产品页数量：{len(baseline_routes)}",
+        ]
+        for item in baseline_routes:
+            lines.extend(
+                [
+                    "",
+                    f"产品页：{item['sheet']}",
+                    f"工作表模式：{item['sheet_mode']}",
+                    f"数据频率：{item['data_frequency']}（{item['data_frequency_source']}）",
+                    f"已核验历史日期数：{item['matched_history_dates']}",
+                    f"工作簿最新日期：{item['workbook_latest_date'] or '无'}",
+                    f"邮箱最新日期：{item['email_latest_date'] or '无'}",
+                    f"待写入日期数：{item['pending_dates']}",
+                ]
+            )
+        if warnings:
+            lines.extend(["", "警告：", *[f"- {item}" for item in warnings]])
+        review.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        plan["review_path"] = str(review.resolve())
+        plan["review_sha256"] = file_sha256(review)
+        write_json_atomic(STATE_ROOT / "plan.json", plan)
         return plan
     try:
         validate_preview(config, plan)
