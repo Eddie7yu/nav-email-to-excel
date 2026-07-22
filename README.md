@@ -72,7 +72,7 @@ Get-Content -Raw -Encoding utf8 SKILL.md
 AI 进入已经创建的运行目录的 `app/`，生成虚构预览：
 
 ```powershell
-cd D:\nav-runtime\app
+cd D:\data\净值自动化\app
 .\.venv\Scripts\python.exe navctl.py demo prepare
 ```
 
@@ -92,7 +92,7 @@ cd D:\nav-runtime\app
 
 ## 首次部署大致流程
 
-1. AI 完整阅读 [SKILL.md](SKILL.md) 和[配置说明](references/configuration.md)，创建短路径运行环境并完成离线演练。
+1. AI 完整阅读 [SKILL.md](SKILL.md) 和[配置说明](references/configuration.md)，默认在工作簿旁创建独立的 `净值自动化/` 运行环境并完成离线演练。
 2. AI 获取已有工作簿路径；如果没有，则获取希望新建的 `.xlsx` 路径。再获取收件邮箱账号；IMAP 设置优先从现有客户端或服务商资料中核实。
 3. AI 运行 `navctl.py secret launch` 主动弹出可见窗口；用户只需在该窗口隐藏粘贴一次授权码，AI 随后用 `secret status` 检查，不要求用户输入终端命令。
 4. AI 运行 `navctl.py propose`，从邮箱自动发现发件人、产品代码、主题与到达时间，生成路由和写表配置；已有表同时参与结构判断。随后给出运行时间建议，并询问用户希望每周一次、工作日每天或哪些星期、几点自动更新。
@@ -102,22 +102,24 @@ cd D:\nav-runtime\app
 
 需要夏普比率、最大回撤、年化收益等专业指标时，先由本工具生成经核验的净值序列，再让 AI 在未托管分析工作表或单独文件中按一致口径计算并说明假设。详见[配置说明中的“派生专业指标”](references/configuration.md#派生专业指标)。
 
-Windows 运行目录请优先使用 `D:\nav-runtime` 之类的短本地路径。引导程序把 116 个字符定义为当前支持上限，为内部 `app/` 和深层依赖保留空间，并会在创建文件前拒绝更长路径；这是本工具的可靠部署边界，不是 Windows 的通用路径上限。
+Windows 默认把运行目录放在工作簿同级的 `净值自动化/`，一份工作簿对应一套配置、入口、备份、日志和计划任务。引导程序把 116 个字符定义为当前支持上限，为内部 `app/` 和深层依赖保留空间，并会在创建文件前拒绝更长路径；默认位置过长、不可写或已有同名目录时，再显式选择 `D:\nav-runtime` 之类的新短本地路径。这是本工具的可靠部署边界，不是 Windows 的通用路径上限。
 
 ## 交付给普通用户的目录
 
 引导完成后的运行目录已经分成“普通用户入口”和“内部程序”两层：
 
 ```text
-D:\nav-runtime\
-├─ 使用说明.txt
-├─ 首次授权.bat
-├─ 查看状态.bat
-├─ 手动更新.bat
-├─ previews\
-├─ backups\
-├─ logs\
-└─ app\                 # Python、配置、状态、解析器和虚拟环境
+D:\data\
+├─ nav.xlsx
+└─ 净值自动化\
+   ├─ 使用说明.txt
+   ├─ 首次授权.bat
+   ├─ 查看状态.bat
+   ├─ 手动更新.bat
+   ├─ previews\
+   ├─ backups\
+   ├─ logs\
+   └─ app\              # Python、配置、状态、解析器和虚拟环境
 ```
 
 普通用户日常只接触中文入口和三个结果目录，不需要进入 `app/`。AI 执行命令、维护配置或排错时才进入 `app/`；不得把新增脚本、临时导出、诊断结果或配置文件堆在用户根目录。详细边界和交付检查见[运行目录分层规范](references/runtime-layout.md)。
@@ -125,7 +127,7 @@ D:\nav-runtime\
 已安装自动更新后，AI 可用以下命令查看最近一次运行、写入行数和备份路径：
 
 ```powershell
-cd D:\nav-runtime\app
+cd D:\data\净值自动化\app
 .\.venv\Scripts\python.exe navctl.py schedule status
 ```
 
@@ -137,7 +139,7 @@ cd D:\nav-runtime\app
 不要在旧运行目录中覆盖脚本、替换 `.venv` 或直接复制新版模板。安全升级采用“新建运行目录、迁移配置、重新验收”，旧目录在验收完成前保留为回退副本：
 
 1. 进入旧运行目录的 `app/` 执行 `navctl.py schedule remove`，避免新旧任务同时运行。
-2. 更新干净的 Skill 仓库，在新的短路径重新运行 `scripts/bootstrap.py`；正式工作簿路径保持不变。
+2. 更新干净的 Skill 仓库，为同一正式工作簿显式指定一个新的短运行目录重新运行 `scripts/bootstrap.py`（例如 `--destination "D:\nav-runtime-upgrade"`）；默认的同级 `净值自动化/` 仍在使用时不会被覆盖。
 3. 以新生成的 `app/config.json` 为基础，让 AI 迁移并复核 `routes`、`column_overrides`、`style`、`schedule`、`validation` 和 `retention`。不要用旧文件整体覆盖，以免带回旧的结构版本或 `runtime_id`。
 4. 如有本地 `app/parsers/`，逐个审阅后复制到新运行目录的同名位置；不要迁移 `app/.venv`、密钥、`plan.json`、`run.lock`、预览、日志或定时状态文件。
 5. 在新目录重新执行 `secret launch` 并由 AI 用 `secret status` 复查，再完成离线演练、验证和一次预览。新预览确认后重新安装自动更新任务并停用旧目录；不要迁移 `automation-approval.json`。

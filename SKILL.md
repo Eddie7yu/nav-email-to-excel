@@ -18,44 +18,45 @@ description: 部署、配置、验证、运行或修复本地 IMAP 邮箱到 Exc
 - 产品无法唯一识别、日期或数值冲突、累计净值口径未确认、出现未知列、基准缺失或工作簿结构变化时，必须停止，不得猜测。历史不足时，只有显式 `append`、满足严格条件的 `summary` 预留行，或程序生成的内置模板冷启动可以继续；都必须具备产品名称或代码，并人工检查警告与第一次预览。
 - 真实邮箱、产品和工作簿可以在用户本机用于发现和配置，但不得写入公开 Skill、测试或 Git 提交。授权码不得出现在聊天、命令参数或日志中。
 - 运行目录必须与 Skill 目录分开，避免升级 Skill 时覆盖本地配置或数据。
+- 一份工作簿对应一套独立自动化。默认把运行目录创建为工作簿同级的 `净值自动化/`；不要把程序文件散放在工作簿所在目录，也不要让不同工作簿共用同一套配置、密钥、日志或计划任务。只有默认路径过长、不可写或名称冲突时，才用 `--destination` 选择另一个短本地目录。
 - 交付给普通用户的运行目录必须保持简洁。根目录只保留中文说明、可双击入口、`previews/`、`backups/`、`logs/` 和内部 `app/`；Python 源码、隔离环境、配置、状态、本地解析器和定时任务脚本全部放进 `app/`。不得把调试脚本、临时导出、检查结果或新增 `.py/.ps1/.json` 文件堆在用户根目录；临时诊断放进 `app/diagnostics/`，交付前删除。
 
 ## 创建本地运行目录
 
-获取已有工作簿路径；如果用户没有工作簿，获取希望创建的新 `.xlsx` 完整路径。再获取收件邮箱账号。目标目录使用短本地路径；IMAP 主机优先从现有邮件客户端设置中读取，不足时再查 [references/email-providers.md](references/email-providers.md) 或服务商官方文档。只有确实无法确定账号认证方式时才询问用户。
+获取已有工作簿路径；如果用户没有工作簿，获取希望创建的新 `.xlsx` 完整路径。再获取收件邮箱账号。引导程序默认在工作簿旁创建独立的 `净值自动化/`；IMAP 主机优先从现有邮件客户端设置中读取，不足时再查 [references/email-providers.md](references/email-providers.md) 或服务商官方文档。只有确实无法确定账号认证方式时才询问用户。
 
 确认后在 Skill 根目录运行：
 
 ```powershell
-python scripts/bootstrap.py --destination "D:\nav-runtime" --workbook "D:\data\nav.xlsx" --email "user@example.com" --imap-host "imap.example.com"
+python scripts/bootstrap.py --workbook "D:\data\nav.xlsx" --email "user@example.com" --imap-host "imap.example.com"
 ```
 
 没有现成工作簿时，登记一个尚不存在的新路径；此命令只创建运行目录，不会提前生成空壳工作簿：
 
 ```powershell
-python scripts/bootstrap.py --destination "D:\nav-runtime" --new-workbook "D:\data\nav.xlsx" --email "user@example.com" --imap-host "imap.example.com"
+python scripts/bootstrap.py --new-workbook "D:\data\nav.xlsx" --email "user@example.com" --imap-host "imap.example.com"
 ```
 
-`--workbook` 与 `--new-workbook` 必须二选一。前者要求文件已经存在；后者要求目标尚不存在且只能是 `.xlsx`，任何已有文件都会被拒绝覆盖。
+`--workbook` 与 `--new-workbook` 必须二选一。前者要求文件已经存在；后者要求目标尚不存在且只能是 `.xlsx`，任何已有文件都会被拒绝覆盖。省略 `--destination` 时，运行目录固定推导为工作簿同级的 `净值自动化/`；若该目录已经存在，引导程序失败关闭，不会复用或覆盖。只有路径预算或目录冲突确实不允许默认位置时，才显式传入新的 `--destination`。
 
 引导程序会创建隔离的虚拟环境、安装锁定版本的依赖，并生成本地配置。
 
 在中国大陆网络，或直连默认 PyPI 已明显缓慢、超时后，AI 应只为本次部署启用清华镜像：
 
 ```powershell
-python scripts/bootstrap.py --destination "D:\nav-runtime" --workbook "D:\data\nav.xlsx" --email "user@example.com" --imap-host "imap.example.com" --index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+python scripts/bootstrap.py --workbook "D:\data\nav.xlsx" --email "user@example.com" --imap-host "imap.example.com" --index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
 ```
 
 `--index-url` 只传给本次运行目录的依赖安装，不会修改用户的 pip 配置。不得要求用户运行 `pip config set global.index-url`，也不得静默改变用户其他 Python 项目的软件源；网络正常时省略此参数。
 
-Windows 必须优先选择 `D:\nav-runtime` 一类的短本地目录。引导程序把 116 个字符作为当前可靠支持上限，为内部 `app/` 和深层依赖保留路径预算；路径过长时必须改用短目录，不得绕过预检或要求用户修改公司电脑的组策略。
+Windows 优先使用工作簿同级的 `净值自动化/`，让工作簿与其配置、入口、备份和日志形成一套清晰的本地交付。引导程序把 116 个字符作为当前可靠支持上限，为内部 `app/` 和深层依赖保留路径预算；默认位置过长、不可写或已有同名目录时，改用 `--destination "D:\nav-runtime"` 一类的新短本地目录，不得绕过预检、覆盖旧运行目录或要求用户修改公司电脑的组策略。
 
 引导完成后必须按照 [references/runtime-layout.md](references/runtime-layout.md) 检查目录分层：用户根目录应包含 `使用说明.txt`、`首次授权.bat`、`查看状态.bat`、`手动更新.bat`、`previews/`、`backups/`、`logs/` 和 `app/`。普通用户只接触中文入口和三个结果目录；`app/` 由 AI 管理，不要求用户进入、理解或修改。后续所有命令都在 `app/` 中执行：
 
 AI 在后台运行一次完全离线的虚构演练，不要求用户参与：
 
 ```powershell
-cd D:\nav-runtime\app
+cd D:\data\净值自动化\app
 .\.venv\Scripts\python.exe navctl.py demo prepare
 ```
 
@@ -71,7 +72,7 @@ cd D:\nav-runtime\app
 Windows 上必须由 AI 主动弹出独立、可见的授权码窗口：
 
 ```powershell
-cd D:\nav-runtime\app
+cd D:\data\净值自动化\app
 .\.venv\Scripts\python.exe navctl.py secret launch
 ```
 
