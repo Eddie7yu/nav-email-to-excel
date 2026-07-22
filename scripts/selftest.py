@@ -10,7 +10,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-from bootstrap import MAX_WINDOWS_DESTINATION_CHARS, pip_install_command
+from bootstrap import (
+    DEFAULT_RUNTIME_DIRECTORY,
+    MAX_WINDOWS_DESTINATION_CHARS,
+    pip_install_command,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,14 +31,12 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     workbook = openpyxl.Workbook()
     workbook.active.append(["NAV Date", "Unit NAV"])
     workbook.save(workbook_path)
-    destination = temporary / "部署 运行时"
+    destination = temporary / DEFAULT_RUNTIME_DIRECTORY
     command = [
         sys.executable,
         "-X",
         "utf8",
         str(BOOTSTRAP),
-        "--destination",
-        str(destination),
         "--workbook",
         str(workbook_path),
         "--email",
@@ -55,6 +57,17 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
         raise AssertionError(
             f"bootstrap validation-only mode failed: {validation.stderr}"
         )
+    explicit_destination = temporary / "显式部署目录"
+    explicit_validation = subprocess.run(
+        command
+        + ["--destination", str(explicit_destination), "--validate-only"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+    )
+    if explicit_validation.returncode or explicit_destination.exists():
+        raise AssertionError("bootstrap rejected an explicit destination override")
     invalid_host = command.copy()
     invalid_host[invalid_host.index("imap.example.invalid")] = ""
     rejected = subprocess.run(
@@ -112,8 +125,7 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
         minimum_length = MAX_WINDOWS_DESTINATION_CHARS + 1
         leaf_length = max(10, minimum_length - len(str(long_parent.resolve())) - 1)
         long_destination = long_parent / ("x" * leaf_length)
-        long_command = command.copy()
-        long_command[long_command.index(str(destination))] = str(long_destination)
+        long_command = command + ["--destination", str(long_destination)]
         rejected = subprocess.run(
             long_command + ["--validate-only"],
             capture_output=True,
@@ -134,6 +146,21 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     )
     if installation.returncode:
         raise AssertionError(f"bootstrap installation failed: {installation.stderr}")
+    if not destination.is_dir() or str(destination) not in installation.stdout:
+        raise AssertionError(
+            "bootstrap did not derive the workbook-adjacent runtime directory"
+        )
+    collision = subprocess.run(
+        command + ["--validate-only"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+    )
+    if collision.returncode != 2 or "already exists" not in collision.stderr:
+        raise AssertionError(
+            "bootstrap did not fail closed when the derived runtime already existed"
+        )
     unwanted = [
         path
         for path in destination.rglob("*")
@@ -411,15 +438,15 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
                 "bootstrap failed after creating a valid non-console-codepage path"
             )
 
-    new_destination = temporary / "模板部署运行时"
-    new_workbook = temporary / "尚未创建的净值表.xlsx"
+    new_workbook_parent = temporary / "新建工作簿场景"
+    new_workbook_parent.mkdir()
+    new_destination = new_workbook_parent / DEFAULT_RUNTIME_DIRECTORY
+    new_workbook = new_workbook_parent / "尚未创建的净值表.xlsx"
     new_command = [
         sys.executable,
         "-X",
         "utf8",
         str(BOOTSTRAP),
-        "--destination",
-        str(new_destination),
         "--new-workbook",
         str(new_workbook),
         "--email",

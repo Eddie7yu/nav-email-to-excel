@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "assets" / "runtime-template"
 WORKBOOK_TEMPLATES = ROOT / "assets" / "workbook-templates"
 APP_DIRECTORY = "app"
+DEFAULT_RUNTIME_DIRECTORY = "净值自动化"
 ROOT_FILE_MAP = {
     ".gitignore": ".gitignore",
     "manual-update.cmd": "手动更新.bat",
@@ -95,17 +96,25 @@ def pip_install_command(
 def validate_inputs(args: argparse.Namespace) -> tuple[Path, Path]:
     if not (3, 11) <= sys.version_info[:2] <= (3, 14):
         raise RuntimeError("Python 3.11 through 3.14 is required")
-    destination = Path(args.destination).expanduser().resolve()
     existing_workbook = args.workbook is not None
     workbook_arg = args.workbook if existing_workbook else args.new_workbook
     workbook = Path(workbook_arg).expanduser().resolve()
+    destination = (
+        Path(args.destination).expanduser().resolve()
+        if args.destination
+        else workbook.parent / DEFAULT_RUNTIME_DIRECTORY
+    )
     args.workbook_mode = "existing" if existing_workbook else "bundled-template"
     if os.name == "nt" and len(str(destination)) > MAX_WINDOWS_DESTINATION_CHARS:
+        destination_kind = (
+            "显式运行目录" if args.destination else "工作簿同级的默认目录"
+        )
         raise RuntimeError(
             "Windows 安装目录过长"
             f"（当前 {len(str(destination))} 个字符，本工具支持不超过 "
             f"{MAX_WINDOWS_DESTINATION_CHARS} 个字符）。"
-            "请改用 D:\\nav-runtime 这类短本地路径；不要部署在深层云盘同步目录或桌面目录。"
+            f"{destination_kind}不满足路径预算；请用 --destination "
+            "选择 D:\\nav-runtime 这类短本地路径。"
         )
     if destination.exists():
         raise RuntimeError(
@@ -165,6 +174,7 @@ def config_payload(args: argparse.Namespace, workbook: Path) -> dict:
             "mailbox": args.mailbox,
             "lookback_days": args.lookback_days,
             "max_messages": 2000,
+            "max_header_messages": 20000,
             "max_message_bytes": 25 * 1024 * 1024,
             "max_total_bytes": 100 * 1024 * 1024,
         },
@@ -285,7 +295,10 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description="Create an isolated local NAV email runtime"
     )
-    result.add_argument("--destination", required=True)
+    result.add_argument(
+        "--destination",
+        help="运行目录；省略时使用工作簿同级的“净值自动化”子目录",
+    )
     workbook = result.add_mutually_exclusive_group(required=True)
     workbook.add_argument("--workbook", help="继续使用已经存在的 .xlsx 或 .xlsm 工作簿")
     workbook.add_argument(

@@ -37,6 +37,12 @@ NETEASE_IMAP_SUFFIXES = ("163.com", "126.com", "yeah.net")
 IMAP_CLIENT_ID = '("name" "nav-email-to-excel" "version" "1")'
 
 
+def _mail_read_error(stage: str, reason: str, suggestion: str) -> MailError:
+    return MailError(
+        f"邮件读取失败；阶段：{stage}；原因：{reason}；处理建议：{suggestion}"
+    )
+
+
 def imap_date(value: dt.date) -> str:
     return f"{value.day:02d}-{MONTHS[value.month - 1]}-{value.year:04d}"
 
@@ -158,7 +164,11 @@ def _message_sizes(
         batch = uids[offset : offset + batch_size]
         status, size_parts = client.uid("fetch", b",".join(batch), "(UID RFC822.SIZE)")
         if status != "OK":
-            raise MailError("无法批量读取邮箱邮件大小")
+            raise _mail_read_error(
+                "读取邮件大小",
+                "IMAP 服务器拒绝了批量大小查询",
+                "稍后重试；若持续失败，请检查服务商 IMAP 兼容性",
+            )
         fallback_sizes: list[int] = []
         for part in size_parts:
             metadata = (
@@ -183,14 +193,61 @@ def _message_sizes(
             sizes[batch[0]] = fallback_sizes[0]
         missing = [uid for uid in batch if uid not in sizes]
         if missing:
-            raise MailError("IMAP 服务器没有返回完整的邮件大小信息")
+            raise _mail_read_error(
+                "读取邮件大小",
+                "IMAP 服务器返回的大小信息不完整",
+                "稍后重试；若持续失败，请检查服务商 IMAP 兼容性",
+            )
     return sizes
+
+
+def _message_headers(
+    client: imaplib.IMAP4_SSL, uids: list[bytes], batch_size: int = 200
+) -> dict[bytes, Message]:
+    headers: dict[bytes, Message] = {}
+    for offset in range(0, len(uids), batch_size):
+        batch = uids[offset : offset + batch_size]
+        status, parts = client.uid(
+            "fetch",
+            b",".join(batch),
+            "(UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])",
+        )
+        if status != "OK":
+            raise _mail_read_error(
+                "读取最小邮件头",
+                "IMAP 服务器拒绝了批量邮件头查询",
+                "稍后重试；若持续失败，请检查服务商 IMAP 兼容性",
+            )
+        for part in parts:
+            if not isinstance(part, tuple) or len(part) < 2:
+                continue
+            metadata, payload = part[0], part[1]
+            if not isinstance(metadata, bytes) or not isinstance(payload, bytes):
+                continue
+            uid_match = re.search(rb"\bUID\s+(\d+)\b", metadata, re.IGNORECASE)
+            if not uid_match:
+                continue
+            headers[uid_match.group(1)] = BytesParser(policy=default).parsebytes(
+                payload
+            )
+        missing = [uid for uid in batch if uid not in headers]
+        if missing:
+            raise _mail_read_error(
+                "读取最小邮件头",
+                "IMAP 服务器返回的邮件头信息不完整",
+                "稍后重试；若持续失败，请检查服务商 IMAP 兼容性",
+            )
+    return headers
 
 
 def _message_payload(client: imaplib.IMAP4_SSL, uid: bytes) -> Message:
     status, parts = client.uid("fetch", uid, "(BODY.PEEK[])")
     if status != "OK":
-        raise MailError("Could not fetch a mailbox message")
+        raise _mail_read_error(
+            "读取完整邮件",
+            "IMAP 服务器拒绝了邮件内容查询",
+            "稍后重试；若持续失败，请检查服务商 IMAP 兼容性",
+        )
     payload = next(
         (
             item[1]
@@ -200,8 +257,17 @@ def _message_payload(client: imaplib.IMAP4_SSL, uid: bytes) -> Message:
         None,
     )
     if not payload:
-        raise MailError("A mailbox message had no readable payload")
+        raise _mail_read_error(
+            "读取完整邮件",
+            "IMAP 服务器未返回可解析的邮件内容",
+            "稍后重试；若持续失败，请检查服务商 IMAP 兼容性",
+        )
     return BytesParser(policy=default).parsebytes(payload)
+
+
+def _max_header_messages(config: dict[str, Any]) -> int:
+    imap = config.get("imap") or {}
+    return int(imap.get("max_header_messages", 20000))
 
 
 def _close(client: imaplib.IMAP4_SSL) -> None:
@@ -267,11 +333,15 @@ def fetch_candidate_messages(
 
 
 def fetch_authorized_messages(config: dict[str, Any]) -> dict[str, list[Message]]:
-    senders = sorted(
-        {str(route["sender"]).strip().lower() for route in active_routes(config)}
-    )
+    routes = active_routes(config)
+    senders = sorted({str(route["sender"]).strip().lower() for route in routes})
     if not senders:
         return {}
+    sender_subjects: dict[str, set[str | None]] = {sender: set() for sender in senders}
+    for route in routes:
+        sender = str(route["sender"]).strip().lower()
+        subject_filter = str(route.get("subject_contains") or "").strip()
+        sender_subjects[sender].add(subject_filter.casefold() or None)
     lookback, max_messages, max_message_bytes, max_total_bytes = _limits(config)
     since = imap_date(dt.date.today() - dt.timedelta(days=lookback))
     client = connect(config)
@@ -284,29 +354,65 @@ def fetch_authorized_messages(config: dict[str, Any]) -> dict[str, list[Message]
             query = f'(SINCE {since} FROM "{sender}")'
             status, data = client.uid("search", None, query)
             if status != "OK":
-                raise MailError("IMAP search failed for an authorized sender")
-            uids = (data[0] or b"").split()
+                raise _mail_read_error(
+                    "搜索授权发件人邮件",
+                    "IMAP 服务器拒绝了搜索请求",
+                    "稍后重试；若持续失败，请检查服务商 IMAP 兼容性",
+                )
+            sender_uids = (data[0] or b"").split()
+            max_header_messages = _max_header_messages(config)
+            if len(sender_uids) > max_header_messages:
+                raise _mail_read_error(
+                    "邮件头扫描边界",
+                    "授权发件人在回看期内的邮件数量超过邮件头扫描上限",
+                    "缩短回看窗口，或在核实邮箱规模后调整 imap.max_header_messages",
+                )
+            stage = "读取最小邮件头并按主题预筛选"
+            headers = _message_headers(client, sender_uids)
+            subject_filters = sender_subjects[sender]
+            uids: list[bytes] = []
+            for uid in sender_uids:
+                header = headers[uid]
+                if not exact_from_matches(header, sender):
+                    raise _mail_read_error(
+                        "校验最小邮件头",
+                        "搜索结果的 From 与授权发件人不完全一致",
+                        "停止本次读取并检查邮箱服务商的搜索行为",
+                    )
+                subject = decoded(header.get("Subject")).casefold()
+                if None in subject_filters or any(
+                    item is not None and item in subject for item in subject_filters
+                ):
+                    uids.append(uid)
             if message_count + len(uids) > max_messages:
-                raise MailError(
-                    "Authorized-message count exceeds imap.max_messages; narrow the lookback window"
+                raise _mail_read_error(
+                    "主题预筛选后计数",
+                    "符合路由的授权邮件数量超过配置上限",
+                    "缩短回看窗口或在核实资源容量后调整 imap.max_messages",
                 )
             stage = "批量读取已授权邮件大小"
             sizes = _message_sizes(client, uids)
             for uid in uids:
                 size = sizes[uid]
                 if size > max_message_bytes:
-                    raise MailError(
-                        "An authorized message exceeds imap.max_message_bytes"
+                    raise _mail_read_error(
+                        "校验单封邮件大小",
+                        "符合路由的授权邮件超过单封大小上限",
+                        "核实邮件来源后调整 imap.max_message_bytes 或改用更小的附件",
                     )
                 if total_bytes + size > max_total_bytes:
-                    raise MailError(
-                        "Authorized messages exceed imap.max_total_bytes; narrow the lookback window"
+                    raise _mail_read_error(
+                        "校验邮件总大小",
+                        "符合路由的授权邮件累计大小超过配置上限",
+                        "缩短回看窗口或在核实资源容量后调整 imap.max_total_bytes",
                     )
                 stage = "读取已授权邮件内容"
                 message = _message_payload(client, uid)
                 if not exact_from_matches(message, sender):
-                    raise MailError(
-                        "An IMAP sender-search result did not have the exact authorized From address"
+                    raise _mail_read_error(
+                        "复核完整邮件",
+                        "完整邮件的 From 与已校验邮件头或授权发件人不完全一致",
+                        "停止本次读取并检查邮箱服务商返回内容",
                     )
                 output[sender].append(message)
                 message_count += 1
@@ -314,8 +420,10 @@ def fetch_authorized_messages(config: dict[str, Any]) -> dict[str, list[Message]
     except MailError:
         raise
     except (imaplib.IMAP4.error, OSError, ssl.SSLError) as exc:
-        raise MailError(
-            f"IMAP 会话在{stage}时意外断开；本次没有生成可用扫描结果，请检查网络后重试"
+        raise _mail_read_error(
+            stage,
+            "IMAP 会话意外断开，本次没有生成可用扫描结果",
+            "检查网络和邮箱服务状态后重试",
         ) from exc
     finally:
         _close(client)
