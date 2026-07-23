@@ -382,6 +382,8 @@ def command_preview(config: dict[str, Any], args: argparse.Namespace) -> int:
         {
             "preview_path": plan["preview_path"],
             "review_path": plan.get("review_path"),
+            "preview_display_name": plan.get("preview_display_name"),
+            "preview_read_only": bool(plan.get("preview_read_only")),
             "approval_kind": plan.get("approval_kind"),
             "warnings": plan.get("warnings") or [],
             "sheets": [

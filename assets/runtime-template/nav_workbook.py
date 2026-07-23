@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import re
 import shutil
+import stat
 import statistics
 import uuid
 from collections import Counter
@@ -47,10 +49,28 @@ HEADER_WORDS = {
 }
 APPEND_HEADER_LABELS = {field: words[0] for field, words in HEADER_WORDS.items()}
 TOTAL_WORDS = {"累计", "合计", "total", "cumulative"}
+CONCURRENCY_REPORT = STATE_ROOT / "concurrency-report.json"
+MANIFEST_HEAD_ROWS = 10
+MANIFEST_TAIL_ROWS = 30
 
 
 class WorkbookError(RuntimeError):
     pass
+
+
+def make_file_writable(path: Path) -> None:
+    try:
+        path.chmod(path.stat().st_mode | stat.S_IWRITE)
+    except FileNotFoundError:
+        pass
+
+
+def make_review_file_read_only(path: Path) -> None:
+    path.chmod(path.stat().st_mode & ~0o222)
+
+
+def review_file_is_read_only(path: Path) -> bool:
+    return not bool(path.stat().st_mode & stat.S_IWRITE)
 
 
 def _cell_values_equal(left: Any, right: Any) -> bool:
@@ -2012,7 +2032,22 @@ def build_preview(
     diagnostic_only: bool = False,
 ) -> dict[str, Any]:
     (STATE_ROOT / "plan.json").unlink(missing_ok=True)
+    CONCURRENCY_REPORT.unlink(missing_ok=True)
     master = Path(config["workbook_path"])
+    master_sha256 = file_sha256(master)
+    master_manifest = workbook_manifest(master)
+    if file_sha256(master) != master_sha256:
+        write_concurrency_report(
+            master,
+            phase="preview-baseline",
+            plan_id=None,
+            expected_sha256=master_sha256,
+            expected_manifest=master_manifest,
+        )
+        raise WorkbookError(
+            "正式工作簿在建立预览基线时被外部进程修改；"
+            "未生成计划，请查看 concurrency-report.json 后重新预览"
+        )
     preview_dir = ROOT / "previews"
     preview_dir.mkdir(exist_ok=True)
     keep = int((config.get("retention") or {}).get("preview_count", 10))
@@ -2026,12 +2061,14 @@ def build_preview(
         reverse=True,
     )
     for old in old_previews[max(keep - 1, 0) :]:
+        make_file_writable(old)
         old.unlink()
     preview = (
         preview_dir
-        / f"preview-{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}{master.suffix.lower()}"
+        / f"preview-只读审查-{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}{master.suffix.lower()}"
     )
     shutil.copy2(master, preview)
+    make_file_writable(preview)
     keep_vba = master.suffix.lower() == ".xlsm"
     workbook = openpyxl.load_workbook(preview, data_only=False, keep_vba=keep_vba)
     plan_sheets: list[dict[str, Any]] = []
@@ -2279,15 +2316,31 @@ def build_preview(
         raise
     else:
         workbook.close()
+    if file_sha256(master) != master_sha256:
+        preview.unlink(missing_ok=True)
+        write_concurrency_report(
+            master,
+            phase="preview-build",
+            plan_id=None,
+            expected_sha256=master_sha256,
+            expected_manifest=master_manifest,
+        )
+        raise WorkbookError(
+            "正式工作簿在生成预览期间被外部进程修改；"
+            "旧基线已失效，未生成计划，请查看 concurrency-report.json"
+        )
     plan = {
         "schema_version": 1,
         "plan_id": str(uuid.uuid4()),
         "created": dt.datetime.now().isoformat(timespec="seconds"),
         "config_sha256": payload_sha256(config),
         "master_path": str(master.resolve()),
-        "master_sha256": file_sha256(master),
+        "master_sha256": master_sha256,
+        "master_manifest": master_manifest,
         "preview_path": str(preview.resolve()) if plan_sheets else None,
         "preview_sha256": file_sha256(preview) if plan_sheets else None,
+        "preview_display_name": preview.name if plan_sheets else None,
+        "preview_read_only": bool(plan_sheets),
         "approval_kind": ("workbook-preview" if plan_sheets else "validated-no-change"),
         "review_path": None,
         "review_sha256": None,
@@ -2348,7 +2401,15 @@ def build_preview(
         review.write_text("\n".join(lines) + "\n", encoding="utf-8")
         plan["review_path"] = str(review.resolve())
         plan["review_sha256"] = file_sha256(review)
-        write_json_atomic(STATE_ROOT / "plan.json", plan)
+        plan["preview_display_name"] = review.name
+        plan["preview_read_only"] = True
+        make_review_file_read_only(review)
+        try:
+            write_json_atomic(STATE_ROOT / "plan.json", plan)
+        except Exception:
+            make_file_writable(review)
+            review.unlink(missing_ok=True)
+            raise
         return plan
     try:
         validate_preview(config, plan)
@@ -2356,7 +2417,13 @@ def build_preview(
         preview.unlink(missing_ok=True)
         (STATE_ROOT / "plan.json").unlink(missing_ok=True)
         raise
-    write_json_atomic(STATE_ROOT / "plan.json", plan)
+    make_review_file_read_only(preview)
+    try:
+        write_json_atomic(STATE_ROOT / "plan.json", plan)
+    except Exception:
+        make_file_writable(preview)
+        preview.unlink(missing_ok=True)
+        raise
     return plan
 
 
@@ -2448,8 +2515,6 @@ def validate_preview(config: dict[str, Any], plan: dict[str, Any]) -> None:
 
 
 def file_sha256(path: Path) -> str:
-    import hashlib
-
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -2457,9 +2522,230 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def payload_sha256(payload: Any) -> str:
-    import hashlib
+def _manifest_value(value: Any) -> tuple[str, str]:
+    if isinstance(value, ArrayFormula):
+        return "array-formula", f"{value.ref}\x1f{value.text}"
+    if isinstance(value, str) and value.startswith("="):
+        return "formula", value
+    if isinstance(value, (dt.datetime, dt.date, dt.time)):
+        return "date-time", value.isoformat()
+    if isinstance(value, bytes):
+        return "bytes", hashlib.sha256(value).hexdigest()
+    return type(value).__name__, repr(value)
 
+
+def _manifest_cell_hash(value: Any) -> tuple[str, bool]:
+    kind, normalized = _manifest_value(value)
+    encoded = f"{kind}\x1f{normalized}".encode("utf-8", errors="backslashreplace")
+    return hashlib.sha256(encoded).hexdigest(), kind in {
+        "formula",
+        "array-formula",
+    }
+
+
+def workbook_manifest(path: Path) -> dict[str, Any]:
+    keep_vba = path.suffix.lower() == ".xlsm"
+    workbook = openpyxl.load_workbook(
+        path,
+        data_only=False,
+        read_only=True,
+        keep_vba=keep_vba,
+    )
+    sheets: list[dict[str, Any]] = []
+    try:
+        for sheet in workbook.worksheets:
+            values_digest = hashlib.sha256()
+            formulas_digest = hashlib.sha256()
+            nonempty_cells = 0
+            formula_cells = 0
+            sampled_cells: dict[str, dict[str, Any]] = {}
+            tail_start = max(1, sheet.max_row - MANIFEST_TAIL_ROWS + 1)
+            for row in sheet.iter_rows():
+                for cell in row:
+                    value = cell.value
+                    if value in (None, ""):
+                        continue
+                    cell_hash, is_formula = _manifest_cell_hash(value)
+                    token = (
+                        f"{cell.coordinate}\x1f{cell_hash}\x1e"
+                    ).encode("ascii")
+                    values_digest.update(token)
+                    nonempty_cells += 1
+                    if is_formula:
+                        formulas_digest.update(token)
+                        formula_cells += 1
+                    if cell.row <= MANIFEST_HEAD_ROWS or cell.row >= tail_start:
+                        sampled_cells[cell.coordinate] = {
+                            "hash": cell_hash,
+                            "formula": is_formula,
+                        }
+            sheets.append(
+                {
+                    "sheet": sheet.title,
+                    "max_row": sheet.max_row,
+                    "max_column": sheet.max_column,
+                    "nonempty_cells": nonempty_cells,
+                    "formula_cells": formula_cells,
+                    "values_sha256": values_digest.hexdigest(),
+                    "formulas_sha256": formulas_digest.hexdigest(),
+                    "sampled_cells": sampled_cells,
+                }
+            )
+    finally:
+        workbook.close()
+    return {
+        "schema_version": 1,
+        "sampled_regions": {
+            "head_rows": MANIFEST_HEAD_ROWS,
+            "tail_rows": MANIFEST_TAIL_ROWS,
+        },
+        "sheet_order": [item["sheet"] for item in sheets],
+        "sheets": sheets,
+    }
+
+
+def workbook_manifest_diff(
+    expected: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any]:
+    expected_sheets = {
+        str(item.get("sheet") or ""): item
+        for item in expected.get("sheets") or []
+        if isinstance(item, dict)
+    }
+    current_sheets = {
+        str(item.get("sheet") or ""): item
+        for item in current.get("sheets") or []
+        if isinstance(item, dict)
+    }
+    changes: list[dict[str, Any]] = []
+    for name in sorted(set(expected_sheets) | set(current_sheets)):
+        before = expected_sheets.get(name)
+        after = current_sheets.get(name)
+        if before is None or after is None:
+            changes.append(
+                {
+                    "sheet": name,
+                    "status": "added" if before is None else "removed",
+                }
+            )
+            continue
+        fields = (
+            "max_row",
+            "max_column",
+            "nonempty_cells",
+            "formula_cells",
+            "values_sha256",
+            "formulas_sha256",
+        )
+        if all(before.get(field) == after.get(field) for field in fields):
+            continue
+        before_cells = before.get("sampled_cells") or {}
+        after_cells = after.get("sampled_cells") or {}
+        changed_coordinates = sorted(
+            coordinate
+            for coordinate in set(before_cells) | set(after_cells)
+            if before_cells.get(coordinate) != after_cells.get(coordinate)
+        )
+        changes.append(
+            {
+                "sheet": name,
+                "status": "changed",
+                "rows_before": before.get("max_row"),
+                "rows_after": after.get("max_row"),
+                "row_delta": int(after.get("max_row") or 0)
+                - int(before.get("max_row") or 0),
+                "columns_before": before.get("max_column"),
+                "columns_after": after.get("max_column"),
+                "column_delta": int(after.get("max_column") or 0)
+                - int(before.get("max_column") or 0),
+                "nonempty_cells_before": before.get("nonempty_cells"),
+                "nonempty_cells_after": after.get("nonempty_cells"),
+                "formula_cells_before": before.get("formula_cells"),
+                "formula_cells_after": after.get("formula_cells"),
+                "values_changed": (
+                    before.get("values_sha256") != after.get("values_sha256")
+                ),
+                "formulas_changed": (
+                    before.get("formulas_sha256")
+                    != after.get("formulas_sha256")
+                ),
+                "sampled_changed_cells": len(changed_coordinates),
+                "sample_coordinates": changed_coordinates[:20],
+                "sample_truncated": len(changed_coordinates) > 20,
+            }
+        )
+    topology_changed = expected.get("sheet_order") != current.get("sheet_order")
+    return {
+        "sheet_topology_changed": topology_changed,
+        "changed_sheet_count": len(changes),
+        "sheets": changes,
+    }
+
+
+def write_concurrency_report(
+    master: Path,
+    *,
+    phase: str,
+    plan_id: str | None,
+    expected_sha256: str | None,
+    expected_manifest: dict[str, Any] | None,
+) -> dict[str, Any]:
+    current_exists = master.is_file()
+    try:
+        current_sha256 = file_sha256(master) if current_exists else None
+    except OSError:
+        current_sha256 = None
+    manifest_available = False
+    current_manifest: dict[str, Any] = {}
+    if current_exists:
+        try:
+            current_manifest = workbook_manifest(master)
+            manifest_available = True
+        except Exception:
+            # A workbook can be briefly unreadable while another application is
+            # replacing it. The concurrency block must still produce a safe,
+            # value-free report instead of masking the original condition.
+            current_manifest = {}
+    differences = (
+        workbook_manifest_diff(expected_manifest or {}, current_manifest)
+        if manifest_available
+        else {
+            "sheet_topology_changed": None,
+            "changed_sheet_count": None,
+            "sheets": [],
+        }
+    )
+    report = {
+        "schema_version": 1,
+        "blocked": True,
+        "kind": "master-workbook-concurrency",
+        "detected_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "phase": phase,
+        "plan_id": plan_id,
+        "master_file": master.name,
+        "master_exists": current_exists,
+        "expected_sha256": expected_sha256,
+        "current_sha256": current_sha256,
+        "binary_hash_changed": expected_sha256 != current_sha256,
+        "current_manifest_available": manifest_available,
+        "binary_or_metadata_only": bool(
+            current_exists
+            and manifest_available
+            and expected_sha256 != current_sha256
+            and not differences["sheet_topology_changed"]
+            and not differences["changed_sheet_count"]
+        ),
+        **differences,
+        "action": (
+            "旧预览计划已失效；不得回滚、覆盖或自动接受当前正式表。"
+            "先核实外部保存来源，再以当前正式表重新生成完整预览。"
+        ),
+    }
+    write_json_atomic(CONCURRENCY_REPORT, report)
+    return report
+
+
+def payload_sha256(payload: Any) -> str:
     encoded = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")

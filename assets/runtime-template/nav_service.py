@@ -1944,6 +1944,7 @@ def preview(
 ) -> dict[str, Any]:
     # A failed preview must never leave an older commit plan looking current.
     (STATE_ROOT / "plan.json").unlink(missing_ok=True)
+    (STATE_ROOT / "concurrency-report.json").unlink(missing_ok=True)
     preview_config, scope_sheets = _config_for_sheets(config, sheets, "preview")
     effective_mail_config = mail_config or config
     if scope_sheets:

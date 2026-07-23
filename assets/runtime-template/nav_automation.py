@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from nav_config import ROOT, STATE_ROOT, write_json_atomic
+from nav_workbook import make_file_writable
 
 
 APPROVAL = STATE_ROOT / "automation-approval.json"
@@ -93,6 +94,7 @@ def discard_staging(plan: dict[str, Any] | None) -> None:
                 continue
             preview = Path(str(value)).resolve()
             if preview.parent == (ROOT / "previews").resolve():
+                make_file_writable(preview)
                 preview.unlink(missing_ok=True)
     (STATE_ROOT / "plan.json").unlink(missing_ok=True)
 

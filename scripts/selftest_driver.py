@@ -2168,7 +2168,14 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     from nav_config import ConfigError, load_config, validate_config
     from nav_parse import NavRow
     from nav_service import preview as service_preview
-    from nav_workbook import WorkbookError, build_preview, validate_history
+    from nav_workbook import (
+        WorkbookError,
+        build_preview,
+        file_sha256,
+        make_file_writable,
+        review_file_is_read_only,
+        validate_history,
+    )
 
     book = runtime / "脱敏 示例.xlsx"
     create_book(book)
@@ -2647,6 +2654,14 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         and plan["sheets"][0]["new_dates"] == ["2026-01-16", "2026-01-23"],
         "catch-up plan is incomplete",
     )
+    preview_path = Path(plan["preview_path"])
+    check(
+        "preview-只读审查-" in preview_path.name
+        and plan["preview_read_only"]
+        and review_file_is_read_only(preview_path)
+        and isinstance(plan.get("master_manifest"), dict),
+        "review workbook is not clearly named, read-only, or bound to a manifest",
+    )
     preview = openpyxl.load_workbook(plan["preview_path"], data_only=False)
     try:
         sheet = preview["Demo Fund"]
@@ -2693,6 +2708,7 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         preview.close()
 
     master_before = book.read_bytes()
+    make_file_writable(preview_path)
     tampered = openpyxl.load_workbook(plan["preview_path"])
     tampered["Demo Fund"]["D4"] = 9.99
     tampered.save(plan["preview_path"])
@@ -2706,6 +2722,67 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     check(
         book.read_bytes() == master_before,
         "preview tampering changed the master workbook",
+    )
+
+    concurrency_book = runtime / "concurrency-fixture.xlsx"
+    shutil.copyfile(book, concurrency_book)
+    concurrency_config = deepcopy(config)
+    concurrency_config["workbook_path"] = str(concurrency_book)
+    concurrency_plan = build_preview(concurrency_config, rows)
+    concurrency_workbook = openpyxl.load_workbook(concurrency_book)
+    try:
+        concurrency_sheet = concurrency_workbook["Demo Fund"]
+        concurrency_sheet.insert_rows(4, 1)
+        concurrency_sheet["A4"] = dt.date(2026, 1, 16)
+        concurrency_sheet["C4"] = "Example Fund"
+        concurrency_sheet["D4"] = 1.019
+        concurrency_sheet["E4"] = "DEMO01"
+        concurrency_sheet["F4"] = 1.019
+        concurrency_workbook.save(concurrency_book)
+    finally:
+        concurrency_workbook.close()
+    external_sha256 = file_sha256(concurrency_book)
+    try:
+        commit(concurrency_config)
+    except CommitError:
+        pass
+    else:
+        raise AssertionError("commit accepted an externally changed master workbook")
+    check(
+        file_sha256(concurrency_book) == external_sha256,
+        "concurrency block rolled back or overwrote the external workbook change",
+    )
+    concurrency_report_path = runtime / "concurrency-report.json"
+    concurrency_report = json.loads(
+        concurrency_report_path.read_text(encoding="utf-8")
+    )
+    report_json = json.dumps(
+        concurrency_report, ensure_ascii=False, sort_keys=True
+    )
+    changed_demo = next(
+        (
+            sheet
+            for sheet in concurrency_report["sheets"]
+            if sheet.get("sheet") == "Demo Fund"
+        ),
+        None,
+    )
+    check(
+        concurrency_report["blocked"]
+        and concurrency_report["phase"] == "commit-preflight"
+        and concurrency_report["plan_id"] == concurrency_plan["plan_id"]
+        and concurrency_report["binary_hash_changed"]
+        and concurrency_report["changed_sheet_count"] >= 1
+        and changed_demo is not None
+        and changed_demo["row_delta"] == 1
+        and changed_demo["sampled_changed_cells"],
+        "external workbook change did not produce a useful structured concurrency report",
+    )
+    check(
+        "1.019" not in report_json
+        and "DEMO01" not in report_json
+        and "Example Fund" not in report_json,
+        "concurrency report leaked workbook cell values",
     )
 
     dense_rows = {
@@ -2958,7 +3035,7 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         finally:
             calculated.close()
     else:
-        shutil.copy2(plan["preview_path"], book)
+        shutil.copyfile(plan["preview_path"], book)
 
     second_validation = validate_history(config, rows)
     check(second_validation["passed"], "post-commit history validation failed")
@@ -2976,8 +3053,13 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         (runtime / "plan.json").is_file(),
         "a validated no-change preview must leave an approvable plan",
     )
+    check(
+        second["preview_read_only"] and review_file_is_read_only(review_path),
+        "validated no-change review is not system read-only",
+    )
     no_change_master = book.read_bytes()
     no_change_backups = set((runtime / "backups").glob("*"))
+    make_file_writable(review_path)
     review_path.write_text(
         review_path.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8"
     )
@@ -3213,7 +3295,7 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
             "COM reserved-row cold start did not report all populated dates",
         )
     else:
-        shutil.copy2(reserved_plan["preview_path"], reserved_book)
+        shutil.copyfile(reserved_plan["preview_path"], reserved_book)
     reserved_second_validation = validate_history(reserved_config, reserved_rows)
     check(
         reserved_second_validation["passed"]
@@ -3370,7 +3452,7 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
             "COM append commit did not apply both cold-start rows",
         )
     else:
-        shutil.copy2(append_plan["preview_path"], append_book)
+        shutil.copyfile(append_plan["preview_path"], append_book)
     approve(append_config)
     check(
         automation_status(append_config)["approved"],
@@ -3429,7 +3511,7 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
             and append_next["sheets"][0]["copy_template_rows"],
             "existing append table did not plan exactly one later date",
         )
-        shutil.copy2(append_next["preview_path"], append_book)
+        shutil.copyfile(append_next["preview_path"], append_book)
     append_updated = openpyxl.load_workbook(append_book, data_only=False)
     try:
         check(
@@ -3661,7 +3743,7 @@ def template_tests(runtime: Path, use_com: bool) -> str | None:
     if use_com:
         application = str(commit(config)["application"])
     else:
-        shutil.copy2(first_plan["preview_path"], target)
+        shutil.copyfile(first_plan["preview_path"], target)
     one_date_validation = validate_history(config, first_rows)
     check(
         one_date_validation["passed"] and one_date_validation["warnings"],
@@ -3726,7 +3808,7 @@ def template_tests(runtime: Path, use_com: bool) -> str | None:
             gc.collect()
             ensure_process_exit(process_id)
     else:
-        shutil.copy2(second_plan["preview_path"], target)
+        shutil.copyfile(second_plan["preview_path"], target)
     strict = validate_history(config, second_rows)
     check(
         strict["passed"] and not strict["warnings"],
@@ -3767,7 +3849,7 @@ def template_tests(runtime: Path, use_com: bool) -> str | None:
             ),
             "later template preview did not contain exactly one incremental date",
         )
-        shutil.copy2(third_plan["preview_path"], target)
+        shutil.copyfile(third_plan["preview_path"], target)
     final = validate_history(config, third_rows)
     check(
         final["passed"]

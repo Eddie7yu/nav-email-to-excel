@@ -17,7 +17,13 @@ from typing import Any
 import openpyxl
 
 from nav_config import ROOT, STATE_ROOT, active_routes
-from nav_workbook import file_sha256, payload_sha256, validate_preview
+from nav_workbook import (
+    file_sha256,
+    payload_sha256,
+    review_file_is_read_only,
+    validate_preview,
+    write_concurrency_report,
+)
 
 
 class CommitError(RuntimeError):
@@ -463,9 +469,22 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
     configured_master = Path(config["workbook_path"]).resolve()
     if master != configured_master:
         raise CommitError("The plan does not belong to the configured master workbook")
-    if file_sha256(master) != plan["master_sha256"]:
+    master_manifest = plan.get("master_manifest")
+    if not isinstance(master_manifest, dict):
         raise CommitError(
-            "The master workbook changed after preview; regenerate the preview"
+            "旧预览计划缺少正式工作簿并发基线；请重新生成预览"
+        )
+    if not master.is_file() or file_sha256(master) != plan["master_sha256"]:
+        write_concurrency_report(
+            master,
+            phase="commit-preflight",
+            plan_id=str(plan.get("plan_id") or "") or None,
+            expected_sha256=str(plan.get("master_sha256") or "") or None,
+            expected_manifest=master_manifest,
+        )
+        raise CommitError(
+            "正式工作簿在预览生成后被外部进程修改；旧计划已并发失效，"
+            "未回滚或覆盖。请查看 concurrency-report.json，核实后以当前文件重新预览"
         )
     if not plan.get("sheets"):
         if (
@@ -485,6 +504,13 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
         if not review.is_file() or file_sha256(review) != plan.get("review_sha256"):
             raise CommitError(
                 "The reviewed no-change baseline report is missing or changed; regenerate the preview"
+            )
+        if (
+            plan.get("preview_read_only") is not True
+            or not review_file_is_read_only(review)
+        ):
+            raise CommitError(
+                "零新增审查报告不再是系统只读文件；请重新生成预览"
             )
         return {
             "changed": False,
@@ -506,6 +532,11 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
         raise CommitError(
             "The reviewed preview is missing or changed; regenerate the preview"
         )
+    if (
+        plan.get("preview_read_only") is not True
+        or not review_file_is_read_only(preview)
+    ):
+        raise CommitError("审查预览不再是系统只读文件；请重新生成预览")
     allowed_sheets = {str(route["sheet"]) for route in active_routes(config)}
     allowed_modes = {
         str(route["sheet"]): str(route.get("sheet_mode", "summary"))
@@ -580,7 +611,16 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
         if file_sha256(preview) != plan["preview_sha256"]:
             raise CommitError("The reviewed preview changed during commit")
         if file_sha256(master) != before:
-            raise CommitError("The master changed during commit; refusing replacement")
+            write_concurrency_report(
+                master,
+                phase="commit-before-replace",
+                plan_id=str(plan.get("plan_id") or "") or None,
+                expected_sha256=before,
+                expected_manifest=master_manifest,
+            )
+            raise CommitError(
+                "正式工作簿在提交处理中被外部进程修改；拒绝替换"
+            )
         try:
             os.replace(temp, master)
         except OSError as exc:
@@ -593,7 +633,7 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
                     "无法替换正式工作簿；请关闭正在打开该文件的 Excel/WPS 窗口后重试"
                 ) from exc
             raise
-    except Exception:
+    except Exception as exc:
         if temp.exists():
             try:
                 temp.unlink()
@@ -605,7 +645,17 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
             except OSError:
                 pass
         if not master.is_file() or file_sha256(master) != before:
-            raise CommitError("Commit failed and the master hash changed unexpectedly")
+            write_concurrency_report(
+                master,
+                phase="commit-failure",
+                plan_id=str(plan.get("plan_id") or "") or None,
+                expected_sha256=before,
+                expected_manifest=master_manifest,
+            )
+            raise CommitError(
+                "提交失败且正式工作簿发生外部变化；未回滚或覆盖当前文件，"
+                "请查看 concurrency-report.json"
+            ) from exc
         raise
     old_backups = sorted(
         backup_dir.glob(f"{master.stem}-before-*{master.suffix}"),

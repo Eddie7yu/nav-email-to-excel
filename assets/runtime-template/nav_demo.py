@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -40,6 +41,18 @@ def _run_path(run_id: str) -> Path:
     if path.parent != DEMO_ROOT.resolve():
         raise RuntimeError("演练目录不在允许范围内")
     return path
+
+
+def _remove_tree(path: Path, *, ignore_errors: bool = False) -> None:
+    if path.is_dir():
+        for item in path.rglob("*"):
+            if item.is_file():
+                try:
+                    item.chmod(item.stat().st_mode | stat.S_IWRITE)
+                except OSError:
+                    if not ignore_errors:
+                        raise
+    shutil.rmtree(path, ignore_errors=ignore_errors)
 
 
 def _run_worker(path: Path, action: str) -> dict[str, Any]:
@@ -79,7 +92,7 @@ def prepare() -> dict[str, Any]:
             shutil.copy2(source, path / name)
         payload = _run_worker(path, "prepare")
     except Exception:
-        shutil.rmtree(path, ignore_errors=True)
+        _remove_tree(path, ignore_errors=True)
         raise
     payload.update(
         {
@@ -112,7 +125,7 @@ def remove(run_id: str) -> dict[str, Any]:
     path = _run_path(run_id)
     existed = path.is_dir()
     if existed:
-        shutil.rmtree(path)
+        _remove_tree(path)
     try:
         DEMO_ROOT.rmdir()
     except OSError:

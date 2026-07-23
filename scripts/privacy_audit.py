@@ -49,6 +49,7 @@ DENIED_NAMES = {
     "config.json",
     "route-report.json",
     "validation-report.json",
+    "concurrency-report.json",
     "plan.json",
     "route-proposals.json",
     "automation-approval.json",
