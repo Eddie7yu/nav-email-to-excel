@@ -14,6 +14,8 @@ from nav_automation import approve, status as approval_status
 from nav_config import (
     STATE_ROOT,
     active_routes,
+    benchmark_requires_review,
+    benchmark_review_issue,
     normalize_code,
     validate_config,
     write_json_atomic,
@@ -52,11 +54,12 @@ def _coverage_matrix(
         for route in active_routes(config)
         if isinstance(route, dict)
     }
-    review_route_sheets = {
-        str(route.get("sheet") or "")
+    review_route_issues = {
+        str(route.get("sheet") or ""): str(benchmark_review_issue(route))
         for route in active_routes(config)
-        if isinstance(route, dict) and route.get("benchmark_review_only", False)
+        if isinstance(route, dict) and benchmark_requires_review(route)
     }
+    review_route_sheets = set(review_route_issues)
     paused_sheet_names = route_sheets - active_sheet_names
     statuses = (
         "active",
@@ -75,7 +78,7 @@ def _coverage_matrix(
         reason = None
         if sheet in review_route_sheets:
             status = "active_review_required"
-            reason = "benchmark-or-workbook-review"
+            reason = review_route_issues[sheet]
         elif sheet in active_sheet_names:
             status = "active"
         elif sheet in paused_sheet_names:
@@ -256,7 +259,8 @@ def _analysis(config: dict[str, Any], report: dict[str, Any] | None) -> dict[str
             "product_name": route.get("product_name"),
             "paused": bool(route.get("paused", False)),
             "pause_reason": route.get("pause_reason"),
-            "review_required": bool(route.get("benchmark_review_only", False)),
+            "review_required": benchmark_requires_review(route),
+            "review_issue": benchmark_review_issue(route),
             "sheet_present": route.get("sheet") in sheets,
         }
         for route in routes
@@ -271,7 +275,7 @@ def _analysis(config: dict[str, Any], report: dict[str, Any] | None) -> dict[str
         "review_required": sum(
             1
             for route in active_routes(config)
-            if route.get("benchmark_review_only", False)
+            if benchmark_requires_review(route)
         ),
         "routes": route_status,
         "matched_candidates": matched,

@@ -28,6 +28,8 @@ from nav_config import (
     ROOT,
     STATE_ROOT,
     active_routes,
+    benchmark_requires_review,
+    benchmark_review_issue,
     normalize_code,
     write_json_atomic,
 )
@@ -1139,10 +1141,16 @@ def validate_history(
     try:
         for route in active_routes(config):
             sheet_name = str(route["sheet"])
-            if route.get("benchmark_review_only"):
+            if benchmark_requires_review(route):
+                issue = benchmark_review_issue(route)
                 warnings.append(
-                    f"{sheet_name}: 基准/超额来源尚未确认；本次只生成审查预览，"
-                    "AI 确认可靠来源并重新预览前不能提交或启用自动更新"
+                    (
+                        f"{sheet_name}: 基准数据使用许可尚未确认；"
+                        if issue == "benchmark-license-unresolved"
+                        else f"{sheet_name}: 基准/超额来源尚未确认；"
+                    )
+                    + "本次只生成审查预览，AI 解决对应审查项并重新预览前"
+                    "不能提交或启用自动更新"
                 )
             if sheet_name not in workbook.sheetnames:
                 errors.append(f"Missing managed sheet: {sheet_name}")
@@ -1741,7 +1749,7 @@ def _set_benchmark_formulas(
     write_summary: bool = True,
     review_rows: set[int] | None = None,
 ) -> None:
-    if route.get("benchmark_review_only"):
+    if benchmark_requires_review(route):
         review_columns = {
             column
             for column in (
@@ -1891,7 +1899,7 @@ def _ensure_summary_formula_safety(
         )
         if column
     }
-    if route.get("benchmark") or route.get("benchmark_review_only"):
+    if route.get("benchmark") or benchmark_requires_review(route):
         managed.update(
             column
             for column in (
@@ -1925,7 +1933,7 @@ def _review_summary_array_column(
     route: dict[str, Any],
     column: int,
 ) -> bool:
-    if not route.get("benchmark_review_only") or column not in {
+    if not benchmark_requires_review(route) or column not in {
         layout.columns.get("benchmark_level"),
         layout.columns.get("benchmark_return"),
         layout.columns.get("excess"),
@@ -2086,9 +2094,12 @@ def build_preview(
     try:
         for route in active_routes(config):
             sheet_name = str(route["sheet"])
-            if route.get("benchmark_review_only"):
+            if benchmark_requires_review(route):
                 blocking_reviews.append(
-                    {"sheet": sheet_name, "issue": "benchmark-source-unresolved"}
+                    {
+                        "sheet": sheet_name,
+                        "issue": str(benchmark_review_issue(route)),
+                    }
                 )
             sheet = workbook[sheet_name]
             layout = discover_layout(
@@ -2393,7 +2404,11 @@ def build_preview(
                     *[
                         f"- {item['sheet']}：基准/超额来源尚未确认"
                         if item["issue"] == "benchmark-source-unresolved"
-                        else f"- {item['sheet']}：这是局部诊断预览，必须完成一次完整预览"
+                        else (
+                            f"- {item['sheet']}：基准数据使用许可尚未确认"
+                            if item["issue"] == "benchmark-license-unresolved"
+                            else f"- {item['sheet']}：这是局部诊断预览，必须完成一次完整预览"
+                        )
                         for item in blocking_reviews
                     ],
                 ]

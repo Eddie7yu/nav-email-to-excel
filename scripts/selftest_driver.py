@@ -3863,7 +3863,7 @@ def template_tests(runtime: Path, use_com: bool) -> str | None:
 def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
     from nav_automation import approve, status as approval_status
     from nav_commit import CommitError, commit
-    from nav_config import load_config, validate_config
+    from nav_config import ConfigError, load_config, validate_config
     from nav_parse import NavRow, choose_route_rows
     from nav_product_workbook import _same_cell, prepare_clone_spec
     from nav_products import (
@@ -4577,16 +4577,105 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         existing_target.read_bytes() == review_before,
         "review-only preview or rejected commit changed the formal workbook",
     )
-    resolved_config = deepcopy(review_config)
-    resolved_route = resolved_config["routes"][-1]
-    resolved_route.pop("benchmark_review_only")
-    resolved_route["benchmark"] = {
+
+    license_review_config = deepcopy(review_config)
+    license_review_route = license_review_config["routes"][-1]
+    license_review_route.pop("benchmark_review_only")
+    license_review_route["benchmark"] = {
         "source_sheet": "待审指数源",
         "source_type": "level",
         "source_date": "A",
         "source_value": "B",
         "display_name": "待审示例指数",
+        "technical_source_verified": True,
+        "license_source": "公开条款技术审查记录",
+        "review_only": True,
     }
+    validate_config(license_review_config)
+    license_status = status(license_review_config)
+    license_validation = validate_history(license_review_config, review_rows)
+    license_plan = build_preview(
+        license_review_config,
+        review_rows,
+        license_validation["warnings"],
+    )
+    check(
+        license_status["review_required"] == 1
+        and license_status["routes"][-1]["review_issue"]
+        == "benchmark-license-unresolved"
+        and license_validation["passed"]
+        and any("使用许可尚未确认" in item for item in license_validation["warnings"])
+        and license_plan["committable"] is False
+        and license_plan["blocking_reviews"]
+        == [{"sheet": "待审基准页", "issue": "benchmark-license-unresolved"}],
+        "technically verified benchmark did not remain blocked for license review",
+    )
+    license_outputs = json.dumps(
+        [license_status, license_validation, license_plan],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    check(
+        "公开条款技术审查记录" not in license_outputs
+        and "license_approved_by" not in license_outputs,
+        "benchmark review reports exposed license evidence or approval identity",
+    )
+    license_preview = openpyxl.load_workbook(
+        license_plan["preview_path"], data_only=False
+    )
+    try:
+        check(
+            license_preview["待审基准页"]["G5"].value is None
+            and license_preview["待审基准页"]["H5"].value is None
+            and license_preview["待审基准页"]["I5"].value is None,
+            "license-review preview populated unapproved benchmark values",
+        )
+    finally:
+        license_preview.close()
+    try:
+        commit(license_review_config)
+    except CommitError:
+        pass
+    else:
+        raise AssertionError("license-review benchmark preview was committable")
+    invalid_license_review = deepcopy(license_review_config)
+    invalid_license_review["routes"][-1]["benchmark"][
+        "license_approved_by"
+    ] = "示例审批人"
+    try:
+        validate_config(invalid_license_review)
+    except ConfigError:
+        pass
+    else:
+        raise AssertionError("review-only benchmark accepted an approval identity")
+    invalid_technical_review = deepcopy(license_review_config)
+    invalid_technical_review["routes"][-1]["benchmark"][
+        "technical_source_verified"
+    ] = False
+    try:
+        validate_config(invalid_technical_review)
+    except ConfigError:
+        pass
+    else:
+        raise AssertionError("license review accepted an unverified technical source")
+
+    resolved_config = deepcopy(license_review_config)
+    resolved_route = resolved_config["routes"][-1]
+    resolved_route["benchmark"].update(
+        {
+            "license_source": "企业授权数据源审批记录",
+            "license_approved_by": "示例数据负责人",
+            "review_only": False,
+        }
+    )
+    missing_license_source = deepcopy(resolved_config)
+    missing_license_source["routes"][-1]["benchmark"].pop("license_source")
+    try:
+        validate_config(missing_license_source)
+    except ConfigError:
+        pass
+    else:
+        raise AssertionError("approved benchmark omitted its license source")
     validate_config(resolved_config)
     resolved_validation = validate_history(resolved_config, review_rows)
     try:

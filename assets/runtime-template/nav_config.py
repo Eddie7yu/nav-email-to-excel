@@ -68,6 +68,10 @@ BENCHMARK_FIELDS = {
     "source_date",
     "source_value",
     "display_name",
+    "technical_source_verified",
+    "license_source",
+    "license_approved_by",
+    "review_only",
 }
 COLUMN_FIELDS = {
     "header_row",
@@ -307,12 +311,6 @@ def validate_config(config: dict[str, Any]) -> None:
         benchmark_review_only = route.get("benchmark_review_only", False)
         if not isinstance(benchmark_review_only, bool):
             errors.append(f"{prefix}.benchmark_review_only must be true or false")
-        if benchmark_review_only and (
-            workbook_mode != "existing" or sheet_mode != "summary"
-        ):
-            errors.append(
-                f"{prefix}.benchmark_review_only is only valid for an existing summary sheet"
-            )
         aliases = route.get("code_aliases") or []
         if not isinstance(aliases, list):
             errors.append(f"{prefix}.code_aliases must be a list of exact code strings")
@@ -396,6 +394,7 @@ def validate_config(config: dict[str, Any]) -> None:
             errors.append(
                 f"{prefix}.benchmark_review_only cannot be combined with benchmark"
             )
+        benchmark_metadata_review = False
         if benchmark is not None:
             if not isinstance(benchmark, dict):
                 errors.append(f"{prefix}.benchmark must be null or an object")
@@ -424,6 +423,67 @@ def validate_config(config: dict[str, Any]) -> None:
                     errors.append(
                         f"{prefix}.benchmark.display_name must be a non-empty, non-formula single-line string of at most 100 characters"
                     )
+                technical_verified = benchmark.get("technical_source_verified")
+                if technical_verified is not None and not isinstance(
+                    technical_verified, bool
+                ):
+                    errors.append(
+                        f"{prefix}.benchmark.technical_source_verified must be true or false"
+                    )
+                benchmark_metadata_review = benchmark.get("review_only", False)
+                if not isinstance(benchmark_metadata_review, bool):
+                    errors.append(
+                        f"{prefix}.benchmark.review_only must be true or false"
+                    )
+                    benchmark_metadata_review = False
+                for field, limit in (
+                    ("license_source", 300),
+                    ("license_approved_by", 200),
+                ):
+                    value = benchmark.get(field)
+                    if value is not None and (
+                        not isinstance(value, str)
+                        or not value.strip()
+                        or len(value.strip()) > limit
+                        or "\n" in value
+                        or "\r" in value
+                        or value.lstrip().startswith("=")
+                    ):
+                        errors.append(
+                            f"{prefix}.benchmark.{field} must be a non-empty, non-formula single-line string of at most {limit} characters"
+                        )
+                provenance_fields = {
+                    "technical_source_verified",
+                    "license_source",
+                    "license_approved_by",
+                    "review_only",
+                }
+                provenance_used = bool(provenance_fields & set(benchmark))
+                if benchmark_metadata_review:
+                    if technical_verified is not True:
+                        errors.append(
+                            f"{prefix}.benchmark.review_only requires technical_source_verified: true"
+                        )
+                    if benchmark.get("license_approved_by") is not None:
+                        errors.append(
+                            f"{prefix}.benchmark.license_approved_by is not allowed while review_only is true"
+                        )
+                elif provenance_used:
+                    if technical_verified is not True:
+                        errors.append(
+                            f"{prefix}.benchmark technical_source_verified must be true before approval"
+                        )
+                    for field in ("license_source", "license_approved_by"):
+                        if not str(benchmark.get(field, "")).strip():
+                            errors.append(
+                                f"{prefix}.benchmark.{field} is required when review_only is false"
+                            )
+        if (benchmark_review_only or benchmark_metadata_review) and (
+            workbook_mode != "existing" or sheet_mode != "summary"
+        ):
+            errors.append(
+                f"{prefix} benchmark review is only valid for an existing summary sheet"
+            )
         key = (sender, sheet, code or "")
         if key in route_keys:
             errors.append(f"{prefix} duplicates an earlier route")
@@ -630,6 +690,19 @@ def active_routes(config: dict[str, Any]) -> list[dict[str, Any]]:
         for route in config.get("routes") or []
         if isinstance(route, dict) and not route.get("paused", False)
     ]
+
+
+def benchmark_review_issue(route: dict[str, Any]) -> str | None:
+    benchmark = route.get("benchmark")
+    if isinstance(benchmark, dict) and benchmark.get("review_only") is True:
+        return "benchmark-license-unresolved"
+    if route.get("benchmark_review_only") is True:
+        return "benchmark-source-unresolved"
+    return None
+
+
+def benchmark_requires_review(route: dict[str, Any]) -> bool:
+    return benchmark_review_issue(route) is not None
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:

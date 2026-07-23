@@ -25,6 +25,8 @@ from nav_config import (
     ROOT,
     STATE_ROOT,
     active_routes,
+    benchmark_requires_review,
+    benchmark_review_issue,
     normalize_code,
     write_json_atomic,
 )
@@ -1780,9 +1782,12 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
         f"{len(active)} active; {len(configured_routes) - len(active)} paused",
     )
     unresolved_reviews = [
-        str(route["sheet"])
+        {
+            "sheet": str(route["sheet"]),
+            "issue": str(benchmark_review_issue(route)),
+        }
         for route in active
-        if route.get("benchmark_review_only")
+        if benchmark_requires_review(route)
     ]
     add(
         "write-rules-resolved",
@@ -1790,7 +1795,12 @@ def doctor(config: dict[str, Any]) -> dict[str, Any]:
         (
             "resolved"
             if not unresolved_reviews
-            else f"{len(unresolved_reviews)} sheet(s) require benchmark/source review"
+            else (
+                f"{len(unresolved_reviews)} sheet(s) require benchmark review: "
+                + ", ".join(
+                    f"{item['sheet']}={item['issue']}" for item in unresolved_reviews
+                )
+            )
         ),
     )
     expected_packages = {
