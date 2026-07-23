@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import hashlib
 import html
 import importlib.util
 import io
@@ -47,6 +48,9 @@ MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 _PARSE_LIBRARY_WARNINGS: ContextVar[tuple[dict[str, str], ...]] = ContextVar(
     "parse_library_warnings", default=()
 )
+_ATTACHMENT_PARSE_DIAGNOSTICS: ContextVar[tuple[dict[str, str], ...]] = ContextVar(
+    "attachment_parse_diagnostics", default=()
+)
 
 
 class ParseError(ValueError):
@@ -75,6 +79,36 @@ def consume_parse_library_warnings() -> list[dict[str, str]]:
     recorded = list(_PARSE_LIBRARY_WARNINGS.get())
     _PARSE_LIBRARY_WARNINGS.set(())
     return recorded
+
+
+def consume_attachment_parse_diagnostics() -> list[dict[str, str]]:
+    recorded = list(_ATTACHMENT_PARSE_DIAGNOSTICS.get())
+    _ATTACHMENT_PARSE_DIAGNOSTICS.set(())
+    return recorded
+
+
+def _record_attachment_parse_diagnostic(
+    part: Message, suffix: str, status: str, reason: str
+) -> None:
+    filename = str(part.get_filename() or "")
+    content_type = str(part.get_content_type() or "application/octet-stream").lower()
+    if not re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", content_type):
+        content_type = "application/octet-stream"
+    safe_suffix = suffix if re.fullmatch(r"\.[a-z0-9]{1,10}", suffix) else "(none)"
+    current = list(_ATTACHMENT_PARSE_DIAGNOSTICS.get())
+    current.append(
+        {
+            "stage": "attachment-parse",
+            "attachment_id": hashlib.sha256(
+                filename.casefold().encode("utf-8", errors="replace")
+            ).hexdigest()[:12],
+            "suffix": safe_suffix,
+            "content_type": content_type,
+            "status": status,
+            "reason": reason,
+        }
+    )
+    _ATTACHMENT_PARSE_DIAGNOSTICS.set(tuple(current))
 
 
 @dataclass(frozen=True)
@@ -539,6 +573,7 @@ def message_text(message: Message) -> str:
 def _rows_from_message_auto(message: Message) -> list[NavRow]:
     subject = str(message.get("Subject") or "")
     rows: list[NavRow] = []
+    attachment_failures = 0
     plain, rich = _message_body_parts(message)
     for text in plain:
         rows.extend(rows_from_text(text, "body:text", subject))
@@ -552,19 +587,33 @@ def _rows_from_message_auto(message: Message) -> list[NavRow]:
         if not payload:
             continue
         suffix = Path(filename).suffix.lower()
+        attachment_rows: list[NavRow] | None = None
         try:
             if suffix in {".xlsx", ".xlsm"}:
-                rows.extend(rows_from_xlsx(payload, f"attachment:{suffix}"))
+                attachment_rows = rows_from_xlsx(payload, f"attachment:{suffix}")
             elif suffix == ".xls":
-                rows.extend(rows_from_xls(payload, "attachment:.xls"))
+                attachment_rows = rows_from_xls(payload, "attachment:.xls")
             elif suffix in {".csv", ".txt"}:
-                rows.extend(rows_from_csv(payload, f"attachment:{suffix}"))
+                attachment_rows = rows_from_csv(payload, f"attachment:{suffix}")
             elif suffix == ".pdf":
-                rows.extend(rows_from_pdf(payload, "attachment:.pdf", subject))
+                attachment_rows = rows_from_pdf(payload, "attachment:.pdf", subject)
         except Exception as exc:
-            raise ParseError(
-                f"Could not parse a {suffix or 'named'} attachment"
-            ) from exc
+            reason = (
+                "resource-limit"
+                if isinstance(exc, ParseError) and "limit exceeded" in str(exc)
+                else "invalid-or-unsupported-content"
+            )
+            _record_attachment_parse_diagnostic(part, suffix, "failed", reason)
+            attachment_failures += 1
+            continue
+        if attachment_rows is not None:
+            if not attachment_rows:
+                _record_attachment_parse_diagnostic(
+                    part, suffix, "no-nav-records", "no-structured-nav-records"
+                )
+            rows.extend(attachment_rows)
+    if attachment_failures:
+        raise ParseError("One or more supported attachments could not be parsed")
     return deduplicate(rows)
 
 
@@ -602,6 +651,7 @@ def _rows_from_local_parser(message: Message, parser_name: str) -> list[NavRow]:
 
 def rows_from_message(message: Message, parser_name: str = "auto") -> list[NavRow]:
     _PARSE_LIBRARY_WARNINGS.set(())
+    _ATTACHMENT_PARSE_DIAGNOSTICS.set(())
     if parser_name == "auto":
         return _rows_from_message_auto(message)
     if parser_name.startswith("local:"):
@@ -622,9 +672,15 @@ def choose_route_rows(
     rows: Iterable[NavRow], route: dict[str, Any], single_sender_route: bool
 ) -> list[NavRow]:
     expected = normalize_code(route.get("code"))
+    accepted_codes = {expected} if expected else set()
+    accepted_codes.update(
+        normalized
+        for alias in route.get("code_aliases") or []
+        if (normalized := normalize_code(alias))
+    )
     selected: list[NavRow] = []
     for row in rows:
-        if expected and row.code and row.code != expected:
+        if expected and row.code and row.code not in accepted_codes:
             continue
         if (
             expected

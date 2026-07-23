@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import gc
+import hashlib
 import os
 import re
 import shutil
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 import openpyxl
+from openpyxl.utils import get_column_letter, range_boundaries
+from openpyxl.worksheet.formula import ArrayFormula
 
 from nav_commit import ensure_process_exit, spreadsheet_app
 from nav_config import ROOT
@@ -180,11 +183,46 @@ def _apply_clone_with_com(
 
 
 def _same_cell(left: Any, right: Any) -> bool:
+    if isinstance(left, ArrayFormula) or isinstance(right, ArrayFormula):
+        return (
+            isinstance(left, ArrayFormula)
+            and isinstance(right, ArrayFormula)
+            and _normalized_array_ref(left.ref)
+            == _normalized_array_ref(right.ref)
+            and left.text == right.text
+        )
     if isinstance(left, dt.datetime):
         left = left.date()
     if isinstance(right, dt.datetime):
         right = right.date()
     return left == right
+
+
+def _normalized_array_ref(value: Any) -> str:
+    try:
+        min_column, min_row, max_column, max_row = range_boundaries(str(value))
+    except (TypeError, ValueError):
+        return str(value)
+    start = f"{get_column_letter(min_column)}{min_row}"
+    end = f"{get_column_letter(max_column)}{max_row}"
+    return start if start == end else f"{start}:{end}"
+
+
+def _cell_value_diagnostic(value: Any) -> str:
+    if isinstance(value, ArrayFormula):
+        return (
+            "ArrayFormula("
+            f"ref_id={hashlib.sha256(str(value.ref).encode()).hexdigest()[:12]},"
+            f"text_id={hashlib.sha256(str(value.text).encode()).hexdigest()[:12]}"
+            ")"
+        )
+    if isinstance(value, str) and value.startswith("="):
+        return (
+            "Formula("
+            f"text_id={hashlib.sha256(value.encode()).hexdigest()[:12]}"
+            ")"
+        )
+    return type(value).__name__
 
 
 def _verify_other_sheets_unchanged(before, after, target_sheet: str) -> None:
@@ -199,7 +237,9 @@ def _verify_other_sheets_unchanged(before, after, target_sheet: str) -> None:
                     left.cell(row, column).value, right.cell(row, column).value
                 ):
                     raise ProductWorkbookError(
-                        f"复制过程意外改变了 {name}!{left.cell(row, column).coordinate}"
+                        f"复制过程意外改变了 {name}!{left.cell(row, column).coordinate}："
+                        f"before={_cell_value_diagnostic(left.cell(row, column).value)}, "
+                        f"after={_cell_value_diagnostic(right.cell(row, column).value)}"
                     )
     if target_sheet not in after.sheetnames:
         raise ProductWorkbookError("复制结果缺少目标 Sheet")

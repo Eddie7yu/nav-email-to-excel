@@ -21,7 +21,7 @@ if not exist "app\navctl.py" (
   popd
   exit /b 2
 )
-"app\.venv\Scripts\python.exe" -X utf8 "app\navctl.py" scheduled-update
+call "app\run-update.cmd"
 set "RC=%ERRORLEVEL%"
 echo.
 if "%RC%"=="0" (

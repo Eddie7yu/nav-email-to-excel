@@ -19,6 +19,7 @@ TOP_FIELDS = {
     "workbook_mode",
     "imap",
     "routes",
+    "sheet_reviews",
     "column_overrides",
     "style",
     "schedule",
@@ -39,9 +40,12 @@ IMAP_FIELDS = {
 ROUTE_FIELDS = {
     "sender",
     "subject_contains",
+    "subject_excludes",
+    "subject_product_code",
     "sheet",
     "sheet_mode",
     "code",
+    "code_aliases",
     "product_name",
     "parser",
     "paused",
@@ -53,6 +57,7 @@ ROUTE_FIELDS = {
     "return_frequency",
     "data_frequency",
     "series_start",
+    "baseline_overlap",
     "max_staleness_days",
     "benchmark",
     "benchmark_review_only",
@@ -77,6 +82,13 @@ COLUMN_FIELDS = {
     "benchmark_level",
     "benchmark_return",
     "excess",
+}
+SHEET_REVIEW_FIELDS = {"status", "reason"}
+SHEET_REVIEW_STATUSES = {
+    "excluded",
+    "no_mail_evidence",
+    "local_parser_required",
+    "business_review",
 }
 
 
@@ -229,6 +241,46 @@ def validate_config(config: dict[str, Any]) -> None:
             errors.append(
                 f"{prefix}.subject_contains must be a non-empty string of at most 200 characters"
             )
+        subject_excludes = route.get("subject_excludes") or []
+        if not isinstance(subject_excludes, list):
+            errors.append(f"{prefix}.subject_excludes must be a list of strings")
+            subject_excludes = []
+        normalized_excludes: list[str] = []
+        for excluded in subject_excludes:
+            if (
+                not isinstance(excluded, str)
+                or not excluded.strip()
+                or len(excluded.strip()) > 200
+            ):
+                errors.append(
+                    f"{prefix}.subject_excludes must contain non-empty strings of at most 200 characters"
+                )
+                continue
+            normalized_excludes.append(excluded.strip().casefold())
+        if len(normalized_excludes) != len(set(normalized_excludes)):
+            errors.append(f"{prefix}.subject_excludes contains duplicates")
+        if (
+            isinstance(subject_contains, str)
+            and subject_contains.strip().casefold() in normalized_excludes
+        ):
+            errors.append(
+                f"{prefix}.subject_excludes must not repeat subject_contains"
+            )
+        subject_product_code = route.get("subject_product_code")
+        if subject_product_code is not None:
+            binding_code = normalize_code(subject_product_code)
+            if not isinstance(subject_product_code, str) or not binding_code:
+                errors.append(
+                    f"{prefix}.subject_product_code must be a quoted product code"
+                )
+            elif not code or binding_code != code:
+                errors.append(
+                    f"{prefix}.subject_product_code must equal the primary route code"
+                )
+            if not subject_contains:
+                errors.append(
+                    f"{prefix}.subject_product_code requires subject_contains"
+                )
         parser_name = str(route.get("parser", "auto"))
         if parser_name != "auto" and not re.fullmatch(
             r"local:[a-z][a-z0-9_-]{0,63}", parser_name
@@ -261,6 +313,23 @@ def validate_config(config: dict[str, Any]) -> None:
             errors.append(
                 f"{prefix}.benchmark_review_only is only valid for an existing summary sheet"
             )
+        aliases = route.get("code_aliases") or []
+        if not isinstance(aliases, list):
+            errors.append(f"{prefix}.code_aliases must be a list of exact code strings")
+            aliases = []
+        normalized_aliases: list[str] = []
+        for alias in aliases:
+            normalized = normalize_code(alias)
+            if not isinstance(alias, str) or not normalized:
+                errors.append(
+                    f"{prefix}.code_aliases must contain non-empty quoted strings"
+                )
+                continue
+            normalized_aliases.append(normalized)
+        if len(normalized_aliases) != len(set(normalized_aliases)):
+            errors.append(f"{prefix}.code_aliases contains duplicates")
+        if code and code in normalized_aliases:
+            errors.append(f"{prefix}.code_aliases must not repeat the primary code")
         policy = str(route.get("cumulative_policy", "require"))
         if policy not in {"require", "unit", "offset"}:
             errors.append(f"{prefix}.cumulative_policy is invalid")
@@ -299,6 +368,20 @@ def validate_config(config: dict[str, Any]) -> None:
                 errors.append(
                     f"{prefix}.series_start must be a real date in YYYY-MM-DD form"
                 )
+        baseline_overlap = route.get("baseline_overlap")
+        if (
+            baseline_overlap is not None
+            and baseline_overlap != "last_existing_point"
+        ):
+            errors.append(
+                f"{prefix}.baseline_overlap must be last_existing_point when present"
+            )
+        if baseline_overlap == "last_existing_point" and not route.get(
+            "series_start"
+        ):
+            errors.append(
+                f"{prefix}.baseline_overlap requires series_start"
+            )
         try:
             max_staleness = int(route.get("max_staleness_days", 14))
             if (
@@ -358,11 +441,70 @@ def validate_config(config: dict[str, Any]) -> None:
                     errors.append(
                         f"sender {sender} has multiple routes; allow_sender_only is unsafe"
                     )
-        codes = [normalize_code(route.get("code")) for route in sender_routes]
-        if len([code for code in codes if code]) != len(
-            set(code for code in codes if code)
-        ):
-            errors.append(f"sender {sender} has duplicate route codes")
+        codes: list[str] = []
+        for route in sender_routes:
+            primary = normalize_code(route.get("code"))
+            if primary:
+                codes.append(primary)
+            codes.extend(
+                normalized
+                for alias in route.get("code_aliases") or []
+                if (normalized := normalize_code(alias))
+            )
+        if len(codes) != len(set(codes)):
+            errors.append(f"sender {sender} has duplicate primary or alias route codes")
+
+    sheet_reviews = config.get("sheet_reviews") or {}
+    if not isinstance(sheet_reviews, dict):
+        errors.append("sheet_reviews must be an object")
+    else:
+        source_sheets = {
+            str(route["benchmark"]["source_sheet"])
+            for route in routes
+            if isinstance(route, dict)
+            and isinstance(route.get("benchmark"), dict)
+            and route["benchmark"].get("source_sheet")
+        }
+        for sheet, review in sheet_reviews.items():
+            prefix = f"sheet_reviews.{sheet}"
+            if (
+                not isinstance(sheet, str)
+                or not sheet.strip()
+                or len(sheet) > 31
+                or re.search(r"[\\/*?:\[\]]", sheet)
+            ):
+                errors.append(
+                    "sheet_reviews keys must be valid non-empty Excel sheet names"
+                )
+                continue
+            if sheet in managed_sheets:
+                errors.append(f"{prefix} duplicates a managed route sheet")
+            if sheet in source_sheets:
+                errors.append(f"{prefix} duplicates a benchmark source sheet")
+            if not isinstance(review, dict):
+                errors.append(f"{prefix} must be an object")
+                continue
+            for field in sorted(set(review) - SHEET_REVIEW_FIELDS):
+                errors.append(f"{prefix} has unknown field: {field}")
+            status = review.get("status")
+            if status not in SHEET_REVIEW_STATUSES:
+                errors.append(
+                    f"{prefix}.status must be excluded, no_mail_evidence, "
+                    "local_parser_required, or business_review"
+                )
+            reason = review.get("reason")
+            if (
+                not isinstance(reason, str)
+                or not reason.strip()
+                or len(reason.strip()) > 200
+                or "\n" in reason
+                or "\r" in reason
+                or reason.lstrip().startswith("=")
+            ):
+                errors.append(
+                    f"{prefix}.reason must be a non-empty, non-formula "
+                    "single-line string of at most 200 characters"
+                )
 
     for index, item in enumerate(config.get("schedule") or [], 1):
         if not isinstance(item, dict):

@@ -9,7 +9,7 @@ import json
 import shutil
 import subprocess
 import sys
-import warnings
+import zipfile
 from copy import deepcopy
 from email.message import EmailMessage
 from pathlib import Path
@@ -18,6 +18,7 @@ from typing import Any
 import openpyxl
 from openpyxl.styles import Border, Font, PatternFill, Side
 from openpyxl.worksheet.formula import ArrayFormula
+from pypdf import PdfWriter
 
 
 def check(condition: bool, message: str) -> None:
@@ -147,6 +148,7 @@ def parser_tests(runtime: Path) -> None:
     sys.path.insert(0, str(runtime))
     import nav_mail
     import nav_parse
+    import nav_products
     import navctl
     from nav_parse import (
         ParseError,
@@ -164,6 +166,7 @@ def parser_tests(runtime: Path) -> None:
         fetch_candidate_messages,
         imap_date,
         needs_imap_id,
+        non_nav_subject_category,
         single_from_address,
     )
     from runtime_secret import (
@@ -171,6 +174,114 @@ def parser_tests(runtime: Path) -> None:
         SecretInputCancelled,
         _read_interactive_secret,
         _read_masked,
+    )
+
+    utf8_args_path = runtime / "utf8-args.txt"
+    utf8_args_path.write_text(
+        "\ufeff# UTF-8 参数文件\n"
+        "propose\n"
+        "--sender\n"
+        "sender@example.invalid\n"
+        "--subject-contains\n"
+        "示例产品净值通知\n",
+        encoding="utf-8",
+    )
+    expanded_args, used_argfile = navctl.expand_utf8_argfiles(
+        [f"@{utf8_args_path}"]
+    )
+    check(
+        used_argfile
+        and expanded_args
+        == [
+            "propose",
+            "--sender",
+            "sender@example.invalid",
+            "--subject-contains",
+            "示例产品净值通知",
+        ],
+        "UTF-8 argument file did not preserve Chinese filter text",
+    )
+    navctl.validate_filter_encoding("示例产品净值通知", "--subject-contains")
+    mojibake_filter = "净值通知".encode("utf-8").decode("latin1")
+    try:
+        navctl.validate_filter_encoding(
+            mojibake_filter, "--subject-contains"
+        )
+    except ValueError as exc:
+        check(
+            "疑似被终端错误解码" in str(exc)
+            and "UTF-8 参数文件" in str(exc),
+            "mojibake filter returned the wrong diagnostic",
+        )
+    else:
+        raise AssertionError("mojibake filter was accepted")
+    invalid_args_path = runtime / "invalid-args.txt"
+    invalid_args_path.write_bytes(b"\xff")
+    try:
+        navctl.expand_utf8_argfiles([f"@{invalid_args_path}"])
+    except ValueError as exc:
+        check(
+            "必须使用 UTF-8" in str(exc),
+            "non-UTF-8 argument file returned the wrong diagnostic",
+        )
+    else:
+        raise AssertionError("non-UTF-8 argument file was accepted")
+
+    coverage_config = {
+        "routes": [
+            {"sheet": "活动产品"},
+            {
+                "sheet": "基准待审产品",
+                "benchmark_review_only": True,
+            },
+            {"sheet": "暂停产品", "paused": True},
+        ],
+        "sheet_reviews": {
+            "归档产品": {"status": "excluded", "reason": "已完成本地核实"},
+            "解析待补": {
+                "status": "local_parser_required",
+                "reason": "正式通知需要专用解析器",
+            },
+            "业务待核": {
+                "status": "business_review",
+                "reason": "持续来源尚未确认",
+            },
+            "无邮件证据": {
+                "status": "no_mail_evidence",
+                "reason": "有界回看期无代码或名称命中",
+            },
+        },
+    }
+    coverage = nav_products._coverage_matrix(
+        coverage_config,
+        [
+            "活动产品",
+            "基准待审产品",
+            "暂停产品",
+            "指数参考",
+            "归档产品",
+            "解析待补",
+            "业务待核",
+            "无邮件证据",
+            "未分类页",
+        ],
+        {"活动产品", "基准待审产品", "暂停产品"},
+        {"指数参考"},
+    )
+    check(
+        coverage["total_workbook_sheets"] == 9
+        and coverage["classified_sheets"] == 8
+        and not coverage["all_sheets_classified"]
+        and coverage["action_required_sheets"] == 4
+        and coverage["counts"]["active"] == 1
+        and coverage["counts"]["active_review_required"] == 1
+        and coverage["counts"]["reference"] == 1
+        and coverage["counts"]["excluded"] == 1
+        and coverage["counts"]["no_mail_evidence"] == 1
+        and coverage["counts"]["local_parser_required"] == 1
+        and coverage["counts"]["business_review"] == 1
+        and coverage["counts"]["unclassified"] == 1,
+        "workbook coverage matrix did not classify every sheet outcome",
     )
 
     try:
@@ -290,6 +401,12 @@ def parser_tests(runtime: Path) -> None:
         and needs_imap_id("imap.yeah.net")
         and not needs_imap_id("imap.qq.com"),
         "NetEase IMAP host detection is incorrect",
+    )
+    check(
+        non_nav_subject_category("示例产品季报") == "periodic-report"
+        and non_nav_subject_category("示例产品季报净值通知") is None
+        and non_nav_subject_category("Example quarterly report NAV") is None,
+        "built-in report exclusions swallowed a subject with explicit NAV semantics",
     )
 
     original_ssl = nav_mail.imaplib.IMAP4_SSL
@@ -479,7 +596,7 @@ def parser_tests(runtime: Path) -> None:
     routed_headers: dict[bytes, bytes] = {}
     for uid, subject in (
         (b"1", "TARGET weekly NAV"),
-        (b"2", "unrelated custody notice"),
+        (b"2", "quarterly report"),
         (b"3", "TARGET valuation"),
         (b"4", "another unrelated notice"),
     ):
@@ -500,7 +617,12 @@ def parser_tests(runtime: Path) -> None:
         def uid(self, command, *_args):
             routed_calls.append((command, _args))
             if command == "search":
-                return "OK", [b"1 2 3 4"]
+                query = str(_args[-1]).upper()
+                if "FROM" in query and "SUBJECT" in query:
+                    return "OK", [b"1 3"]
+                if "FROM" in query:
+                    return "OK", [b"1 2 3 4"]
+                return "OK", [b" ".join(str(uid).encode("ascii") for uid in range(1, 3005))]
             request = str(_args[-1])
             requested = _args[0].split(b",")
             if "HEADER.FIELDS" in request:
@@ -563,6 +685,128 @@ def parser_tests(runtime: Path) -> None:
         and full_fetch_uids == [b"1", b"3"],
         "authorized sender mail was not header-filtered before message limits and full download",
     )
+    check(
+        [
+            getattr(message, "_nav_source_uid", None)
+            for message in routed_messages["sender@example.invalid"]
+        ]
+        == [1, 3],
+        "authorized messages did not retain mailbox order for correction auditing",
+    )
+    transient_disconnects = {"remaining": 1, "connections": 0}
+
+    class ReconnectingRoutedIMAP(RoutedIMAP):
+        def __init__(self):
+            transient_disconnects["connections"] += 1
+
+        def uid(self, command, *_args):
+            if (
+                command == "fetch"
+                and str(_args[-1]) == "(BODY.PEEK[])"
+                and transient_disconnects["remaining"]
+            ):
+                transient_disconnects["remaining"] -= 1
+                raise nav_mail.imaplib.IMAP4.abort(
+                    "fixture transient disconnect"
+                )
+            return super().uid(command, *_args)
+
+    routed_calls.clear()
+    nav_mail.connect = lambda _config: ReconnectingRoutedIMAP()
+    try:
+        reconnected_messages = fetch_authorized_messages(routed_config)
+    finally:
+        nav_mail.connect = original_connect
+    check(
+        len(reconnected_messages["sender@example.invalid"]) == 2
+        and reconnected_messages.reconnect_count == 1
+        and transient_disconnects["connections"] == 2
+        and [
+            getattr(message, "_nav_source_uid", None)
+            for message in reconnected_messages["sender@example.invalid"]
+        ]
+        == [1, 3],
+        "authorized discovery did not reconnect and resume at the current UID",
+    )
+
+    changed_uidvalidity_connections = {"count": 0}
+
+    class ChangedUIDValidityIMAP(RoutedIMAP):
+        def __init__(self):
+            changed_uidvalidity_connections["count"] += 1
+            self.connection_number = changed_uidvalidity_connections["count"]
+
+        def response(self, _name):
+            return "UIDVALIDITY", [
+                str(100 + self.connection_number).encode("ascii")
+            ]
+
+        def uid(self, command, *_args):
+            if (
+                self.connection_number == 1
+                and command == "fetch"
+                and str(_args[-1]) == "(BODY.PEEK[])"
+            ):
+                raise nav_mail.imaplib.IMAP4.abort(
+                    "fixture mailbox identity changed"
+                )
+            return super().uid(command, *_args)
+
+    nav_mail.connect = lambda _config: ChangedUIDValidityIMAP()
+    try:
+        fetch_authorized_messages(routed_config)
+    except MailError as exc:
+        check(
+            "UIDVALIDITY" in str(exc)
+            and "fixture mailbox identity changed" not in str(exc),
+            "changed mailbox identity returned the wrong reconnect error",
+        )
+    else:
+        raise AssertionError(
+            "authorized discovery resumed after UIDVALIDITY changed"
+        )
+    finally:
+        nav_mail.connect = original_connect
+    routed_calls.clear()
+    nav_mail.connect = lambda _config: RoutedIMAP()
+    try:
+        routed_scope = fetch_authorized_messages(
+            routed_config, load_bodies=False
+        )
+    finally:
+        nav_mail.connect = original_connect
+    check(
+        routed_scope.scope_fingerprint
+        == routed_messages.scope_fingerprint
+        and routed_scope.messages_selected == 2
+        and not any(
+            call[0] == "fetch"
+            and str(call[1][-1]) == "(BODY.PEEK[])"
+            for call in routed_calls
+        ),
+        "lightweight mailbox scope verification downloaded full message bodies",
+    )
+    excluded_config = json.loads(json.dumps(routed_config))
+    excluded_config["routes"][0]["subject_excludes"] = ["valuation"]
+    routed_calls.clear()
+    nav_mail.connect = lambda _config: RoutedIMAP()
+    try:
+        excluded_messages = fetch_authorized_messages(excluded_config)
+    finally:
+        nav_mail.connect = original_connect
+    excluded_full_fetch_uids = [
+        call[1][0]
+        for call in routed_calls
+        if call[0] == "fetch" and str(call[1][-1]) == "(BODY.PEEK[])"
+    ]
+    check(
+        len(excluded_messages["sender@example.invalid"]) == 1
+        and excluded_full_fetch_uids == [b"1"]
+        and excluded_messages.excluded_non_nav_messages == 1
+        and excluded_messages.excluded_non_nav_reasons
+        == {"configured-subject-exclude": 1},
+        "confirmed subject exclusions were not applied before full message download",
+    )
     routed_calls.clear()
     nav_mail.connect = lambda _config: RoutedIMAP()
     try:
@@ -580,10 +824,59 @@ def parser_tests(runtime: Path) -> None:
     ]
     check(
         len(selected_candidates) == 2
-        and selected_scan["headers_fetched"] == 4
+        and selected_scan["headers_fetched"] == 2
+        and selected_scan["server_since_matches"] == 3004
+        and selected_scan["server_sender_matches"] == 2
+        and selected_scan["server_subject_filter_applied"]
         and selected_scan["messages_selected"] == 2
         and selected_full_fetch_uids == [b"3", b"1"],
-        "selected proposal scan downloaded messages outside the exact sender/subject scope",
+        "selected proposal scan did not narrow at the server before exact local verification",
+    )
+    import nav_service
+
+    nav_mail.connect = lambda _config: RoutedIMAP()
+    try:
+        first_chunk = nav_service.propose_routes(
+            routed_config,
+            sender="sender@example.invalid",
+            subject_contains="TARGET",
+            lookback_days=30,
+            batch_messages=1,
+            time_budget_seconds=120,
+        )
+        from nav_products import ProductError, sync as sync_products
+
+        try:
+            sync_products(routed_config, refresh=False)
+        except ProductError as exc:
+            check(
+                "尚未完成" in str(exc),
+                "partial proposal blocked products with the wrong error",
+            )
+        else:
+            raise AssertionError("products accepted a stale proposal during resume")
+        second_chunk = nav_service.propose_routes(
+            routed_config,
+            batch_messages=1,
+            time_budget_seconds=120,
+            resume=True,
+        )
+    finally:
+        nav_mail.connect = original_connect
+    progress_report = json.loads(
+        (runtime / "route-proposal-progress.json").read_text(encoding="utf-8")
+    )
+    check(
+        not first_chunk["passed"]
+        and first_chunk["partial"]
+        and first_chunk["resume_available"]
+        and second_chunk["passed"]
+        and not second_chunk["partial"]
+        and second_chunk["scan"]["chunks_completed"] == 2
+        and len(second_chunk["candidates"][0]["observations"]) == 2
+        and progress_report["status"] == "complete"
+        and not (runtime / "route-proposals.partial.json").exists(),
+        "bounded proposal scan did not publish progress or resume from its UID cursor",
     )
     unfiltered_config = json.loads(json.dumps(routed_config))
     unfiltered_config["routes"][0].pop("subject_contains")
@@ -595,10 +888,78 @@ def parser_tests(runtime: Path) -> None:
     finally:
         nav_mail.connect = original_connect
     check(
-        len(unfiltered_messages["sender@example.invalid"]) == 4,
-        "a route without subject_contains silently excluded authorized sender mail",
+        len(unfiltered_messages["sender@example.invalid"]) == 3
+        and unfiltered_messages.excluded_non_nav_messages == 1
+        and unfiltered_messages.excluded_non_nav_reasons == {"periodic-report": 1},
+        "built-in non-NAV exclusions did not report a controlled reason before download",
     )
+    snapshot_config = json.loads(json.dumps(routed_config))
+    snapshot_config["routes"][0]["max_staleness_days"] = 366
+    routed_calls.clear()
+    nav_mail.connect = lambda _config: RoutedIMAP()
+    try:
+        snapshot_rows, snapshot_report = nav_service.collect_route_rows(
+            snapshot_config
+        )
+    finally:
+        nav_mail.connect = original_connect
+    reused_config = json.loads(json.dumps(snapshot_config))
+    reused_config["routes"][0]["benchmark_review_only"] = True
+    routed_calls.clear()
+    nav_mail.connect = lambda _config: RoutedIMAP()
+    try:
+        reused_rows, reused_report = nav_service.reuse_discovery_snapshot(
+            reused_config
+        )
+    finally:
+        nav_mail.connect = original_connect
+    check(
+        snapshot_report["passed"]
+        and len(snapshot_rows["Demo Fund"]) == 2
+        and len(reused_rows["Demo Fund"]) == 2
+        and reused_report["discovery_reused"]
+        and reused_report["mail_scope_reverified"]
+        and not any(
+            call[0] == "fetch"
+            and str(call[1][-1]) == "(BODY.PEEK[])"
+            for call in routed_calls
+        ),
+        "verified discovery snapshot was not reused without full body downloads",
+    )
+    original_scope_header = routed_headers[b"3"]
+    routed_headers[b"3"] = (
+        b"From: NAV Desk <sender@example.invalid>\r\n"
+        b"Subject: TARGET valuation revised\r\n\r\n"
+    )
+    nav_mail.connect = lambda _config: RoutedIMAP()
+    try:
+        try:
+            nav_service.reuse_discovery_snapshot(reused_config)
+        except RuntimeError as exc:
+            check(
+                "邮箱范围" in str(exc),
+                "changed mailbox scope rejected the snapshot for the wrong reason",
+            )
+        else:
+            raise AssertionError(
+                "changed mailbox scope reused a stale discovery snapshot"
+            )
+    finally:
+        nav_mail.connect = original_connect
+        routed_headers[b"3"] = original_scope_header
+    changed_snapshot_config = json.loads(json.dumps(snapshot_config))
+    changed_snapshot_config["routes"][0]["subject_contains"] = "CHANGED"
+    try:
+        nav_service.reuse_discovery_snapshot(changed_snapshot_config)
+    except RuntimeError as exc:
+        check(
+            "路由" in str(exc),
+            "changed routing rules rejected the snapshot for the wrong reason",
+        )
+    else:
+        raise AssertionError("changed routing rules reused a stale discovery snapshot")
     bounded_config = json.loads(json.dumps(routed_config))
+    bounded_config["routes"][0].pop("subject_contains")
     bounded_config["imap"]["max_header_messages"] = 3
     bounded_config["imap"]["max_messages"] = 2
     routed_calls.clear()
@@ -673,18 +1034,30 @@ def parser_tests(runtime: Path) -> None:
         any(row.date == dt.date(2026, 1, 16) for row in parsed),
         "multi-sheet attachment parsing or 估值基准日 alias recognition failed",
     )
-    original_openpyxl_load = nav_parse.openpyxl.load_workbook
-
-    def warning_openpyxl_load(*args, **kwargs):
-        warnings.warn("fixture workbook repair detail", UserWarning, stacklevel=2)
-        return original_openpyxl_load(*args, **kwargs)
-
-    nav_parse.openpyxl.load_workbook = warning_openpyxl_load
-    try:
-        warning_rows = rows_from_message(message)
-        library_warnings = nav_parse.consume_parse_library_warnings()
-    finally:
-        nav_parse.openpyxl.load_workbook = original_openpyxl_load
+    warning_buffer = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as source_archive:
+        with zipfile.ZipFile(warning_buffer, "w") as target_archive:
+            for item in source_archive.infolist():
+                payload = source_archive.read(item.filename)
+                if item.filename == "xl/styles.xml":
+                    payload = (
+                        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                        b'<styleSheet xmlns="http://schemas.openxmlformats.org/'
+                        b'spreadsheetml/2006/main"/>'
+                    )
+                target_archive.writestr(item, payload)
+    warning_message = EmailMessage()
+    warning_message["From"] = "Warning Desk <warning@example.invalid>"
+    warning_message["Subject"] = "WARNING NAV fixture"
+    warning_message.set_content("See attachment")
+    warning_message.add_attachment(
+        warning_buffer.getvalue(),
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="warning-fixture.xlsx",
+    )
+    warning_rows = rows_from_message(warning_message)
+    library_warnings = nav_parse.consume_parse_library_warnings()
     check(
         warning_rows
         and library_warnings
@@ -694,8 +1067,150 @@ def parser_tests(runtime: Path) -> None:
             "source_type": "xlsx-attachment",
             "category": "UserWarning",
         }
-        and "fixture workbook repair detail" not in json.dumps(library_warnings),
+        and "Workbook contains no stylesheet" not in json.dumps(library_warnings),
         "openpyxl warnings were not recorded as sanitized structured diagnostics",
+    )
+    original_candidate_fetch = nav_service.fetch_candidate_messages
+    nav_service.fetch_candidate_messages = lambda *_args, **_kwargs: (
+        [warning_message],
+        {
+            "messages_found": 3004,
+            "server_since_matches": 3004,
+            "server_sender_matches": 1,
+            "headers_fetched": 1,
+            "messages_selected": 1,
+            "messages_fetched": 1,
+            "bytes_fetched": len(warning_buffer.getvalue()),
+            "skipped_oversize": 0,
+            "truncated": False,
+            "selection_applied": True,
+            "selection": {
+                "mode": "sender-subject",
+                "sender": "warning@example.invalid",
+                "subject_contains": "WARNING",
+            },
+        },
+    )
+    try:
+        warning_report = nav_service.propose_routes(
+            mail_config,
+            sender="warning@example.invalid",
+            subject_contains="WARNING",
+        )
+    finally:
+        nav_service.fetch_candidate_messages = original_candidate_fetch
+    serialized_warning_report = json.dumps(warning_report, ensure_ascii=False)
+    check(
+        warning_report["passed"]
+        and warning_report["selection"]["subject_contains"] == "WARNING"
+        and warning_report["candidates"][0]["selection"]
+        == warning_report["selection"]
+        and warning_report["parser_library_warnings"][0]["count"] == 1
+        and "Workbook contains no stylesheet" not in serialized_warning_report
+        and "warning-fixture.xlsx" not in serialized_warning_report,
+        "selected proposal did not preserve scope or sanitize real library warnings",
+    )
+
+    binding_message = EmailMessage()
+    binding_message["From"] = "Binding Desk <binding@example.invalid>"
+    binding_message["Subject"] = "BIND01 weekly NAV"
+    binding_message.set_content(
+        "NAV Date | Unit NAV | Cumulative NAV\n"
+        "2026-01-16 | 1.03 | 1.05"
+    )
+    nav_service.fetch_candidate_messages = lambda *_args, **_kwargs: (
+        [binding_message],
+        {
+            "messages_found": 1,
+            "server_since_matches": 1,
+            "server_sender_matches": 1,
+            "headers_fetched": 1,
+            "messages_selected": 1,
+            "matching_messages_in_range": 1,
+            "messages_fetched": 1,
+            "bytes_fetched": 100,
+            "skipped_oversize": 0,
+            "truncated": False,
+            "timed_out": False,
+            "range_complete": True,
+            "resume_before_uid": None,
+            "selection_applied": True,
+            "selection": {
+                "mode": "sender-subject",
+                "sender": "binding@example.invalid",
+                "subject_contains": "BIND01",
+            },
+        },
+    )
+    try:
+        binding_report = nav_service.propose_routes(
+            mail_config,
+            sender="binding@example.invalid",
+            subject_contains="BIND01",
+            subject_product_code="BIND01",
+        )
+    finally:
+        nav_service.fetch_candidate_messages = original_candidate_fetch
+    check(
+        binding_report["passed"]
+        and binding_report["candidates"][0]["detected_codes"] == ["BIND01"]
+        and binding_report["subject_code_binding"]["messages"] == 1
+        and binding_report["selection"]["subject_product_code"] == "BIND01"
+        and binding_report["candidates"][0]["observations"][0]["source"].endswith(
+            ":subject-product-code"
+        ),
+        "explicit subject product code did not bind a unique code-less NAV series",
+    )
+
+    gap_message = EmailMessage()
+    gap_message["From"] = "Gap Desk <gap@example.invalid>"
+    gap_message["Subject"] = "GAP01 report"
+    gap_message.set_content("Please review the proprietary attachment")
+    gap_message.add_attachment(
+        b"not a supported NAV format",
+        maintype="application",
+        subtype="octet-stream",
+        filename="private-name.bin",
+    )
+    nav_service.fetch_candidate_messages = lambda *_args, **_kwargs: (
+        [gap_message],
+        {
+            "messages_found": 1,
+            "headers_fetched": 1,
+            "messages_selected": 1,
+            "matching_messages_in_range": 1,
+            "messages_fetched": 1,
+            "bytes_fetched": 100,
+            "skipped_oversize": 0,
+            "truncated": False,
+            "timed_out": False,
+            "range_complete": True,
+            "resume_before_uid": None,
+            "selection": {
+                "mode": "sender-subject",
+                "sender": "gap@example.invalid",
+                "subject_contains": "GAP01",
+            },
+        },
+    )
+    try:
+        gap_report = nav_service.propose_routes(
+            mail_config,
+            sender="gap@example.invalid",
+            subject_contains="GAP01",
+        )
+    finally:
+        nav_service.fetch_candidate_messages = original_candidate_fetch
+    gap_serialized = json.dumps(gap_report, ensure_ascii=False)
+    check(
+        not gap_report["passed"]
+        and gap_report["parse_gap_summary"]["headers_matched"] == 1
+        and gap_report["parse_gap_summary"]["parsed_records"] == 0
+        and gap_report["parse_gap_summary"]["local_parser_recommended"]
+        and gap_report["parse_gap_summary"]["attachment_types"]
+        == {"application/octet-stream": 1}
+        and "private-name.bin" not in gap_serialized,
+        "matched-but-unparsed mail did not produce a sanitized parser-gap summary",
     )
 
     html_body = """
@@ -754,6 +1269,124 @@ def parser_tests(runtime: Path) -> None:
 
     parser_dir = runtime / "parsers"
     parser_dir.mkdir(exist_ok=True)
+    strict_example_name = "fixed_label_xlsx_example"
+    shutil.copy2(
+        runtime / "parser-examples" / "fixed_label_xlsx.py",
+        parser_dir / f"{strict_example_name}.py",
+    )
+
+    def fixed_label_message(
+        *,
+        nav_date: dt.date = dt.date(2026, 1, 30),
+        subject_date: dt.date | None = None,
+        unit: float = 1.03,
+        cumulative: float | None = 1.03,
+        product_name: str = "虚构示例产品",
+        manager: str = "虚构示例管理人",
+        duplicate_xlsx: bool = False,
+        include_pdf: bool = True,
+    ) -> EmailMessage:
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "净值通知"
+        values = (
+            ("产品代码", "SAMPLE01"),
+            ("产品名称", product_name),
+            ("净值日期", nav_date),
+            ("单位净值", unit),
+            ("累计净值", cumulative),
+            ("管理人", manager),
+            ("托管人", "虚构示例托管人"),
+        )
+        for row, (label, value) in enumerate(values, 1):
+            sheet.cell(row, 1, label)
+            sheet.cell(row, 2, value)
+        xlsx_buffer = io.BytesIO()
+        workbook.save(xlsx_buffer)
+        workbook.close()
+        actual_subject_date = subject_date or nav_date
+        message = EmailMessage()
+        message["Subject"] = (
+            f"SAMPLE01 净值通知 {actual_subject_date.isoformat()}"
+        )
+        message.set_content("请见附件。")
+        message.add_attachment(
+            xlsx_buffer.getvalue(),
+            maintype="application",
+            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename="sample.xlsx",
+        )
+        if duplicate_xlsx:
+            message.add_attachment(
+                xlsx_buffer.getvalue(),
+                maintype="application",
+                subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                filename="duplicate.xlsx",
+            )
+        if include_pdf:
+            pdf_buffer = io.BytesIO()
+            writer = PdfWriter()
+            writer.add_blank_page(width=200, height=200)
+            writer.write(pdf_buffer)
+            message.add_attachment(
+                pdf_buffer.getvalue(),
+                maintype="application",
+                subtype="pdf",
+                filename="sample.pdf",
+            )
+        return message
+
+    strict_rows = rows_from_message(
+        fixed_label_message(), f"local:{strict_example_name}"
+    )
+    check(
+        len(strict_rows) == 1
+        and strict_rows[0].code == "SAMPLE01"
+        and strict_rows[0].date == dt.date(2026, 1, 30)
+        and strict_rows[0].unit == 1.03
+        and strict_rows[0].cumulative == 1.03,
+        "strict fixed-label XLSX local parser example rejected a valid fixture",
+    )
+    invalid_strict_messages = (
+        fixed_label_message(product_name="错误身份"),
+        fixed_label_message(manager="错误管理人"),
+        fixed_label_message(subject_date=dt.date(2026, 1, 31)),
+        fixed_label_message(cumulative=None),
+        fixed_label_message(duplicate_xlsx=True),
+        fixed_label_message(include_pdf=False),
+    )
+    for invalid_message in invalid_strict_messages:
+        try:
+            rows_from_message(
+                invalid_message, f"local:{strict_example_name}"
+            )
+        except ParseError:
+            pass
+        else:
+            raise AssertionError(
+                "strict fixed-label XLSX parser accepted invalid identity, "
+                "date, cumulative NAV, or attachment structure"
+            )
+    strict_conflict_rows = [
+        *strict_rows,
+        *rows_from_message(
+            fixed_label_message(unit=1.04, cumulative=1.04),
+            f"local:{strict_example_name}",
+        ),
+    ]
+    try:
+        choose_route_rows(
+            strict_conflict_rows,
+            {"code": "SAMPLE01", "sheet": "示例产品", "allow_sender_only": False},
+            True,
+        )
+    except ParseError:
+        pass
+    else:
+        raise AssertionError(
+            "strict fixed-label XLSX parser regression did not expose a same-day conflict"
+        )
+
     (parser_dir / "fixture.py").write_text(
         "from datetime import date\n"
         "from nav_parse import NavRow\n\n"
@@ -825,6 +1458,7 @@ def parser_tests(runtime: Path) -> None:
 def route_state_tests(runtime: Path) -> None:
     sys.path.insert(0, str(runtime))
     import nav_service
+    import navctl
 
     book = runtime / "route-state-placeholder.xlsx"
     create_book(book)
@@ -885,6 +1519,35 @@ def route_state_tests(runtime: Path) -> None:
         and any("no routed NAV rows" in item for item in report["errors"]),
         "active route with no messages reported discovery success",
     )
+    binding_config = json.loads(json.dumps(config))
+    binding_route = binding_config["routes"][0]
+    binding_route["code"] = "BIND01"
+    binding_route["subject_contains"] = "BIND01"
+    binding_route["subject_product_code"] = "BIND01"
+    binding_route["max_staleness_days"] = 366
+    binding_message = EmailMessage()
+    binding_message["From"] = "NAV Desk <sender@example.invalid>"
+    binding_message["Subject"] = "BIND01 weekly NAV"
+    binding_message.set_content(
+        "NAV Date | Unit NAV | Cumulative NAV\n"
+        "2026-07-17 | 1.03 | 1.05"
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [binding_message]
+    }
+    try:
+        binding_rows, binding_route_report = nav_service.collect_route_rows(
+            binding_config
+        )
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    check(
+        binding_route_report["passed"]
+        and binding_rows["Demo Fund"][0].code == "BIND01"
+        and binding_route_report["routes"][0]["subject_code_binding_messages"] == 1
+        and any("主题产品代码证据" in item for item in binding_route_report["warnings"]),
+        "configured subject product code binding was not visible in routed preview evidence",
+    )
     sensitive_subject = "机密产品甲净值通知"
     sensitive_attachment = "客户私密估值表.xlsx"
     failed_message = EmailMessage()
@@ -914,6 +1577,63 @@ def route_state_tests(runtime: Path) -> None:
         and sensitive_subject not in serialized_failure
         and sensitive_attachment not in serialized_failure,
         "parse diagnostics did not identify the failure without leaking sensitive names",
+    )
+    non_nav_message = EmailMessage()
+    non_nav_message["From"] = "NAV Desk <sender@example.invalid>"
+    non_nav_subject = "DEMO01 account service notice"
+    non_nav_message["Subject"] = non_nav_subject
+    non_nav_message.set_content("This fixture contains no structured values.")
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [non_nav_message]
+    }
+    try:
+        _, non_nav_report = nav_service.collect_route_rows(config)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    serialized_non_nav = json.dumps(non_nav_report, ensure_ascii=False)
+    check(
+        not non_nav_report["passed"]
+        and non_nav_report["diagnostics"][0]["notice_classification"]
+        == "likely-non-nav-notice"
+        and non_nav_report["diagnostics"][0]["suggested_filter"]["field"]
+        == "subject_excludes"
+        and non_nav_subject not in serialized_non_nav,
+        "non-NAV messages did not produce a redacted exclusion diagnostic",
+    )
+
+    pdf_buffer = io.BytesIO()
+    pdf_writer = PdfWriter()
+    pdf_writer.add_blank_page(width=72, height=72)
+    pdf_writer.write(pdf_buffer)
+    pdf_message = EmailMessage()
+    pdf_message["From"] = "NAV Desk <sender@example.invalid>"
+    pdf_message["Subject"] = "DEMO01 NAV PDF fixture"
+    pdf_message.set_content("See attached reports.")
+    pdf_names = ["private-report-one.pdf", "private-report-two.pdf"]
+    for pdf_name in pdf_names:
+        pdf_message.add_attachment(
+            pdf_buffer.getvalue(),
+            maintype="application",
+            subtype="pdf",
+            filename=pdf_name,
+        )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [pdf_message]
+    }
+    try:
+        _, pdf_report = nav_service.collect_route_rows(config)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    serialized_pdf = json.dumps(pdf_report, ensure_ascii=False)
+    pdf_diagnostics = pdf_report["diagnostics"][0]["attachment_diagnostics"]
+    check(
+        not pdf_report["passed"]
+        and len(pdf_diagnostics) == 2
+        and len({item["attachment_id"] for item in pdf_diagnostics}) == 2
+        and all(item["suffix"] == ".pdf" for item in pdf_diagnostics)
+        and all(item["status"] == "no-nav-records" for item in pdf_diagnostics)
+        and all(name not in serialized_pdf for name in pdf_names),
+        "PDF parser gaps were not reported per attachment with redacted fingerprints",
     )
     local_failure_config = json.loads(json.dumps(config))
     local_failure_config["routes"][0]["parser"] = "local:sensitive_failure"
@@ -959,6 +1679,299 @@ def route_state_tests(runtime: Path) -> None:
         and len(mixed_rows["Demo Fund"]) == 1
         and len(mixed_rows["Second Fund"]) == 1,
         "multiple trusted parsers for one sender were not merged and routed safely",
+    )
+    check(
+        report["route_overlaps"]
+        and report["route_overlaps"][0]["reason"]
+        == "overlapping-message-scope"
+        and len(report["route_overlaps"][0]["routes"]) == 2
+        and report["route_overlaps"][0]["suggested_filter"]["rerun_sheets"],
+        "overlapping route scopes were not reported as a minimal route pair",
+    )
+
+    conflict_config = json.loads(json.dumps(config))
+    conflict_config["routes"][0]["max_staleness_days"] = 3660
+    conflict_message = EmailMessage()
+    conflict_message["Subject"] = "Weekly NAV conflict fixture"
+    conflict_message.set_content(
+        "Product Code | NAV Date | Unit NAV | Cumulative NAV\n"
+        "DEMO01 | 2026-07-17 | 1.10 | 1.10\n"
+        "DEMO01 | 2026-07-17 | 1.11 | 1.11"
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [conflict_message]
+    }
+    try:
+        _, conflict_report = nav_service.collect_route_rows(conflict_config)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    serialized_conflict = json.dumps(conflict_report, ensure_ascii=False)
+    check(
+        not conflict_report["passed"]
+        and conflict_report["date_conflicts"]
+        and conflict_report["date_conflicts"][0]["date"] == "2026-07-17"
+        and len(conflict_report["date_conflicts"][0]["candidate_sources"]) == 2
+        and conflict_report["date_conflicts"][0]["suggested_filter"]["rerun_sheet"]
+        == "Demo Fund"
+        and "1.10" not in serialized_conflict
+        and "1.11" not in serialized_conflict,
+        "same-date conflicts did not expose actionable redacted fingerprints",
+    )
+
+    bounded_conflict_config = json.loads(json.dumps(conflict_config))
+    bounded_conflict_config["routes"][0]["series_start"] = "2026-07-18"
+    bounded_conflict_message = EmailMessage()
+    bounded_conflict_message["Subject"] = "Weekly NAV bounded conflict fixture"
+    bounded_conflict_message.set_content(
+        "Product Code | NAV Date | Unit NAV | Cumulative NAV\n"
+        "DEMO01 | 2026-07-17 | 1.10 | 1.10\n"
+        "DEMO01 | 2026-07-17 | 1.11 | 1.11\n"
+        "DEMO01 | 2026-07-18 | 1.12 | 1.12"
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [bounded_conflict_message]
+    }
+    try:
+        bounded_rows, bounded_conflict_report = nav_service.collect_route_rows(
+            bounded_conflict_config
+        )
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    check(
+        bounded_conflict_report["passed"]
+        and not bounded_conflict_report["date_conflicts"]
+        and bounded_conflict_report["pre_managed_rows_ignored"] == 2
+        and [row.date for row in bounded_rows["Demo Fund"]]
+        == [dt.date(2026, 7, 18)],
+        "pre-managed same-date conflicts blocked or entered the managed route",
+    )
+    overlap_config = json.loads(json.dumps(conflict_config))
+    overlap_config["routes"][0]["series_start"] = "2026-07-18"
+    overlap_config["routes"][0]["baseline_overlap"] = "last_existing_point"
+    overlap_message = EmailMessage()
+    overlap_message["Subject"] = "Weekly NAV overlap fixture"
+    overlap_message.set_content(
+        "Product Code | NAV Date | Unit NAV | Cumulative NAV\n"
+        "DEMO01 | 2026-07-17 | 1.10 | 1.10"
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [overlap_message]
+    }
+    try:
+        overlap_rows, overlap_report = nav_service.collect_route_rows(
+            overlap_config
+        )
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    check(
+        overlap_report["passed"]
+        and overlap_report["routes"][0]["verification_anchor_date"]
+        == "2026-07-17"
+        and [row.date for row in overlap_rows["Demo Fund"]]
+        == [dt.date(2026, 7, 17)],
+        "last-existing-point overlap did not survive routing as a read-only anchor",
+    )
+
+    def correction_fixture(
+        subject: str,
+        uid: int,
+        value_rows: list[tuple[float, float]],
+        message_id: str,
+    ) -> EmailMessage:
+        message = EmailMessage()
+        message["From"] = "NAV Desk <sender@example.invalid>"
+        message["Subject"] = subject
+        message["Date"] = (
+            f"Fri, 17 Jul 2026 {8 + uid % 10:02d}:00:00 +0800"
+        )
+        message["Message-ID"] = f"<{message_id}@example.invalid>"
+        lines = ["Product Code | NAV Date | Unit NAV | Cumulative NAV"]
+        lines.extend(
+            f"DEMO01 | 2026-07-17 | {unit:.4f} | {cumulative:.4f}"
+            for unit, cumulative in value_rows
+        )
+        message.set_content("\n".join(lines))
+        setattr(message, "_nav_source_uid", uid)
+        return message
+
+    original_notice = correction_fixture(
+        "Weekly NAV", 100, [(1.10, 1.10)], "original-notice"
+    )
+    correction_subject = "Weekly NAV 更正通知（以此为准）"
+    correction_notice = correction_fixture(
+        correction_subject,
+        101,
+        [(1.11, 1.11)],
+        "correction-notice",
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [original_notice, correction_notice]
+    }
+    try:
+        corrected_rows, corrected_report = nav_service.collect_route_rows(
+            conflict_config
+        )
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    serialized_corrected = json.dumps(corrected_report, ensure_ascii=False)
+    check(
+        corrected_report["passed"]
+        and len(corrected_rows["Demo Fund"]) == 1
+        and corrected_rows["Demo Fund"][0].unit == 1.11
+        and corrected_report["corrections_applied"]
+        and corrected_report["corrections_applied"][0]["order_basis"]
+        == "mailbox-uid"
+        and len(corrected_report["corrections_applied"][0]["replaced"]) == 1
+        and correction_subject not in serialized_corrected
+        and "1.1000" not in serialized_corrected
+        and "1.1100" not in serialized_corrected,
+        "a later explicit correction did not replace the original with redacted audit evidence",
+    )
+
+    ordinary_late_notice = correction_fixture(
+        "Weekly NAV resend", 102, [(1.12, 1.12)], "ordinary-late-notice"
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [original_notice, ordinary_late_notice]
+    }
+    try:
+        _, ordinary_late_report = nav_service.collect_route_rows(conflict_config)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    check(
+        not ordinary_late_report["passed"]
+        and ordinary_late_report["date_conflicts"]
+        and not ordinary_late_report["corrections_applied"],
+        "a normal later message incorrectly overwrote an earlier same-date value",
+    )
+
+    early_correction = correction_fixture(
+        "Weekly NAV corrected", 99, [(1.11, 1.11)], "early-correction"
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [early_correction, original_notice]
+    }
+    try:
+        _, early_correction_report = nav_service.collect_route_rows(conflict_config)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    check(
+        not early_correction_report["passed"]
+        and early_correction_report["date_conflicts"]
+        and not early_correction_report["corrections_applied"],
+        "an earlier correction-labeled message incorrectly overwrote a later original",
+    )
+
+    internally_conflicting_correction = correction_fixture(
+        "Weekly NAV 修正通知",
+        101,
+        [(1.11, 1.11), (1.12, 1.12)],
+        "internally-conflicting-correction",
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [original_notice, internally_conflicting_correction]
+    }
+    try:
+        _, internal_conflict_report = nav_service.collect_route_rows(conflict_config)
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    check(
+        not internal_conflict_report["passed"]
+        and internal_conflict_report["date_conflicts"]
+        and not internal_conflict_report["corrections_applied"],
+        "multiple values inside one correction message did not fail closed",
+    )
+
+    scoped_config = json.loads(json.dumps(config))
+    scoped_config["routes"][0]["max_staleness_days"] = 3660
+    scoped_second = json.loads(json.dumps(scoped_config["routes"][0]))
+    scoped_second.update({"sheet": "Second Fund", "code": "DEMO02"})
+    scoped_config["routes"].append(scoped_second)
+    scoped_message = EmailMessage()
+    scoped_message["Subject"] = "Weekly NAV scoped fixture"
+    scoped_message.set_content(
+        "Product Code | NAV Date | Unit NAV | Cumulative NAV\n"
+        "DEMO01 | 2026-07-17 | 1.10 | 1.10"
+    )
+    captured_scope: list[list[str]] = []
+
+    def scoped_fetch(test_config: dict[str, Any]) -> dict[str, list[EmailMessage]]:
+        captured_scope.append(
+            [str(route["sheet"]) for route in test_config.get("routes") or []]
+        )
+        return {"sender@example.invalid": [scoped_message]}
+
+    nav_service.fetch_authorized_messages = scoped_fetch
+    try:
+        scoped_rows, scoped_report = nav_service.discover(
+            scoped_config, ["Demo Fund"]
+        )
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    parsed_args = navctl.parser().parse_args(
+        ["discover", "--sheet", "Demo Fund", "--sheet", "Second Fund"]
+    )
+    check(
+        scoped_report["passed"]
+        and captured_scope == [["Demo Fund"]]
+        and list(scoped_rows) == ["Demo Fund"]
+        and scoped_report["scoped"]
+        and scoped_report["final_full_preview_required"]
+        and parsed_args.sheets == ["Demo Fund", "Second Fund"],
+        "read-only per-sheet discovery did not isolate the requested route",
+    )
+    scoped_preview_config = json.loads(json.dumps(scoped_config))
+    scoped_preview_config["routes"][0].pop("benchmark", None)
+    scoped_preview_config["routes"][1].pop("benchmark", None)
+    scoped_preview_message = EmailMessage()
+    scoped_preview_message["Subject"] = "Weekly NAV scoped preview fixture"
+    scoped_preview_message.set_content(
+        "Product Code | NAV Date | Unit NAV | Cumulative NAV\n"
+        "DEMO01 | 2026-01-09 | 1.01 | 1.01"
+    )
+    nav_service.fetch_authorized_messages = lambda _config: {
+        "sender@example.invalid": [scoped_preview_message]
+    }
+    try:
+        scoped_plan = nav_service.preview(
+            scoped_preview_config, sheets=["Demo Fund"]
+        )
+    finally:
+        nav_service.fetch_authorized_messages = original_fetch
+    persisted_scoped_plan = json.loads(
+        (runtime / "plan.json").read_text(encoding="utf-8")
+    )
+    check(
+        scoped_plan["scoped"]
+        and scoped_plan["scope_sheets"] == ["Demo Fund"]
+        and scoped_plan["diagnostic_only"]
+        and not scoped_plan["committable"]
+        and scoped_plan["final_full_preview_required"]
+        and persisted_scoped_plan["diagnostic_only"]
+        and any(
+            item["issue"] == "scoped-diagnostic-preview"
+            for item in scoped_plan["blocking_reviews"]
+        ),
+        "per-sheet preview was not marked diagnostic-only and non-committable",
+    )
+    from nav_commit import CommitError as ScopedCommitError
+    from nav_commit import commit as commit_scoped_preview
+
+    try:
+        commit_scoped_preview(scoped_preview_config)
+    except ScopedCommitError as exc:
+        check(
+            "review-only preview" in str(exc),
+            "scoped preview was rejected for the wrong reason",
+        )
+    else:
+        raise AssertionError("a scoped diagnostic preview was accepted for commit")
+    parsed_preview_args = navctl.parser().parse_args(
+        ["preview", "--sheet", "Demo Fund", "--sheet", "Second Fund"]
+    )
+    check(
+        parsed_preview_args.sheets == ["Demo Fund", "Second Fund"],
+        "preview CLI did not accept repeated per-sheet diagnostic scopes",
     )
 
     selective = json.loads(json.dumps(config))
@@ -1186,6 +2199,7 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     revoke()
     invalid = json.loads(json.dumps(config))
     invalid["routes"][0]["series_start"] = "2026-99-99"
+    invalid["routes"][0]["baseline_overlap"] = "unsafe"
     invalid["routes"][0]["parser"] = "local:../unsafe"
     invalid["routes"][0]["data_frequency"] = "hourly"
     invalid["unexpected"] = True
@@ -1197,7 +2211,17 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         raise AssertionError("invalid dates and unknown config fields must be rejected")
     local_parser_config = json.loads(json.dumps(config))
     local_parser_config["routes"][0]["parser"] = "local:fixture"
+    local_parser_config["routes"][0]["subject_excludes"] = ["fee notice"]
     validate_config(local_parser_config)
+    invalid_excludes = json.loads(json.dumps(config))
+    invalid_excludes["routes"][0]["subject_contains"] = "NAV"
+    invalid_excludes["routes"][0]["subject_excludes"] = ["nav", "NAV"]
+    try:
+        validate_config(invalid_excludes)
+    except ConfigError:
+        pass
+    else:
+        raise AssertionError("duplicate or self-cancelling subject exclusions were accepted")
     mixed_parser_config = json.loads(json.dumps(config))
     second_route = json.loads(json.dumps(mixed_parser_config["routes"][0]))
     second_route.update(
@@ -1209,6 +2233,41 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     paused_config["routes"][0]["paused"] = True
     paused_config["routes"][0]["pause_reason"] = "fixture pause"
     validate_config(paused_config)
+    reviewed_sheet_config = json.loads(json.dumps(config))
+    reviewed_sheet_config["sheet_reviews"] = {
+        "Archived Example": {
+            "status": "excluded",
+            "reason": "local evidence says this page is no longer updated",
+        },
+        "Parser Example": {
+            "status": "local_parser_required",
+            "reason": "official notices require a vendor-specific parser",
+        },
+    }
+    validate_config(reviewed_sheet_config)
+    conflicting_review_config = json.loads(json.dumps(config))
+    conflicting_review_config["sheet_reviews"] = {
+        "Demo Fund": {
+            "status": "business_review",
+            "reason": "must not duplicate a managed route",
+        }
+    }
+    try:
+        validate_config(conflicting_review_config)
+    except ConfigError:
+        pass
+    else:
+        raise AssertionError("sheet review duplicated a managed route")
+    invalid_review_config = json.loads(json.dumps(config))
+    invalid_review_config["sheet_reviews"] = {
+        "Unknown Example": {"status": "guess", "reason": ""}
+    }
+    try:
+        validate_config(invalid_review_config)
+    except ConfigError:
+        pass
+    else:
+        raise AssertionError("invalid workbook sheet review was accepted")
     invalid_header_limit = json.loads(json.dumps(config))
     invalid_header_limit["imap"]["max_messages"] = 100
     invalid_header_limit["imap"]["max_header_messages"] = 99
@@ -1240,6 +2299,177 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         pass
     else:
         raise AssertionError("route accepted a formula-like product name")
+    integrity_book = runtime / "history-integrity-fixture.xlsx"
+    integrity_workbook = openpyxl.Workbook()
+    integrity_sheet = integrity_workbook.active
+    integrity_sheet.title = "Integrity Fund"
+    integrity_sheet.append(
+        ["NAV Date", "Product Code", "Unit NAV", "Cumulative NAV"]
+    )
+    for row in (
+        (dt.date(2026, 1, 2), "DEMO01", 1.00, 1.50),
+        (dt.date(2026, 1, 9), "DEMO02", 1.10, 1.10),
+        (dt.date(2026, 1, 16), "DEMO03", 1.20, 1.70),
+    ):
+        integrity_sheet.append(row)
+    integrity_workbook.save(integrity_book)
+    integrity_workbook.close()
+    integrity_config = config_for(runtime, integrity_book)
+    integrity_config["routes"][0].update(
+        {
+            "sheet": "Integrity Fund",
+            "sheet_mode": "append",
+            "benchmark": None,
+            "max_staleness_days": 366,
+        }
+    )
+    integrity_rows = {
+        "Integrity Fund": [
+            NavRow(dt.date(2026, 1, 2), 1.00, 1.50, "DEMO01", "fixture"),
+            NavRow(dt.date(2026, 1, 9), 1.10, 1.60, "DEMO01", "fixture"),
+            NavRow(dt.date(2026, 1, 16), 1.20, 1.70, "DEMO01", "fixture"),
+        ]
+    }
+    integrity_report = validate_history(integrity_config, integrity_rows)
+    serialized_integrity = json.dumps(integrity_report, ensure_ascii=False)
+    integrity_checks = integrity_report["routes"][0]["history_integrity"]
+    check(
+        not integrity_report["passed"]
+        and integrity_report["history_repairs_required"] == 1
+        and not integrity_checks["code_column"]["passed"]
+        and len(integrity_checks["code_column"]["unexpected_rows"]) == 2
+        and not integrity_checks["cumulative_sequence"]["passed"]
+        and integrity_checks["cumulative_sequence"]["anomalies"][0]["issue"]
+        == "isolated-unit-cumulative-spread-break"
+        and "DEMO02" not in serialized_integrity
+        and "DEMO03" not in serialized_integrity
+        and "1.6000" not in serialized_integrity,
+        "historical code drift and isolated cumulative discontinuity were not diagnosed safely",
+    )
+    boundary_book = runtime / "series-start-boundary-fixture.xlsx"
+    boundary_workbook = openpyxl.Workbook()
+    boundary_sheet = boundary_workbook.active
+    boundary_sheet.title = "Boundary Fund"
+    boundary_sheet.append(
+        ["NAV Date", "Product Code", "Unit NAV", "Cumulative NAV"]
+    )
+    boundary_sheet.append([dt.date(2026, 1, 2), "LEGACY01", 0.90, None])
+    boundary_sheet.append([dt.date(2026, 1, 9), "DEMO01", 1.00, 1.50])
+    boundary_sheet.append([dt.date(2026, 1, 16), "DEMO01", 1.10, 1.60])
+    boundary_sheet.append(["TOTAL", None, None, None])
+    boundary_workbook.save(boundary_book)
+    boundary_workbook.close()
+    boundary_config = config_for(runtime, boundary_book)
+    boundary_config["routes"][0].update(
+        {
+            "sheet": "Boundary Fund",
+            "product_name": None,
+            "series_start": "2026-01-09",
+            "benchmark": None,
+            "max_staleness_days": 366,
+        }
+    )
+    boundary_rows = {
+        "Boundary Fund": [
+            NavRow(dt.date(2026, 1, 9), 1.00, 1.50, "DEMO01", "fixture"),
+            NavRow(dt.date(2026, 1, 16), 1.10, 1.60, "DEMO01", "fixture"),
+        ]
+    }
+    boundary_report = validate_history(boundary_config, boundary_rows)
+    boundary_integrity = boundary_report["routes"][0]["history_integrity"]
+    check(
+        boundary_report["passed"]
+        and boundary_report["history_repairs_required"] == 0
+        and boundary_integrity["passed"]
+        and boundary_integrity["scope"]["pre_managed_rows"] == 1
+        and boundary_integrity["scope"]["managed_rows"] == 2
+        and boundary_integrity["pre_managed_diagnostics"]["repair_required"]
+        and boundary_report["warnings"],
+        "pre-managed integrity diagnostics blocked the managed series tail",
+    )
+    boundary_master = boundary_book.read_bytes()
+    boundary_plan = service_preview(boundary_config, boundary_rows)
+    check(
+        boundary_plan["approval_kind"] == "validated-no-change"
+        and not boundary_plan["sheets"]
+        and boundary_book.read_bytes() == boundary_master,
+        "series_start boundary preview changed preserved history",
+    )
+    managed_break_book = runtime / "series-start-managed-break.xlsx"
+    shutil.copy2(boundary_book, managed_break_book)
+    managed_break_workbook = openpyxl.load_workbook(managed_break_book)
+    try:
+        managed_break_workbook["Boundary Fund"]["D3"] = None
+        managed_break_workbook.save(managed_break_book)
+    finally:
+        managed_break_workbook.close()
+    managed_break_config = json.loads(json.dumps(boundary_config))
+    managed_break_config["workbook_path"] = str(managed_break_book.resolve())
+    managed_break_report = validate_history(managed_break_config, boundary_rows)
+    check(
+        not managed_break_report["passed"]
+        and managed_break_report["history_repairs_required"] == 1
+        and not managed_break_report["routes"][0]["history_integrity"][
+            "cumulative_sequence"
+        ]["passed"],
+        "a cumulative gap at the first managed point was ignored",
+    )
+    anchor_config = config_for(runtime, book)
+    anchor_config["routes"][0]["series_start"] = "2026-01-10"
+    anchor_config["routes"][0]["baseline_overlap"] = "last_existing_point"
+    anchor_rows = {
+        "Demo Fund": [
+            NavRow(dt.date(2026, 1, 9), 1.01, 1.01, "DEMO01", "fixture")
+        ]
+    }
+    anchor_validation = validate_history(anchor_config, anchor_rows)
+    anchor_plan = service_preview(anchor_config, anchor_rows)
+    check(
+        anchor_validation["passed"]
+        and anchor_validation["routes"][0]["boundary_anchor_verified"]
+        and anchor_validation["routes"][0]["boundary_anchor_date"]
+        == "2026-01-09"
+        and anchor_plan["approval_kind"] == "validated-no-change"
+        and not anchor_plan["sheets"],
+        "a verified pre-managed tail anchor did not unlock a zero-add baseline",
+    )
+    bad_anchor_rows = {
+        "Demo Fund": [
+            NavRow(dt.date(2026, 1, 9), 1.02, 1.02, "DEMO01", "fixture")
+        ]
+    }
+    bad_anchor_validation = validate_history(anchor_config, bad_anchor_rows)
+    check(
+        not bad_anchor_validation["passed"]
+        and not bad_anchor_validation["routes"][0]["boundary_anchor_verified"],
+        "a mismatched last-existing-point overlap was accepted",
+    )
+    continuing_anchor_rows = {
+        "Demo Fund": [
+            NavRow(dt.date(2026, 1, 9), 1.01, 1.01, "DEMO01", "fixture"),
+            NavRow(dt.date(2026, 1, 16), 1.02, 1.02, "DEMO01", "fixture"),
+        ]
+    }
+    continuing_anchor_validation = validate_history(
+        anchor_config, continuing_anchor_rows
+    )
+    continuing_anchor_plan = build_preview(
+        anchor_config,
+        continuing_anchor_rows,
+        continuing_anchor_validation["warnings"],
+    )
+    continuing_anchor_preview = openpyxl.load_workbook(
+        continuing_anchor_plan["preview_path"], data_only=False
+    )
+    try:
+        continuing_anchor_sheet = continuing_anchor_preview["Demo Fund"]
+        check(
+            continuing_anchor_sheet["B4"].value == "=F4/F3-1"
+            and continuing_anchor_sheet["B5"].value == "=F4/F2-1",
+            "adoption boundary truncated the first new return or full-history summary",
+        )
+    finally:
+        continuing_anchor_preview.close()
     (runtime / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -1292,6 +2522,31 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
     else:
         raise AssertionError(
             "managed array formula was copied or moved during automatic insertion"
+        )
+
+    review_multi_array_book = runtime / "review-multi-cell-array.xlsx"
+    create_book(review_multi_array_book)
+    review_multi_array_workbook = openpyxl.load_workbook(review_multi_array_book)
+    try:
+        review_multi_array_workbook["Demo Fund"]["H4"] = ArrayFormula(
+            ref="H4:H5", text="=PRODUCT(1+H2:H3)-1"
+        )
+        review_multi_array_workbook.save(review_multi_array_book)
+    finally:
+        review_multi_array_workbook.close()
+    review_multi_array_config = config_for(runtime, review_multi_array_book)
+    review_multi_array_config["routes"][0]["benchmark"] = None
+    review_multi_array_config["routes"][0]["benchmark_review_only"] = True
+    try:
+        build_preview(review_multi_array_config, rows)
+    except WorkbookError as exc:
+        check(
+            "array formula" in str(exc).lower(),
+            "multi-cell review array failed for the wrong reason",
+        )
+    else:
+        raise AssertionError(
+            "review-only exception accepted a multi-cell summary array"
         )
 
     validation = validate_history(config, rows)
@@ -1501,6 +2756,87 @@ def workbook_tests(runtime: Path, use_com: bool) -> str | None:
         )
     finally:
         dense_preview.close()
+
+    current_week_date = dt.date.today()
+    current_week_book = runtime / "current-week-baseline.xlsx"
+    create_book(current_week_book)
+    current_week_workbook = openpyxl.load_workbook(current_week_book)
+    try:
+        current_week_sheet = current_week_workbook["Demo Fund"]
+        current_week_sheet["A2"] = current_week_date - dt.timedelta(days=14)
+        current_week_sheet["A3"] = current_week_date - dt.timedelta(days=7)
+        current_week_workbook.save(current_week_book)
+    finally:
+        current_week_workbook.close()
+    current_week_config = config_for(runtime, current_week_book)
+    current_week_config["routes"][0]["series_start"] = (
+        current_week_date - dt.timedelta(days=14)
+    ).isoformat()
+    current_week_config["routes"][0]["benchmark"] = None
+    current_week_rows = {
+        "Demo Fund": [
+            NavRow(
+                current_week_date,
+                1.011,
+                1.011,
+                "DEMO01",
+                "fixture-current-week",
+            )
+        ]
+    }
+    current_week_master = current_week_book.read_bytes()
+    current_week_validation = validate_history(
+        current_week_config, current_week_rows
+    )
+    check(
+        current_week_validation["passed"]
+        and current_week_validation["routes"][0][
+            "pending_current_week_baseline"
+        ]
+        and current_week_validation["routes"][0][
+            "withheld_current_week_dates"
+        ]
+        == [current_week_date.isoformat()],
+        "a verified unfinished natural week did not reach a zero-add baseline",
+    )
+    current_week_plan = service_preview(current_week_config, current_week_rows)
+    current_week_review = Path(current_week_plan["review_path"])
+    check(
+        not current_week_plan["sheets"]
+        and current_week_plan["approval_kind"] == "validated-no-change"
+        and current_week_plan["committable"]
+        and current_week_plan["preview_path"] is None
+        and "未完成自然周暂缓日期数：1"
+        in current_week_review.read_text(encoding="utf-8")
+        and current_week_book.read_bytes() == current_week_master,
+        "unfinished-week baseline wrote data or did not produce a reviewable report",
+    )
+    wrong_current_week_rows = {
+        "Demo Fund": [
+            NavRow(
+                current_week_date,
+                1.011,
+                1.011,
+                "OTHER01",
+                "fixture-current-week",
+            )
+        ]
+    }
+    wrong_current_week_validation = validate_history(
+        current_week_config, wrong_current_week_rows
+    )
+    check(
+        not wrong_current_week_validation["passed"],
+        "unfinished-week baseline accepted a conflicting product code",
+    )
+    stale_current_week_validation = validate_history(config, current_week_rows)
+    check(
+        not stale_current_week_validation["passed"]
+        and not stale_current_week_validation["routes"][0][
+            "pending_current_week_baseline"
+        ],
+        "unfinished-week baseline accepted an unverified stale workbook tail",
+    )
 
     forced_daily = json.loads(json.dumps(config))
     forced_daily["routes"][0]["data_frequency"] = "daily"
@@ -2446,11 +3782,21 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
     from nav_automation import approve, status as approval_status
     from nav_commit import CommitError, commit
     from nav_config import load_config, validate_config
-    from nav_parse import NavRow
-    from nav_product_workbook import prepare_clone_spec
-    from nav_products import add, adopt, clone, pause, resume, status, sync
+    from nav_parse import NavRow, choose_route_rows
+    from nav_product_workbook import _same_cell, prepare_clone_spec
+    from nav_products import (
+        ProductError,
+        add,
+        add_code_alias,
+        adopt,
+        clone,
+        pause,
+        resume,
+        status,
+        sync,
+    )
     from nav_template import init_template
-    from nav_workbook import build_preview, validate_history
+    from nav_workbook import WorkbookError, build_preview, validate_history
 
     target = runtime / "产品生命周期模板.xlsx"
     config_path = runtime / "product-lifecycle-config.json"
@@ -2490,6 +3836,12 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
             "lookback_days": 180,
         },
         "routes": [initial_route],
+        "sheet_reviews": {
+            "新增产品": {
+                "status": "business_review",
+                "reason": "等待邮箱候选与工作簿身份核实",
+            }
+        },
         "column_overrides": {},
         "style": {"mode": "cn-red-up-green-down", "zero_threshold": 0.00005},
         "schedule": [{"days": ["MON", "WED", "FRI"], "time": "09:00"}],
@@ -2503,6 +3855,12 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
     proposal = {
         "passed": True,
         "scan": {},
+        "selection": {
+            "mode": "sender-subject",
+            "sender": "new@example.invalid",
+            "subject_contains": "NEW002",
+            "subject_product_code": "NEW002",
+        },
         "candidates": [
             {
                 "sender": "new@example.invalid",
@@ -2512,6 +3870,12 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
                 "detected_codes": ["NEW002"],
                 "first_date": "2026-01-02",
                 "latest_date": "2026-01-16",
+                "selection": {
+                    "mode": "sender-subject",
+                    "sender": "new@example.invalid",
+                    "subject_contains": "NEW002",
+                    "subject_product_code": "NEW002",
+                },
                 "observations": [
                     {
                         "date": "2026-01-02",
@@ -2556,6 +3920,8 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
     check(
         result["changed"]
         and result["requires_preview_approval"]
+        and result["route"]["subject_contains"] == "NEW002"
+        and result["route"]["subject_product_code"] == "NEW002"
         and result["template"]["product_sheet"] == "新增产品"
         and Path(result["template"]["backup"]).is_file(),
         "products add did not create a backed-up template page",
@@ -2578,9 +3944,56 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         workbook.close()
     check(
         len(updated["routes"]) == 2
+        and "新增产品" not in updated.get("sheet_reviews", {})
         and not approval_status(updated)["approved"]
         and not sync(updated, refresh=False)["new_candidates"],
         "new product route or approval state is wrong",
+    )
+    alias_proposal = deepcopy(proposal)
+    alias_candidate = alias_proposal["candidates"][0]
+    alias_candidate["detected_codes"] = ["NEW002A"]
+    alias_candidate["observations"] = [
+        {
+            "date": "2026-01-16",
+            "code": "NEW002A",
+            "unit": 1.03,
+            "cumulative": 1.03,
+            "source": "body",
+        }
+    ]
+    (runtime / "route-proposals.json").write_text(
+        json.dumps(alias_proposal, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    alias_analysis = sync(updated, refresh=False)
+    check(
+        len(alias_analysis["alias_pending"]) == 1
+        and alias_analysis["alias_pending"][0]["possible_sheet"] == "新增产品"
+        and alias_analysis["alias_pending"][0]["requires_confirmation"],
+        "share-class suffix difference was not reported as a confirmation-only alias",
+    )
+    alias_result = add_code_alias(
+        updated, config_path, sheet="新增产品", code="NEW002A"
+    )
+    updated = load_config(config_path)
+    alias_rows = choose_route_rows(
+        [
+            NavRow(
+                dt.date(2026, 1, 16),
+                1.03,
+                1.03,
+                "NEW002A",
+                "body",
+            )
+        ],
+        updated["routes"][1],
+        False,
+    )
+    check(
+        alias_result["changed"]
+        and updated["routes"][1]["code_aliases"] == ["NEW002A"]
+        and alias_rows[0].code == "NEW002",
+        "confirmed exact code alias was not persisted and routed to the primary code",
     )
 
     approve(updated)
@@ -2650,6 +4063,27 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         and config_path.read_bytes() == config_before,
         "duplicate product rejection changed the workbook or configuration",
     )
+    try:
+        add(
+            resumed,
+            config_path,
+            proposal_index=1,
+            sheet="新增产品",
+            frequency="weekly",
+            subject_contains="BROADER",
+        )
+    except RuntimeError as exc:
+        check(
+            "主题范围" in str(exc),
+            "selected proposal scope mismatch did not return a controlled error",
+        )
+    else:
+        raise AssertionError("products add allowed selected mailbox scope replacement")
+    check(
+        target.read_bytes() == workbook_before
+        and config_path.read_bytes() == config_before,
+        "selected proposal scope rejection changed the workbook or configuration",
+    )
 
     existing_target = runtime / "产品生命周期已有表.xlsx"
     existing_book = openpyxl.Workbook()
@@ -2688,8 +4122,8 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
             "累计单位净值",
             "净值日期",
             "收益（周度）",
-            "基准点位",
-            "基准收益",
+            "示例指数A",
+            "示例指数A（日收益）",
             "超额收益",
         ]
     )
@@ -2707,8 +4141,8 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
             "累计单位净值",
             "净值日期",
             "收益（周度）",
-            "基准点位",
-            "基准收益",
+            "示例指数A",
+            "示例指数A（日收益）",
             "超额收益",
         ]
     )
@@ -2740,6 +4174,9 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
     )
     review_sheet.append(
         ["累计", None, None, None, None, "=D4/D3-1", None, "=G4/G3-1", "=F5-H5"]
+    )
+    review_sheet["H5"] = ArrayFormula(
+        ref="H5:H5", text="=PRODUCT(1+H3:H4)-1"
     )
     benchmark_source = existing_book.create_sheet("待审指数源")
     benchmark_source.append(["日期", "指数点位"])
@@ -2789,6 +4226,11 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
             "detected_codes": ["REVIEW03"],
             "first_date": "2025-12-26",
             "latest_date": "2026-01-09",
+            "selection": {
+                "mode": "sender-subject",
+                "sender": "review@example.invalid",
+                "subject_contains": "REVIEW03",
+            },
             "observations": [
                 {
                     "date": "2025-12-26",
@@ -2846,6 +4288,10 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         "products adopt did not use the worksheet to resolve a multi-code sender",
     )
     check(
+        existing_result["route"]["subject_contains"] == "NEW002",
+        "products adopt did not inherit the selected proposal subject scope",
+    )
+    check(
         existing_target.read_bytes() == existing_before,
         "products adopt changed the user workbook",
     )
@@ -2877,6 +4323,62 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         f"partial user-prepared onboarding row was not accepted safely: {adopted_validation}",
     )
     review_before = existing_target.read_bytes()
+    review_config_before = existing_config_path.read_bytes()
+    history_inspection = adopt(
+        existing_updated,
+        existing_config_path,
+        proposal_index=2,
+        sheet="待审基准页",
+        history_scope="mail-history",
+        inspect_only=True,
+    )
+    check(
+        history_inspection["inference"]["history_scope"] == "mail-history"
+        and history_inspection["inference"]["history_scope_default"] == "tail"
+        and history_inspection["inference"]["series_start"] is None
+        and history_inspection["inference"]["baseline_overlap"] is None
+        and existing_config_path.read_bytes() == review_config_before
+        and existing_target.read_bytes() == review_before,
+        "mail-history adoption scope was not available as a read-only alternative",
+    )
+    try:
+        adopt(
+            existing_updated,
+            existing_config_path,
+            proposal_index=2,
+            sheet="待审基准页",
+            history_scope="unsupported",
+            inspect_only=True,
+        )
+    except ProductError:
+        pass
+    else:
+        raise AssertionError("products adopt accepted an unknown history scope")
+    review_inspection = adopt(
+        existing_updated,
+        existing_config_path,
+        proposal_index=2,
+        sheet="待审基准页",
+        inspect_only=True,
+    )
+    check(
+        review_inspection["review_required"]
+        and not review_inspection["ready_for_direct_adoption"]
+        and review_inspection["inference"]["series_start"] == "2026-01-03"
+        and review_inspection["inference"]["series_start_reason"]
+        == "existing-sheet-tail-plus-one-day"
+        and review_inspection["inference"]["baseline_overlap"]
+        == "last_existing_point"
+        and review_inspection["inference"]["column_roles"]["benchmark_level"]
+        == {"column": "G", "header": "示例指数A"}
+        and review_inspection["inference"]["column_roles"]["benchmark_return"]
+        == {"column": "H", "header": "示例指数A（日收益）"}
+        and review_inspection["master_unchanged"]
+        and existing_config_path.read_bytes() == review_config_before
+        and existing_target.read_bytes() == review_before,
+        "read-only adoption inspection did not isolate a benchmark-review "
+        f"product: {review_inspection}",
+    )
     review_result = adopt(
         existing_updated,
         existing_config_path,
@@ -2886,6 +4388,9 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
     review_config = load_config(existing_config_path)
     check(
         review_result["inference"]["benchmark_review_only"]
+        and review_result["route"]["series_start"] == "2026-01-03"
+        and review_result["route"]["baseline_overlap"]
+        == "last_existing_point"
         and review_config["routes"][-1]["benchmark_review_only"] is True
         and status(review_config)["review_required"] == 1
         and existing_target.read_bytes() == review_before,
@@ -2906,6 +4411,17 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
             NavRow(dt.date(2026, 1, 9), 1.02, 1.02, "REVIEW03", "fixture"),
         ],
     }
+    check(
+        _same_cell(
+            ArrayFormula(ref="H5:H5", text="=SUM(H3:H4)"),
+            ArrayFormula(ref="H5", text="=SUM(H3:H4)"),
+        )
+        and not _same_cell(
+            ArrayFormula(ref="H5:H6", text="=SUM(H3:H4)"),
+            ArrayFormula(ref="H5", text="=SUM(H3:H4)"),
+        ),
+        "single-cell array range normalization weakened array formula comparison",
+    )
     review_validation = validate_history(review_config, review_rows)
     check(
         review_validation["passed"]
@@ -2948,12 +4464,21 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         check(
             review_preview["待审基准页"]["E5"].value.date()
             == dt.date(2026, 1, 9)
+            and review_preview["待审基准页"]["F5"].value == "=D5/D4-1"
+            and review_preview["待审基准页"]["F6"].value == "=D5/D3-1"
             and review_preview["待审基准页"]["G5"].value is None
             and review_preview["待审基准页"]["H5"].value is None
             and review_preview["待审基准页"]["I5"].value is None
             and review_preview["待审基准页"]["H6"].value is None
             and review_preview["待审基准页"]["I6"].value is None,
-            "review-only preview did not preserve NAV while blanking unresolved benchmark cells",
+            "review-only preview did not preserve NAV while blanking unresolved "
+            f"benchmark cells: F5={review_preview['待审基准页']['F5'].value!r}, "
+            f"F6={review_preview['待审基准页']['F6'].value!r}",
+        )
+        check(
+            review_plan["sheets"][-1]["review_array_formulas_cleared"]
+            == ["H6"],
+            "review-only preview did not audit the cleared single-cell summary array",
         )
     finally:
         review_preview.close()
@@ -2981,6 +4506,31 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         "display_name": "待审示例指数",
     }
     validate_config(resolved_config)
+    resolved_validation = validate_history(resolved_config, review_rows)
+    try:
+        build_preview(
+            resolved_config, review_rows, resolved_validation["warnings"]
+        )
+    except WorkbookError as exc:
+        check(
+            "array formula" in str(exc).lower(),
+            "resolved benchmark array failed for the wrong reason",
+        )
+    else:
+        raise AssertionError(
+            "review-only array exception leaked into a committable preview"
+        )
+    resolved_formula_book = runtime / "resolved-benchmark-formula.xlsx"
+    shutil.copy2(existing_target, resolved_formula_book)
+    resolved_formula_workbook = openpyxl.load_workbook(resolved_formula_book)
+    try:
+        resolved_formula_workbook["待审基准页"]["H5"] = (
+            "=PRODUCT(1+H3:H4)-1"
+        )
+        resolved_formula_workbook.save(resolved_formula_book)
+    finally:
+        resolved_formula_workbook.close()
+    resolved_config["workbook_path"] = str(resolved_formula_book.resolve())
     resolved_validation = validate_history(resolved_config, review_rows)
     resolved_plan = build_preview(
         resolved_config, review_rows, resolved_validation["warnings"]
@@ -3010,6 +4560,11 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
             "detected_codes": ["CLONE003"],
             "first_date": "2026-02-06",
             "latest_date": "2026-02-13",
+            "selection": {
+                "mode": "sender-subject",
+                "sender": "clone@example.invalid",
+                "subject_contains": "CLONE003",
+            },
             "observations": [
                 {
                     "date": "2026-02-06",
@@ -3071,6 +4626,7 @@ def product_lifecycle_tests(runtime: Path, use_com: bool) -> str | None:
         check(
             len(cloned_config["routes"]) == 4
             and cloned_config["routes"][-1]["sheet"] == "照参考新增"
+            and cloned_config["routes"][-1]["subject_contains"] == "CLONE003"
             and Path(clone_result["workbook"]["backup"]).is_file(),
             "products clone did not save its route or backup",
         )

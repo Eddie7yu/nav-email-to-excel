@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,6 +23,7 @@ from nav_demo import list_runs as list_demo_runs
 from nav_demo import prepare as prepare_demo
 from nav_demo import remove as remove_demo
 from nav_products import add as add_product
+from nav_products import add_code_alias
 from nav_products import adopt as adopt_product
 from nav_products import clone as clone_product
 from nav_products import pause as pause_product
@@ -49,9 +51,19 @@ from runtime_secret import (
     set_password,
 )
 
+MAX_UTF8_ARGFILE_BYTES = 1024 * 1024
+
 
 def emit(payload: Any) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def emit_proposal_progress(payload: dict[str, Any]) -> None:
+    print(
+        json.dumps({"proposal_progress": payload}, ensure_ascii=False),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def configure_output() -> None:
@@ -59,6 +71,60 @@ def configure_output() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
             reconfigure(errors="backslashreplace")
+
+
+def expand_utf8_argfiles(argv: list[str]) -> tuple[list[str], bool]:
+    expanded: list[str] = []
+    used = False
+    for value in argv:
+        if not value.startswith("@") or len(value) == 1:
+            expanded.append(value)
+            continue
+        path = Path(value[1:]).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError(f"UTF-8 参数文件不存在：{path}")
+        if path.stat().st_size > MAX_UTF8_ARGFILE_BYTES:
+            raise ValueError("UTF-8 参数文件超过 1 MiB 上限")
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError("参数文件必须使用 UTF-8 编码") from exc
+        for line in text.splitlines():
+            argument = line.strip()
+            if not argument or argument.startswith("#"):
+                continue
+            if argument.startswith("@"):
+                raise ValueError("UTF-8 参数文件不支持嵌套 @ 文件")
+            if "\x00" in argument:
+                raise ValueError("UTF-8 参数文件包含非法 NUL 字符")
+            expanded.append(argument)
+        used = True
+    return expanded, used
+
+
+def _recovered_utf8_text(value: str) -> str | None:
+    for encoding in ("gbk", "cp1252", "latin1"):
+        try:
+            recovered = value.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        if recovered != value and re.search(r"[\u3400-\u9fff]", recovered):
+            return recovered
+    return None
+
+
+def validate_filter_encoding(value: str | None, label: str) -> None:
+    text = str(value or "")
+    if not text:
+        return
+    if "\ufffd" in text or any(0xDC80 <= ord(character) <= 0xDCFF for character in text):
+        raise ValueError(
+            f"{label} 含编码替换字符；请改用 UTF-8 参数文件 @<路径>"
+        )
+    if _recovered_utf8_text(text) is not None:
+        raise ValueError(
+            f"{label} 疑似被终端错误解码；请改用 UTF-8 参数文件 @<路径>"
+        )
 
 
 def record_scheduled_run_safely(payload: dict[str, Any]) -> None:
@@ -217,27 +283,72 @@ def command_secret(config: dict[str, Any], args: argparse.Namespace) -> int:
     return 0 if available else 2
 
 
-def command_discover(config: dict[str, Any], _args: argparse.Namespace) -> int:
+def command_discover(config: dict[str, Any], args: argparse.Namespace) -> int:
     with run_lock():
-        _, report = discover(config)
+        _, report = discover(config, args.sheets)
     emit(report)
     return 0 if report["passed"] else 2
 
 
 def command_propose(config: dict[str, Any], args: argparse.Namespace) -> int:
+    validate_filter_encoding(args.subject_contains, "--subject-contains")
     with run_lock():
         if args.headers_only:
-            if args.sender or args.subject_contains:
+            if (
+                args.sender
+                or args.subject_contains
+                or args.subject_product_code
+                or args.allow_unscoped_full_scan
+                or args.resume
+                or args.lookback_days is not None
+            ):
                 raise ValueError(
-                    "--headers-only 不能与 --sender 或 --subject-contains 同时使用"
+                    "--headers-only 不能与完整解析的范围参数同时使用"
                 )
             report = propose_headers(config, args.header_limit)
         else:
+            if args.resume and (
+                args.sender
+                or args.subject_contains
+                or args.subject_product_code
+                or args.allow_unscoped_full_scan
+                or args.lookback_days is not None
+            ):
+                raise ValueError("--resume 使用本地检查点，不能同时改写扫描范围")
+            if (
+                not args.resume
+                and not args.sender
+                and not args.allow_unscoped_full_scan
+            ):
+                raise ValueError(
+                    "完整候选解析必须至少指定 --sender；先读取头部报告，"
+                    "主题不确定时只限定发件人即可。仅在有明确诊断理由并核实资源边界后，"
+                    "才能显式添加 --allow-unscoped-full-scan"
+                )
+            configured_lookback = int(config["imap"].get("lookback_days", 180))
+            effective_lookback = args.lookback_days
+            if effective_lookback is None and not args.resume:
+                effective_lookback = min(configured_lookback, 30)
             report = propose_routes(
                 config,
                 sender=args.sender,
                 subject_contains=args.subject_contains,
+                subject_product_code=args.subject_product_code,
+                lookback_days=effective_lookback,
+                batch_messages=args.batch_messages,
+                time_budget_seconds=args.time_budget_seconds,
+                resume=args.resume,
+                progress_sink=emit_proposal_progress,
             )
+    if args.subject_contains and isinstance(report.get("scan"), dict):
+        report["scan"]["filter_input_encoding"] = {
+            "source": (
+                "utf8-argfile"
+                if getattr(args, "utf8_argfile_used", False)
+                else "native-unicode-argv"
+            ),
+            "encoding_check": "passed",
+        }
     emit(report)
     return 0 if report["passed"] else 2
 
@@ -249,9 +360,24 @@ def command_validate(config: dict[str, Any], _args: argparse.Namespace) -> int:
     return 0 if report["passed"] else 2
 
 
-def command_preview(config: dict[str, Any], _args: argparse.Namespace) -> int:
+def command_preview(config: dict[str, Any], args: argparse.Namespace) -> int:
+    if args.reuse_discovery and (args.lookback_days is not None or args.sheets):
+        raise ValueError(
+            "--reuse-discovery 不能与 --lookback-days 或 --sheet 同时使用"
+        )
+    mail_config = None
+    if args.lookback_days is not None:
+        if not 1 <= args.lookback_days <= 3650:
+            raise ValueError("本次预览回看天数必须在 1 到 3650 之间")
+        mail_config = json.loads(json.dumps(config))
+        mail_config["imap"]["lookback_days"] = args.lookback_days
     with run_lock():
-        plan = preview(config)
+        plan = preview(
+            config,
+            mail_config=mail_config,
+            sheets=args.sheets,
+            reuse_discovery=args.reuse_discovery,
+        )
     emit(
         {
             "preview_path": plan["preview_path"],
@@ -263,6 +389,18 @@ def command_preview(config: dict[str, Any], _args: argparse.Namespace) -> int:
                 for item in plan["sheets"]
             ],
             "master_unchanged": True,
+            "scoped": bool(plan.get("scoped")),
+            "scope_sheets": plan.get("scope_sheets") or [],
+            "committable": plan.get("committable", True),
+            "final_full_preview_required": bool(
+                plan.get("final_full_preview_required")
+            ),
+            "discovery_reused": bool(plan.get("discovery_reused")),
+            "effective_lookback_days": (
+                args.lookback_days
+                if args.lookback_days is not None
+                else int(config["imap"].get("lookback_days", 60))
+            ),
         }
     )
     return 0
@@ -331,7 +469,41 @@ def command_products(config: dict[str, Any], args: argparse.Namespace) -> int:
         return 0
     with run_lock():
         if args.products_action == "sync":
-            result = sync_products(config, refresh=not args.use_existing_proposals)
+            validate_filter_encoding(
+                args.subject_contains, "--subject-contains"
+            )
+            if args.use_existing_proposals:
+                if (
+                    args.sender
+                    or args.subject_contains
+                    or args.allow_unscoped_full_scan
+                ):
+                    raise ValueError(
+                        "--use-existing-proposals 不能与邮箱扫描范围参数同时使用"
+                    )
+                result = sync_products(config, refresh=False)
+            else:
+                if not args.sender and not args.allow_unscoped_full_scan:
+                    raise ValueError(
+                        "products sync 刷新邮箱时必须至少指定 --sender；"
+                        "已有完整候选报告时使用 --use-existing-proposals。"
+                        "只有受控诊断才可显式添加 --allow-unscoped-full-scan"
+                    )
+                result = sync_products(
+                    config,
+                    refresh=True,
+                    sender=args.sender,
+                    subject_contains=args.subject_contains,
+                )
+            if args.subject_contains:
+                result["filter_input_encoding"] = {
+                    "source": (
+                        "utf8-argfile"
+                        if getattr(args, "utf8_argfile_used", False)
+                        else "native-unicode-argv"
+                    ),
+                    "encoding_check": "passed",
+                }
         elif args.products_action == "add":
             result = add_product(
                 config,
@@ -364,6 +536,8 @@ def command_products(config: dict[str, Any], args: argparse.Namespace) -> int:
                 code=args.code,
                 product_name=args.product_name,
                 subject_contains=args.subject_contains,
+                history_scope=args.history_scope,
+                inspect_only=args.inspect_only,
             )
         elif args.products_action == "clone":
             result = clone_product(
@@ -376,6 +550,10 @@ def command_products(config: dict[str, Any], args: argparse.Namespace) -> int:
                 product_name=args.product_name,
                 subject_contains=args.subject_contains,
                 inherit_benchmark=args.inherit_benchmark,
+            )
+        elif args.products_action == "alias":
+            result = add_code_alias(
+                config, config_path, sheet=args.sheet, code=args.code
             )
         elif args.products_action == "pause":
             result = pause_product(
@@ -428,9 +606,65 @@ def parser() -> argparse.ArgumentParser:
     )
     propose.add_argument("--sender", help="完整解析时限定精确发件人")
     propose.add_argument("--subject-contains", help="完整解析时限定稳定主题片段")
-    commands.add_parser("discover")
+    propose.add_argument(
+        "--subject-product-code",
+        help="显式把唯一主题代码绑定到附件中的无代码净值行",
+    )
+    propose.add_argument(
+        "--allow-unscoped-full-scan",
+        action="store_true",
+        help="受控诊断时显式允许无发件人范围的完整扫描",
+    )
+    propose.add_argument(
+        "--lookback-days",
+        type=int,
+        help="本次完整候选解析的回看天数；默认不超过 30 天",
+    )
+    propose.add_argument(
+        "--batch-messages",
+        type=int,
+        default=50,
+        help="单次最多解析的完整邮件数（默认 50）",
+    )
+    propose.add_argument(
+        "--time-budget-seconds",
+        type=int,
+        default=120,
+        help="下载与解析阶段各自的软时间预算（默认各 120 秒）",
+    )
+    propose.add_argument(
+        "--resume",
+        action="store_true",
+        help="从本地部分报告与 UID 游标继续同一范围",
+    )
+    discover_parser = commands.add_parser("discover")
+    discover_parser.add_argument(
+        "--sheet",
+        action="append",
+        dest="sheets",
+        help="只读复跑指定活动 Sheet；可重复使用，最终仍需完整 preview",
+    )
     commands.add_parser("validate")
-    commands.add_parser("preview")
+    preview_parser = commands.add_parser("preview")
+    preview_parser.add_argument(
+        "--lookback-days",
+        type=int,
+        help="本次历史补录预览临时使用的回看天数，不改变日常配置",
+    )
+    preview_parser.add_argument(
+        "--sheet",
+        action="append",
+        dest="sheets",
+        help="生成指定活动 Sheet 的只读诊断预览；可重复，不能提交",
+    )
+    preview_parser.add_argument(
+        "--reuse-discovery",
+        action="store_true",
+        help=(
+            "轻量复核邮箱范围未变化后复用上次完整解析；"
+            "路由、解析器或邮箱变化时自动拒绝"
+        ),
+    )
     commands.add_parser("scheduled-update", help=argparse.SUPPRESS)
     commit_parser = commands.add_parser("commit")
     commit_parser.add_argument("--yes-reviewed-preview", action="store_true")
@@ -447,6 +681,15 @@ def parser() -> argparse.ArgumentParser:
         "sync", help="扫描邮箱并比较新增候选与当前产品"
     )
     product_sync.add_argument("--use-existing-proposals", action="store_true")
+    product_sync.add_argument("--sender", help="刷新候选时限定精确发件人")
+    product_sync.add_argument(
+        "--subject-contains", help="刷新候选时限定稳定主题片段"
+    )
+    product_sync.add_argument(
+        "--allow-unscoped-full-scan",
+        action="store_true",
+        help="受控诊断时显式允许无发件人范围的完整扫描",
+    )
     product_add = product_actions.add_parser(
         "add", help="从 products sync 的候选新增受管产品"
     )
@@ -484,6 +727,20 @@ def parser() -> argparse.ArgumentParser:
     product_adopt.add_argument("--code")
     product_adopt.add_argument("--product-name")
     product_adopt.add_argument("--subject-contains")
+    product_adopt.add_argument(
+        "--history-scope",
+        choices=("tail", "mail-history"),
+        default="tail",
+        help=(
+            "内部接管范围：tail 默认只续接表尾；mail-history "
+            "允许把可证明的邮箱历史放入首次受保护预览"
+        ),
+    )
+    product_adopt.add_argument(
+        "--inspect-only",
+        action="store_true",
+        help="只读判断接管方式和基准审查状态，不修改配置",
+    )
     product_clone = product_actions.add_parser(
         "clone", help="照现有受管 Sheet 的格式新建并接管产品"
     )
@@ -494,6 +751,11 @@ def parser() -> argparse.ArgumentParser:
     product_clone.add_argument("--product-name")
     product_clone.add_argument("--subject-contains")
     product_clone.add_argument("--inherit-benchmark", action="store_true")
+    product_alias = product_actions.add_parser(
+        "alias", help="确认并保存邮件产品代码的精确别名"
+    )
+    product_alias.add_argument("--sheet", required=True)
+    product_alias.add_argument("--code", required=True)
     product_pause = product_actions.add_parser(
         "pause", help="暂停产品但保留工作表和历史"
     )
@@ -519,7 +781,13 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     configure_output()
-    args = parser().parse_args()
+    try:
+        expanded_argv, utf8_argfile_used = expand_utf8_argfiles(sys.argv[1:])
+    except (OSError, ValueError) as exc:
+        emit({"passed": False, "error": str(exc)})
+        return 2
+    args = parser().parse_args(expanded_argv)
+    args.utf8_argfile_used = utf8_argfile_used
     args.scheduled_started = dt.datetime.now().isoformat(timespec="seconds")
     try:
         if args.command == "demo":
@@ -547,17 +815,17 @@ def main() -> int:
             if not isinstance(exc, OSError)
             else f"系统操作失败：{exc.strerror or type(exc).__name__}"
         )
+        failure = {"passed": False, "error": error}
         if args.command == "scheduled-update":
+            failure["exit_code"] = 2
             record_scheduled_run_safely(
                 {
                     "started": args.scheduled_started,
                     "finished": dt.datetime.now().isoformat(timespec="seconds"),
-                    "passed": False,
-                    "exit_code": 2,
-                    "error": error,
+                    **failure,
                 }
             )
-        emit({"passed": False, "error": error})
+        emit(failure)
         return 2
 
 

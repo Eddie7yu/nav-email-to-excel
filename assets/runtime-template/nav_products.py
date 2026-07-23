@@ -33,10 +33,84 @@ from nav_workbook import (
 
 
 PROPOSALS = STATE_ROOT / "route-proposals.json"
+PARTIAL_PROPOSALS = STATE_ROOT / "route-proposals.partial.json"
 
 
 class ProductError(RuntimeError):
     pass
+
+
+def _coverage_matrix(
+    config: dict[str, Any],
+    sheets: list[str],
+    route_sheets: set[str],
+    source_sheets: set[str],
+) -> dict[str, Any]:
+    reviews = config.get("sheet_reviews") or {}
+    active_sheet_names = {
+        str(route.get("sheet") or "")
+        for route in active_routes(config)
+        if isinstance(route, dict)
+    }
+    review_route_sheets = {
+        str(route.get("sheet") or "")
+        for route in active_routes(config)
+        if isinstance(route, dict) and route.get("benchmark_review_only", False)
+    }
+    paused_sheet_names = route_sheets - active_sheet_names
+    statuses = (
+        "active",
+        "active_review_required",
+        "paused",
+        "reference",
+        "excluded",
+        "no_mail_evidence",
+        "local_parser_required",
+        "business_review",
+        "unclassified",
+    )
+    counts = {status: 0 for status in statuses}
+    items: list[dict[str, Any]] = []
+    for sheet in sheets:
+        reason = None
+        if sheet in review_route_sheets:
+            status = "active_review_required"
+            reason = "benchmark-or-workbook-review"
+        elif sheet in active_sheet_names:
+            status = "active"
+        elif sheet in paused_sheet_names:
+            status = "paused"
+        elif sheet in source_sheets:
+            status = "reference"
+        elif isinstance(reviews.get(sheet), dict):
+            status = str(reviews[sheet].get("status") or "unclassified")
+            reason = reviews[sheet].get("reason")
+        else:
+            status = "unclassified"
+        counts[status] += 1
+        item = {"sheet": sheet, "status": status}
+        if reason:
+            item["reason"] = reason
+        items.append(item)
+    action_required_statuses = {
+        "active_review_required",
+        "local_parser_required",
+        "business_review",
+        "unclassified",
+    }
+    return {
+        "total_workbook_sheets": len(sheets),
+        "classified_sheets": len(sheets) - counts["unclassified"],
+        "all_sheets_classified": counts["unclassified"] == 0,
+        "action_required_sheets": sum(
+            counts[status] for status in action_required_statuses
+        ),
+        "counts": counts,
+        "sheets": items,
+        "reviews_for_missing_sheets": sorted(
+            str(sheet) for sheet in reviews if sheet not in sheets
+        ),
+    }
 
 
 def _workbook_sheets(config: dict[str, Any]) -> list[str]:
@@ -56,6 +130,10 @@ def _workbook_sheets(config: dict[str, Any]) -> list[str]:
 
 
 def _read_proposals() -> dict[str, Any]:
+    if PARTIAL_PROPOSALS.is_file():
+        raise ProductError(
+            "候选扫描尚未完成；请先运行 propose --resume，不能使用旧候选接管"
+        )
     try:
         report = json.loads(PROPOSALS.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -98,8 +176,26 @@ def _route_matches_item(route: dict[str, Any], item: dict[str, Any]) -> bool:
         return False
     expected = normalize_code(route.get("code"))
     if expected:
-        return expected == item["code"]
+        accepted = {expected}
+        accepted.update(
+            normalized
+            for alias in route.get("code_aliases") or []
+            if (normalized := normalize_code(alias))
+        )
+        return item["code"] in accepted
     return item["code"] is None
+
+
+def _possible_share_alias(route: dict[str, Any], item: dict[str, Any]) -> bool:
+    if str(route.get("sender") or "").strip().lower() != item["sender"]:
+        return False
+    expected = normalize_code(route.get("code"))
+    candidate = normalize_code(item.get("code"))
+    if not expected or not candidate or expected == candidate:
+        return False
+    shorter, longer = sorted((expected, candidate), key=len)
+    suffix = longer[len(shorter) :] if longer.startswith(shorter) else ""
+    return bool(suffix and len(suffix) <= 12 and re.fullmatch(r"[A-Z0-9_-]+", suffix))
 
 
 def _analysis(config: dict[str, Any], report: dict[str, Any] | None) -> dict[str, Any]:
@@ -115,6 +211,7 @@ def _analysis(config: dict[str, Any], report: dict[str, Any] | None) -> dict[str
     items = _proposal_items(report or {"candidates": []})
     matched: list[dict[str, Any]] = []
     new_candidates: list[dict[str, Any]] = []
+    alias_pending: list[dict[str, Any]] = []
     for item in items:
         matches = [route for route in routes if _route_matches_item(route, item)]
         if matches:
@@ -127,7 +224,20 @@ def _analysis(config: dict[str, Any], report: dict[str, Any] | None) -> dict[str
                     }
                 )
         else:
-            new_candidates.append(item)
+            possible_aliases = [
+                route for route in routes if _possible_share_alias(route, item)
+            ]
+            if len(possible_aliases) == 1:
+                alias_pending.append(
+                    {
+                        **item,
+                        "possible_sheet": possible_aliases[0]["sheet"],
+                        "reason": "share-class-suffix-difference",
+                        "requires_confirmation": True,
+                    }
+                )
+            else:
+                new_candidates.append(item)
     configured_not_seen = [
         {
             "sheet": route.get("sheet"),
@@ -151,6 +261,7 @@ def _analysis(config: dict[str, Any], report: dict[str, Any] | None) -> dict[str
         }
         for route in routes
     ]
+    coverage = _coverage_matrix(config, sheets, route_sheets, source_sheets)
     return {
         "passed": True,
         "changed": False,
@@ -165,6 +276,7 @@ def _analysis(config: dict[str, Any], report: dict[str, Any] | None) -> dict[str
         "routes": route_status,
         "matched_candidates": matched,
         "new_candidates": new_candidates,
+        "alias_pending": alias_pending,
         "configured_not_seen_in_lookback": configured_not_seen,
         "workbook_missing_sheets": [
             item["sheet"] for item in route_status if not item["sheet_present"]
@@ -172,6 +284,7 @@ def _analysis(config: dict[str, Any], report: dict[str, Any] | None) -> dict[str
         "unmanaged_workbook_sheets": [
             name for name in sheets if name not in route_sheets | source_sheets
         ],
+        "workbook_coverage": coverage,
         "automatic_updates": approval_status(config),
     }
 
@@ -186,11 +299,19 @@ def status(config: dict[str, Any]) -> dict[str, Any]:
     return _analysis(config, report)
 
 
-def sync(config: dict[str, Any], refresh: bool = True) -> dict[str, Any]:
+def sync(
+    config: dict[str, Any],
+    refresh: bool = True,
+    *,
+    sender: str | None = None,
+    subject_contains: str | None = None,
+) -> dict[str, Any]:
     if refresh:
         from nav_service import propose_routes
 
-        report = propose_routes(config)
+        report = propose_routes(
+            config, sender=sender, subject_contains=subject_contains
+        )
     else:
         report = _read_proposals()
     result = _analysis(config, report)
@@ -210,6 +331,47 @@ def _candidate(proposal_index: int) -> dict[str, Any]:
     if not isinstance(candidate, dict):
         raise ProductError("Selected proposal is invalid")
     return candidate
+
+
+def _candidate_subject(
+    candidate: dict[str, Any], requested: str | None
+) -> str | None:
+    selection = candidate.get("selection")
+    if selection is None:
+        selection = _read_proposals().get("selection")
+    if selection is not None and not isinstance(selection, dict):
+        raise ProductError("产品候选的邮箱选择范围无效；请重新运行 products sync")
+    inherited = None
+    if isinstance(selection, dict):
+        selected_sender = str(selection.get("sender") or "").strip().casefold()
+        candidate_sender = str(candidate.get("sender") or "").strip().casefold()
+        if selected_sender and selected_sender != candidate_sender:
+            raise ProductError("产品候选与邮箱选择范围的发件人不一致；请重新扫描")
+        value = selection.get("subject_contains")
+        inherited = str(value).strip() if value is not None else None
+        inherited = inherited or None
+    explicit = str(requested).strip() if requested is not None else None
+    explicit = explicit or None
+    if inherited and explicit and inherited.casefold() != explicit.casefold():
+        raise ProductError(
+            "不能把选择式邮箱发现的主题范围替换为其他范围；请重新按目标范围运行 propose"
+        )
+    return inherited or explicit
+
+
+def _candidate_subject_product_code(candidate: dict[str, Any]) -> str | None:
+    selection = candidate.get("selection")
+    if selection is None:
+        selection = _read_proposals().get("selection")
+    if not isinstance(selection, dict):
+        return None
+    binding = normalize_code(selection.get("subject_product_code"))
+    if not binding:
+        return None
+    subject = str(selection.get("subject_contains") or "").strip()
+    if normalize_code(subject) != binding:
+        raise ProductError("主题产品代码绑定与候选主题范围不一致；请重新扫描")
+    return binding
 
 
 def _benchmark(
@@ -389,6 +551,11 @@ def _infer_existing_sheet(
         )
         current = existing_rows(sheet, layout)
         reserved = _summary_reserved_row(sheet, layout, route, current)
+        adoption_series_start = (
+            None
+            if not current or reserved is not None
+            else (max(current) + dt.timedelta(days=1)).isoformat()
+        )
         frequency, frequency_source, _weekday = _data_frequency(
             sheet, layout, route, current, reserved
         )
@@ -398,6 +565,17 @@ def _infer_existing_sheet(
             semantic: layout.columns[semantic]
             for semantic in ("benchmark_level", "benchmark_return", "excess")
             if layout.columns.get(semantic)
+        }
+        column_roles = {
+            semantic: {
+                "column": openpyxl.utils.get_column_letter(column),
+                "header": str(
+                    sheet.cell(layout.header_row, column).value or ""
+                ).strip(),
+            }
+            for semantic, column in sorted(
+                layout.columns.items(), key=lambda item: item[1]
+            )
         }
         benchmark_review_only = bool(
             benchmark_columns
@@ -440,10 +618,17 @@ def _infer_existing_sheet(
             "product_name": product_name,
             "frequency": frequency,
             "frequency_source": frequency_source,
+            "series_start": adoption_series_start,
+            "series_start_reason": (
+                "existing-sheet-tail-plus-one-day"
+                if adoption_series_start
+                else "cold-start-or-reserved-row"
+            ),
             "cumulative_policy": cumulative_policy,
             "return_basis": return_basis,
             "benchmark_review_only": benchmark_review_only,
             "benchmark_columns_present": sorted(benchmark_columns),
+            "column_roles": column_roles,
         }
     finally:
         workbook.close()
@@ -465,6 +650,7 @@ def add(
     cumulative_offset: float | None = None,
     return_basis: str = "cumulative",
     series_start: str | None = None,
+    baseline_overlap: str | None = None,
     max_staleness_days: int = 14,
     benchmark_source_sheet: str | None = None,
     benchmark_source_type: str = "level",
@@ -474,6 +660,8 @@ def add(
     benchmark_review_only: bool = False,
 ) -> dict[str, Any]:
     candidate = _candidate(proposal_index)
+    resolved_subject = _candidate_subject(candidate, subject_contains)
+    subject_product_code = _candidate_subject_product_code(candidate)
     detected = {
         normalize_code(value)
         for value in candidate.get("detected_codes") or []
@@ -511,7 +699,7 @@ def add(
             )
     route: dict[str, Any] = {
         "sender": str(candidate.get("sender") or "").strip().lower(),
-        "subject_contains": subject_contains.strip() if subject_contains else None,
+        "subject_contains": resolved_subject,
         "sheet": sheet.strip(),
         "sheet_mode": resolved_mode,
         "code": selected_code,
@@ -534,14 +722,21 @@ def add(
     }
     if benchmark_review_only:
         route["benchmark_review_only"] = True
+    if subject_product_code:
+        if selected_code != subject_product_code:
+            raise ProductError("主题绑定代码与目标产品代码不一致；拒绝接管")
+        route["subject_product_code"] = subject_product_code
     if cumulative_policy == "offset":
         if cumulative_offset is None:
             raise ProductError("--cumulative-offset is required for offset policy")
         route["cumulative_offset"] = cumulative_offset
     if series_start:
         route["series_start"] = series_start
+    if baseline_overlap:
+        route["baseline_overlap"] = baseline_overlap
 
     updated = deepcopy(config)
+    updated.setdefault("sheet_reviews", {}).pop(route["sheet"], None)
     updated.setdefault("routes", []).append(route)
     validate_config(updated)
     template_result = None
@@ -578,9 +773,15 @@ def adopt(
     code: str | None = None,
     product_name: str | None = None,
     subject_contains: str | None = None,
+    history_scope: str = "tail",
+    inspect_only: bool = False,
 ) -> dict[str, Any]:
     """Connect a user-prepared sheet without asking them for internal modes."""
 
+    if history_scope not in {"tail", "mail-history"}:
+        raise ProductError(
+            "history_scope must be tail or mail-history"
+        )
     candidate = _candidate(proposal_index)
     profile = _infer_existing_sheet(
         config,
@@ -589,6 +790,30 @@ def adopt(
         requested_code=code,
         requested_product_name=product_name,
     )
+    profile["history_scope"] = history_scope
+    profile["history_scope_default"] = "tail"
+    if history_scope == "mail-history":
+        profile["series_start"] = None
+        profile["series_start_reason"] = "supervised-mail-history"
+        profile["baseline_overlap"] = None
+    else:
+        profile["baseline_overlap"] = (
+            "last_existing_point" if profile["series_start"] else None
+        )
+    if inspect_only:
+        _candidate_subject(candidate, subject_contains)
+        return {
+            "passed": True,
+            "changed": False,
+            "action": "inspected-existing-sheet",
+            "sheet": sheet,
+            "review_required": bool(profile["benchmark_review_only"]),
+            "ready_for_direct_adoption": not bool(
+                profile["benchmark_review_only"]
+            ),
+            "inference": profile,
+            "master_unchanged": True,
+        }
     result = add(
         config,
         config_path,
@@ -601,11 +826,73 @@ def adopt(
         sheet_mode=profile["sheet_mode"],
         cumulative_policy=profile["cumulative_policy"],
         return_basis=profile["return_basis"],
+        series_start=profile["series_start"],
+        baseline_overlap=profile["baseline_overlap"],
         benchmark_review_only=profile["benchmark_review_only"],
     )
     result["action"] = "adopted-existing-sheet"
     result["inference"] = profile
     return result
+
+
+def add_code_alias(
+    config: dict[str, Any], config_path: Path, *, sheet: str, code: str
+) -> dict[str, Any]:
+    """Persist one evidence-backed exact mailbox code alias for a managed route."""
+
+    normalized = normalize_code(code)
+    if not normalized:
+        raise ProductError("别名代码不能为空")
+    updated = deepcopy(config)
+    route = next(
+        (
+            item
+            for item in updated.get("routes") or []
+            if str(item.get("sheet") or "") == sheet
+        ),
+        None,
+    )
+    if route is None:
+        raise ProductError(f"找不到受管 Sheet：{sheet}")
+    primary = normalize_code(route.get("code"))
+    if not primary:
+        raise ProductError("没有主产品代码的路由不能添加代码别名")
+    if normalized == primary:
+        return {
+            "passed": True,
+            "changed": False,
+            "sheet": sheet,
+            "code_alias": normalized,
+            "automatic_updates": approval_status(config),
+        }
+    report = _read_proposals()
+    observed = {
+        normalize_code(value)
+        for candidate in report.get("candidates") or []
+        if str(candidate.get("sender") or "").strip().casefold()
+        == str(route.get("sender") or "").strip().casefold()
+        for value in candidate.get("detected_codes") or []
+        if normalize_code(value)
+    }
+    if normalized not in observed:
+        raise ProductError("该别名未出现在当前发件人的候选报告中；请先重新扫描并核实")
+    aliases = {
+        alias
+        for value in route.get("code_aliases") or []
+        if (alias := normalize_code(value))
+    }
+    aliases.add(normalized)
+    route["code_aliases"] = sorted(aliases)
+    validate_config(updated)
+    write_json_atomic(config_path, updated)
+    return {
+        "passed": True,
+        "changed": True,
+        "sheet": sheet,
+        "code_alias": normalized,
+        "requires_preview_approval": True,
+        "automatic_updates": approval_status(updated),
+    }
 
 
 def clone(
@@ -630,6 +917,8 @@ def clone(
     ):
         raise ProductError("目标 Sheet 名称为空、超过 31 字符或包含 Excel 禁用字符")
     candidate = _candidate(proposal_index)
+    resolved_subject = _candidate_subject(candidate, subject_contains)
+    subject_product_code = _candidate_subject_product_code(candidate)
     selected_code = _select_code(candidate, code)
     observations = _candidate_observations(candidate, selected_code)
     if not observations:
@@ -661,7 +950,7 @@ def clone(
         raise ProductError("参考 Sheet 的日频/周频配置无效，无法安全复制")
     route: dict[str, Any] = {
         "sender": str(candidate.get("sender") or "").strip().lower(),
-        "subject_contains": subject_contains.strip() if subject_contains else None,
+        "subject_contains": resolved_subject,
         "sheet": target_sheet,
         "sheet_mode": "summary",
         "code": selected_code,
@@ -676,7 +965,12 @@ def clone(
         "max_staleness_days": int(source_route.get("max_staleness_days", 14)),
         "benchmark": deepcopy(source_benchmark) if inherit_benchmark else None,
     }
+    if subject_product_code:
+        if selected_code != subject_product_code:
+            raise ProductError("主题绑定代码与目标产品代码不一致；拒绝新建")
+        route["subject_product_code"] = subject_product_code
     updated = deepcopy(config)
+    updated.setdefault("sheet_reviews", {}).pop(target_sheet, None)
     updated.setdefault("routes", []).append(route)
     source_overrides = (config.get("column_overrides") or {}).get(copy_from.strip())
     if source_overrides:

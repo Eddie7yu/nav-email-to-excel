@@ -188,6 +188,7 @@ def config_payload(args: argparse.Namespace, workbook: Path) -> dict:
             "max_total_bytes": 100 * 1024 * 1024,
         },
         "routes": [],
+        "sheet_reviews": {},
         "column_overrides": {},
         "style": {
             "mode": (
@@ -318,7 +319,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--imap-host", required=True)
     result.add_argument("--imap-port", type=int, default=993)
     result.add_argument("--mailbox", default="INBOX")
-    result.add_argument("--lookback-days", type=int, default=180)
+    result.add_argument("--lookback-days", type=int, default=60)
     result.add_argument(
         "--index-url",
         help="仅本次安装使用的 HTTPS Python 包索引，不修改 pip 全局配置",

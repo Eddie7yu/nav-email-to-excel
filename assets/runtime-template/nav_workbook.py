@@ -79,29 +79,129 @@ def _norm(value: Any) -> str:
     return re.sub(r"[\s_:/：()（）\[\]-]", "", str(value or "")).lower()
 
 
-def _field(value: Any) -> str | None:
+def _field(value: Any, route: dict[str, Any] | None = None) -> str | None:
     text = _norm(value)
     if not text:
         return None
     # Match date before unit NAV: a header such as "NAV Date" contains both
     # concepts, and treating it as NAV would make otherwise valid layouts fail.
-    order = (
-        "cumulative",
-        "date",
-        "code",
-        "name",
+    for field in ("cumulative", "date", "code", "name", "excess"):
+        if any(_norm(word) in text for word in HEADER_WORDS[field]):
+            return field
+    benchmark = (route or {}).get("benchmark")
+    display_name = (
+        _norm(benchmark.get("display_name"))
+        if isinstance(benchmark, dict)
+        else ""
+    )
+    identifies_benchmark = (
+        "指数" in text
+        or "基准" in text
+        or bool(display_name and display_name in text)
+    )
+    if identifies_benchmark:
+        if any(
+            marker in text
+            for marker in ("日收益", "周收益", "收益率", "收益", "return")
+        ):
+            return "benchmark_return"
+        if any(
+            marker in text
+            for marker in ("点位", "收盘", "level", "close")
+        ) or (display_name and text == display_name):
+            return "benchmark_level"
+    for field in (
         "benchmark_return",
         "benchmark_level",
-        "excess",
         "daily_return",
         "weekly_return",
         "return",
         "unit",
-    )
-    for field in order:
+    ):
         if any(_norm(word) in text for word in HEADER_WORDS[field]):
             return field
     return None
+
+
+def _return_header_base(value: Any) -> str:
+    text = _norm(value)
+    for marker in (
+        "dailyreturn",
+        "weeklyreturn",
+        "benchmarkreturn",
+        "indexreturn",
+        "日收益率",
+        "周收益率",
+        "日收益",
+        "周收益",
+        "收益率",
+        "收益",
+        "return",
+    ):
+        text = text.replace(_norm(marker), "")
+    return text
+
+
+def _infer_named_benchmark_columns(
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    row: int,
+    candidate: dict[str, int],
+    route: dict[str, Any],
+) -> dict[str, int]:
+    """Recognize a concrete benchmark name paired with its return header."""
+
+    if {"benchmark_level", "benchmark_return"} <= candidate.keys():
+        return candidate
+    values = {
+        column: sheet.cell(row, column).value
+        for column in range(1, min(sheet.max_column, 80) + 1)
+    }
+    used = set(candidate.values())
+    benchmark = route.get("benchmark")
+    display_name = (
+        _norm(benchmark.get("display_name"))
+        if isinstance(benchmark, dict)
+        else ""
+    )
+    return_columns = (
+        [candidate["benchmark_return"]]
+        if candidate.get("benchmark_return")
+        else list(values)
+    )
+    for return_column in return_columns:
+        value = values[return_column]
+        if (
+            return_column in used
+            and candidate.get("benchmark_return") != return_column
+        ):
+            continue
+        normalized = _norm(value)
+        base = _return_header_base(value)
+        if not base or base == normalized:
+            continue
+        explicit_benchmark = (
+            "指数" in normalized
+            or "基准" in normalized
+            or bool(display_name and display_name in normalized)
+        )
+        level_column = next(
+            (
+                column
+                for column, level_value in values.items()
+                if column not in used
+                and column != return_column
+                and _norm(level_value) == base
+            ),
+            None,
+        )
+        paired_with_excess = bool(candidate.get("excess") and level_column)
+        if not explicit_benchmark and not paired_with_excess:
+            continue
+        candidate.setdefault("benchmark_return", return_column)
+        if level_column:
+            candidate.setdefault("benchmark_level", level_column)
+        break
+    return candidate
 
 
 def _column(value: Any) -> int:
@@ -207,9 +307,12 @@ def discover_layout(
         for row in range(1, min(sheet.max_row, 30) + 1):
             candidate: dict[str, int] = {}
             for column in range(1, min(sheet.max_column, 80) + 1):
-                field = _field(sheet.cell(row, column).value)
+                field = _field(sheet.cell(row, column).value, route)
                 if field and field not in candidate:
                     candidate[field] = column
+            candidate = _infer_named_benchmark_columns(
+                sheet, row, candidate, route
+            )
             score = len(candidate) + (3 if {"date", "unit"} <= candidate.keys() else 0)
             if score > best_score:
                 best_score = score
@@ -421,6 +524,142 @@ def existing_rows(
     return output
 
 
+def _history_value_id(*values: Any) -> str:
+    import hashlib
+
+    encoded = "\x1f".join("" if value is None else str(value) for value in values)
+    return hashlib.sha256(encoded.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _history_integrity(
+    layout: Layout,
+    route: dict[str, Any],
+    existing: dict[dt.date, dict[str, Any]],
+    tolerance: float,
+) -> dict[str, Any]:
+    expected_code = normalize_code(route.get("code"))
+    code_rows = [
+        (date, values)
+        for date, values in sorted(existing.items())
+        if values.get("code")
+    ]
+    observed_codes = {str(values["code"]) for _, values in code_rows}
+    code_constant = len(observed_codes) <= 1 and (
+        not expected_code or not observed_codes or observed_codes == {expected_code}
+    )
+    unexpected_code_rows = [
+        {
+            "row": int(values["row"]),
+            "date": date.isoformat(),
+            "code_id": _history_value_id(values.get("code")),
+        }
+        for date, values in code_rows
+        if (expected_code and values.get("code") != expected_code)
+        or (not expected_code and len(observed_codes) > 1)
+    ]
+
+    cumulative_anomalies: list[dict[str, Any]] = []
+    complete: list[tuple[dt.date, dict[str, Any], float]] = []
+    if layout.columns.get("cumulative"):
+        for date, values in sorted(existing.items()):
+            unit = values.get("unit")
+            cumulative = values.get("cumulative")
+            if unit is None:
+                cumulative_anomalies.append(
+                    {
+                        "row": int(values["row"]),
+                        "date": date.isoformat(),
+                        "issue": "missing-unit-nav",
+                    }
+                )
+                continue
+            if cumulative is None:
+                cumulative_anomalies.append(
+                    {
+                        "row": int(values["row"]),
+                        "date": date.isoformat(),
+                        "issue": "missing-cumulative-nav",
+                    }
+                )
+                continue
+            spread = float(cumulative) - float(unit)
+            complete.append((date, values, spread))
+        policy = str(route.get("cumulative_policy", "require"))
+        spread_tolerance = max(tolerance * 10, 1e-8)
+        if policy in {"unit", "offset"}:
+            expected_spread = (
+                0.0 if policy == "unit" else float(route["cumulative_offset"])
+            )
+            for date, values, spread in complete:
+                if abs(spread - expected_spread) > spread_tolerance:
+                    cumulative_anomalies.append(
+                        {
+                            "row": int(values["row"]),
+                            "date": date.isoformat(),
+                            "issue": "configured-cumulative-policy-break",
+                            "spread_id": _history_value_id(f"{spread:.10f}"),
+                        }
+                    )
+        elif len(complete) >= 3:
+            for previous, current, following in zip(
+                complete, complete[1:], complete[2:]
+            ):
+                if (
+                    abs(previous[2] - following[2]) <= spread_tolerance
+                    and abs(current[2] - previous[2]) > spread_tolerance
+                ):
+                    cumulative_anomalies.append(
+                        {
+                            "row": int(current[1]["row"]),
+                            "date": current[0].isoformat(),
+                            "issue": "isolated-unit-cumulative-spread-break",
+                            "spread_id": _history_value_id(f"{current[2]:.10f}"),
+                            "neighbor_spread_id": _history_value_id(
+                                f"{previous[2]:.10f}"
+                            ),
+                        }
+                    )
+    else:
+        cumulative_anomalies.extend(
+            {
+                "row": int(values["row"]),
+                "date": date.isoformat(),
+                "issue": "missing-unit-nav",
+            }
+            for date, values in sorted(existing.items())
+            if values.get("unit") is None
+        )
+    return {
+        "passed": code_constant and not cumulative_anomalies,
+        "repair_required": not code_constant or bool(cumulative_anomalies),
+        "code_column": {
+            "passed": code_constant,
+            "nonblank_code_count": len(code_rows),
+            "distinct_code_count": len(observed_codes),
+            "unexpected_rows": unexpected_code_rows,
+        },
+        "cumulative_sequence": {
+            "passed": not cumulative_anomalies,
+            "anomalies": cumulative_anomalies,
+        },
+    }
+
+
+def _identity_evidence_rows(
+    existing: dict[dt.date, dict[str, Any]], route: dict[str, Any]
+) -> dict[dt.date, dict[str, Any]]:
+    """Use managed history for identity, or only the preserved tail at the boundary."""
+
+    if not existing:
+        return {}
+    start = parse_date(route.get("series_start")) or dt.date.min
+    managed = {date: values for date, values in existing.items() if date >= start}
+    if managed:
+        return managed
+    tail = max(existing)
+    return {tail: existing[tail]}
+
+
 def _summary_reserved_row(
     sheet: openpyxl.worksheet.worksheet.Worksheet,
     layout: Layout,
@@ -495,11 +734,16 @@ def _summary_reviewed_onboarding(
 
     expected_code = normalize_code(route.get("code"))
     expected_name = _norm(route.get("product_name"))
+    identity_existing = _identity_evidence_rows(existing, route)
     observed_codes = {
-        values["code"] for values in existing.values() if values.get("code")
+        values["code"]
+        for values in identity_existing.values()
+        if values.get("code")
     }
     observed_names = {
-        _norm(values["name"]) for values in existing.values() if values.get("name")
+        _norm(values["name"])
+        for values in identity_existing.values()
+        if values.get("name")
     }
     candidate_codes = {candidate.code for candidate in candidates if candidate.code}
     code_identity = bool(
@@ -519,7 +763,7 @@ def _summary_reviewed_onboarding(
         and (
             not layout.columns.get("cumulative") or values.get("cumulative") is not None
         )
-        for values in existing.values()
+        for values in identity_existing.values()
     )
     if not (
         layout.mode == "summary"
@@ -550,6 +794,190 @@ def _summary_reviewed_onboarding(
         else "product name"
     )
     return identity
+
+
+def _withheld_current_week_dates(
+    data_frequency: str,
+    existing: dict[dt.date, dict[str, Any]],
+    selected_candidates: list[NavRow],
+    candidates: list[NavRow],
+) -> list[dt.date]:
+    """Return real tail dates intentionally withheld until the ISO week completes."""
+
+    if data_frequency != "weekly" or not existing:
+        return []
+    today = dt.date.today()
+    current_iso = today.isocalendar()
+    current_week = (current_iso.year, current_iso.week)
+    latest_existing = max(existing)
+    selected_dates = {candidate.date for candidate in selected_candidates}
+    return sorted(
+        {
+            candidate.date
+            for candidate in candidates
+            if candidate.date not in existing
+            and candidate.date not in selected_dates
+            and latest_existing < candidate.date <= today
+            and (
+                candidate.date.isocalendar().year,
+                candidate.date.isocalendar().week,
+            )
+            == current_week
+        }
+    )
+
+
+def _weekly_pending_baseline_identity(
+    layout: Layout,
+    route: dict[str, Any],
+    existing: dict[dt.date, dict[str, Any]],
+    selected_candidates: list[NavRow],
+    candidates: list[NavRow],
+    conflicts: int,
+    data_frequency: str,
+) -> tuple[str, list[dt.date]] | None:
+    """Allow a zero-add baseline when only the unfinished current week is pending."""
+
+    withheld_dates = _withheld_current_week_dates(
+        data_frequency, existing, selected_candidates, candidates
+    )
+    if not withheld_dates or conflicts or layout.mode not in {"summary", "append"}:
+        return None
+    tail_age_days = (dt.date.today() - max(existing)).days
+    if tail_age_days > int(route.get("max_staleness_days", 14)):
+        return None
+    if any(candidate.date not in existing for candidate in selected_candidates):
+        return None
+    allowed_dates = set(existing) | set(withheld_dates)
+    if not candidates or any(
+        candidate.date not in allowed_dates for candidate in candidates
+    ):
+        return None
+    identity_existing = _identity_evidence_rows(existing, route)
+    complete_history = all(
+        values.get("unit") is not None
+        and (
+            not layout.columns.get("cumulative")
+            or values.get("cumulative") is not None
+        )
+        for values in identity_existing.values()
+    )
+    if not complete_history:
+        return None
+
+    expected_code = normalize_code(route.get("code"))
+    expected_name = _norm(route.get("product_name"))
+    observed_codes = {
+        values["code"]
+        for values in identity_existing.values()
+        if values.get("code")
+    }
+    observed_names = {
+        _norm(values["name"])
+        for values in identity_existing.values()
+        if values.get("name")
+    }
+    candidate_codes = {candidate.code for candidate in candidates if candidate.code}
+    code_identity = bool(
+        expected_code
+        and layout.columns.get("code")
+        and observed_codes == {expected_code}
+        and all(candidate.code == expected_code for candidate in candidates)
+    )
+    name_identity = bool(
+        expected_name
+        and len(candidate_codes) <= 1
+        and (
+            _norm(layout.sheet) == expected_name
+            or (layout.columns.get("name") and observed_names == {expected_name})
+        )
+    )
+    if not (code_identity or name_identity):
+        return None
+    identity = (
+        "product code and product name"
+        if code_identity and name_identity
+        else "product code"
+        if code_identity
+        else "product name"
+    )
+    return identity, withheld_dates
+
+
+def _boundary_anchor_identity(
+    layout: Layout,
+    route: dict[str, Any],
+    existing: dict[dt.date, dict[str, Any]],
+    pre_managed_candidates: list[NavRow],
+    tolerance: float,
+) -> tuple[str, dt.date] | None:
+    """Verify the preserved workbook tail immediately before series_start."""
+
+    if route.get("baseline_overlap") != "last_existing_point":
+        return None
+    start = parse_date(route.get("series_start"))
+    if not start or start == dt.date.min or not existing:
+        return None
+    anchor_date = start - dt.timedelta(days=1)
+    if max(existing) != anchor_date or anchor_date not in existing:
+        return None
+    candidates = [
+        candidate
+        for candidate in pre_managed_candidates
+        if candidate.date == anchor_date
+    ]
+    signatures = {
+        (
+            round(candidate.unit, 10),
+            None
+            if candidate.cumulative is None
+            else round(candidate.cumulative, 10),
+            candidate.code,
+        )
+        for candidate in candidates
+    }
+    if len(signatures) != 1:
+        return None
+    candidate = candidates[0]
+    observed = existing[anchor_date]
+    if observed.get("unit") is None or abs(
+        float(observed["unit"]) - candidate.unit
+    ) > tolerance:
+        return None
+    if layout.columns.get("cumulative"):
+        if observed.get("cumulative") is None or abs(
+            float(observed["cumulative"])
+            - effective_cumulative(candidate, route)
+        ) > tolerance:
+            return None
+    expected_code = normalize_code(route.get("code"))
+    expected_name = _norm(route.get("product_name"))
+    code_identity = bool(
+        expected_code
+        and layout.columns.get("code")
+        and observed.get("code") == expected_code
+        and candidate.code == expected_code
+    )
+    name_identity = bool(
+        expected_name
+        and (
+            _norm(layout.sheet) == expected_name
+            or (
+                layout.columns.get("name")
+                and _norm(observed.get("name")) == expected_name
+            )
+        )
+    )
+    if not (code_identity or name_identity):
+        return None
+    identity = (
+        "product code and product name"
+        if code_identity and name_identity
+        else "product code"
+        if code_identity
+        else "product name"
+    )
+    return identity, anchor_date
 
 
 def _header_data_frequency(
@@ -705,9 +1133,62 @@ def validate_history(
                 route,
             )
             existing = existing_rows(workbook[sheet_name], layout)
+            start = parse_date(route.get("series_start")) or dt.date.min
+            reserved = _summary_reserved_row(
+                workbook[sheet_name], layout, route, existing
+            )
+            integrity_existing = {
+                date: values
+                for date, values in existing.items()
+                if date >= start and (reserved is None or date != reserved[0])
+            }
+            pre_managed_existing = {
+                date: values for date, values in existing.items() if date < start
+            }
+            history_integrity = _history_integrity(
+                layout, route, integrity_existing, tolerance
+            )
+            pre_managed_integrity = _history_integrity(
+                layout, route, pre_managed_existing, tolerance
+            )
+            history_integrity["scope"] = {
+                "series_start": start.isoformat(),
+                "pre_managed_rows": len(pre_managed_existing),
+                "managed_rows": len(integrity_existing),
+            }
+            history_integrity["pre_managed_diagnostics"] = {
+                "repair_required": pre_managed_integrity["repair_required"],
+                "code_column": pre_managed_integrity["code_column"],
+                "cumulative_sequence": pre_managed_integrity[
+                    "cumulative_sequence"
+                ],
+            }
+            if pre_managed_integrity["repair_required"]:
+                warnings.append(
+                    f"{sheet_name}: preserved pre-managed history before series_start "
+                    "contains integrity diagnostics; it is not modified and does not "
+                    "block managed-tail validation"
+                )
+            if not history_integrity["code_column"]["passed"]:
+                errors.append(
+                    f"{sheet_name}: managed historical product code column is not constant; "
+                    "inspect history_integrity before any supervised repair"
+                )
+            if not history_integrity["cumulative_sequence"]["passed"]:
+                errors.append(
+                    f"{sheet_name}: managed unit/cumulative NAV history has a sequence break; "
+                    "inspect history_integrity before any supervised repair"
+                )
             matches = 0
             conflicts = 0
-            start = parse_date(route.get("series_start")) or dt.date.min
+            pre_managed_candidates = sorted(
+                (
+                    candidate
+                    for candidate in route_rows.get(sheet_name, [])
+                    if candidate.date < start
+                ),
+                key=lambda item: item.date,
+            )
             candidates = sorted(
                 (
                     candidate
@@ -715,9 +1196,6 @@ def validate_history(
                     if candidate.date >= start
                 ),
                 key=lambda item: item.date,
-            )
-            reserved = _summary_reserved_row(
-                workbook[sheet_name], layout, route, existing
             )
             if reserved:
                 reserved_date = reserved[0]
@@ -764,7 +1242,7 @@ def validate_history(
             known_units = {
                 date: values["unit"]
                 for date, values in existing.items()
-                if values["unit"] is not None
+                if date >= start and values["unit"] is not None
             }
             for candidate in candidates:
                 expected_code = normalize_code(route.get("code"))
@@ -864,9 +1342,40 @@ def validate_history(
                     )
             summary_cold_start = reserved_date is not None
             template_cold_start = layout.mode == "template" and matches < minimum
+            weekly_pending_baseline = (
+                reserved_date is None
+                and matches < minimum
+                and _weekly_pending_baseline_identity(
+                    layout,
+                    route,
+                    existing,
+                    selected_candidates,
+                    candidates,
+                    conflicts,
+                    data_frequency,
+                )
+            )
+            boundary_anchor = _boundary_anchor_identity(
+                layout,
+                route,
+                existing,
+                pre_managed_candidates,
+                tolerance,
+            )
+            boundary_zero_baseline = bool(boundary_anchor and not candidates)
+            if (
+                route.get("baseline_overlap") == "last_existing_point"
+                and not boundary_anchor
+            ):
+                errors.append(
+                    f"{sheet_name}: baseline_overlap last_existing_point could not "
+                    "verify the workbook tail immediately before series_start"
+                )
             summary_review_identity = (
                 reserved_date is None
                 and matches < minimum
+                and not boundary_zero_baseline
+                and not weekly_pending_baseline
                 and _summary_reviewed_onboarding(
                     layout,
                     route,
@@ -894,6 +1403,21 @@ def validate_history(
                     errors.append(
                         f"{sheet_name}: bundled template cold start needs at least one real email NAV date"
                     )
+            elif weekly_pending_baseline:
+                identity, withheld_dates = weekly_pending_baseline
+                warnings.append(
+                    f"{sheet_name}: a unique {identity} match and the workbook tail were verified; "
+                    f"{len(withheld_dates)} real email date(s) belong to the unfinished current week, "
+                    "so generate a zero-add baseline and do not write that week yet"
+                )
+            elif boundary_zero_baseline and boundary_anchor:
+                identity, anchor_date = boundary_anchor
+                warnings.append(
+                    f"{sheet_name}: the preserved workbook tail on "
+                    f"{anchor_date.isoformat()} and a unique {identity} match were "
+                    "verified at the adoption boundary; generate a zero-add baseline "
+                    "without reopening earlier history"
+                )
             elif summary_review_identity:
                 warnings.append(
                     f"{sheet_name}: only {matches} historical date(s) were verified, but a unique {summary_review_identity} match allows a review-gated preview; verify the product, dates and NAV values before approval"
@@ -913,7 +1437,12 @@ def validate_history(
                     "cold_start": summary_cold_start
                     or template_cold_start
                     or bool(summary_review_identity)
-                    or (layout.mode == "append" and matches < minimum),
+                    or (
+                        layout.mode == "append"
+                        and matches < minimum
+                        and not boundary_zero_baseline
+                        and not weekly_pending_baseline
+                    ),
                     "cold_start_kind": (
                         "summary-reserved-row"
                         if summary_cold_start
@@ -922,13 +1451,32 @@ def validate_history(
                         else "summary-reviewed-preview"
                         if summary_review_identity
                         else "append"
-                        if layout.mode == "append" and matches < minimum
+                        if (
+                            layout.mode == "append"
+                            and matches < minimum
+                            and not boundary_zero_baseline
+                            and not weekly_pending_baseline
+                        )
                         else None
                     ),
                     "matched_history_dates": matches,
                     "conflicts": conflicts,
                     "data_frequency": data_frequency,
                     "data_frequency_source": frequency_source,
+                    "pending_current_week_baseline": bool(weekly_pending_baseline),
+                    "boundary_anchor_verified": bool(boundary_anchor),
+                    "boundary_anchor_date": (
+                        boundary_anchor[1].isoformat() if boundary_anchor else None
+                    ),
+                    "withheld_current_week_dates": [
+                        date.isoformat()
+                        for date in (
+                            weekly_pending_baseline[1]
+                            if weekly_pending_baseline
+                            else []
+                        )
+                    ],
+                    "history_integrity": history_integrity,
                 }
             )
     finally:
@@ -938,6 +1486,11 @@ def validate_history(
         "routes": reports,
         "warnings": warnings,
         "errors": errors,
+        "history_repairs_required": sum(
+            1
+            for route_report in reports
+            if route_report["history_integrity"]["repair_required"]
+        ),
     }
     write_json_atomic(STATE_ROOT / "validation-report.json", report)
     return report
@@ -988,6 +1541,16 @@ def _date_rows(
         if date and date >= start:
             rows.append((date, row))
     return sorted(rows)
+
+
+def _formula_series_start(route: dict[str, Any]) -> dt.date:
+    start = parse_date(route.get("series_start")) or dt.date.min
+    if route.get("baseline_overlap") == "last_existing_point":
+        # This mode marks an adoption/write boundary, not an investment-series
+        # reset.  Existing return and summary formulas must continue to use the
+        # workbook's full preserved history.
+        return dt.date.min
+    return start
 
 
 def _primary_return_column(layout: Layout, route: dict[str, Any]) -> int | None:
@@ -1042,7 +1605,7 @@ def _set_return_formulas(
         raise WorkbookError(
             f"{sheet.title}: return basis column {basis_name} is missing"
         )
-    start = parse_date(route.get("series_start")) or dt.date.min
+    start = _formula_series_start(route)
     rows = _date_rows(sheet, layout, summary_row, start)
     if not rows:
         return [], set()
@@ -1190,7 +1753,7 @@ def _set_benchmark_formulas(
         raise WorkbookError(
             f"{sheet.title}: benchmark return, product return, and excess columns are required"
         )
-    start = parse_date(route.get("series_start")) or dt.date.min
+    start = _formula_series_start(route)
     rows = _date_rows(sheet, layout, summary_row, start)
     by_row = {row: date for date, row in rows}
     target_rows = [
@@ -1321,6 +1884,8 @@ def _ensure_summary_formula_safety(
     for column in range(1, sheet.max_column + 1):
         value = sheet.cell(layout.summary_row, column).value
         if isinstance(value, ArrayFormula):
+            if _review_summary_array_column(sheet, layout, route, column):
+                continue
             coordinate = sheet.cell(layout.summary_row, column).coordinate
             raise WorkbookError(
                 f"{sheet.title}: array formula at {coordinate} cannot be moved "
@@ -1332,6 +1897,47 @@ def _ensure_summary_formula_safety(
                 f"{sheet.title}: summary formula at {coordinate} is not managed; "
                 "automatic insertion cannot prove that its range will expand safely"
             )
+
+
+def _review_summary_array_column(
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    layout: Layout,
+    route: dict[str, Any],
+    column: int,
+) -> bool:
+    if not route.get("benchmark_review_only") or column not in {
+        layout.columns.get("benchmark_level"),
+        layout.columns.get("benchmark_return"),
+        layout.columns.get("excess"),
+    }:
+        return False
+    cell = sheet.cell(layout.summary_row, column)
+    value = cell.value
+    if not isinstance(value, ArrayFormula):
+        return False
+    try:
+        min_column, min_row, max_column, max_row = range_boundaries(value.ref)
+    except (TypeError, ValueError):
+        return False
+    return (
+        min_column == max_column == cell.column
+        and min_row == max_row == cell.row
+    )
+
+
+def _clear_review_summary_arrays(
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    layout: Layout,
+    route: dict[str, Any],
+) -> list[int]:
+    columns = [
+        column
+        for column in range(1, sheet.max_column + 1)
+        if _review_summary_array_column(sheet, layout, route, column)
+    ]
+    for column in columns:
+        sheet.cell(layout.summary_row, column).value = None
+    return columns
 
 
 def _ensure_array_formula_insertion_safety(
@@ -1402,6 +2008,8 @@ def build_preview(
     config: dict[str, Any],
     route_rows: dict[str, list[NavRow]],
     warnings: list[str] | None = None,
+    *,
+    diagnostic_only: bool = False,
 ) -> dict[str, Any]:
     (STATE_ROOT / "plan.json").unlink(missing_ok=True)
     master = Path(config["workbook_path"])
@@ -1429,6 +2037,15 @@ def build_preview(
     plan_sheets: list[dict[str, Any]] = []
     baseline_routes: list[dict[str, Any]] = []
     blocking_reviews: list[dict[str, str]] = []
+    if diagnostic_only:
+        blocking_reviews.append(
+            {
+                "sheet": "、".join(
+                    str(route["sheet"]) for route in active_routes(config)
+                ),
+                "issue": "scoped-diagnostic-preview",
+            }
+        )
     try:
         for route in active_routes(config):
             sheet_name = str(route["sheet"])
@@ -1442,13 +2059,18 @@ def build_preview(
             )
             current = existing_rows(sheet, layout)
             start = parse_date(route.get("series_start")) or dt.date.min
-            candidates = sorted(
-                (row for row in route_rows.get(sheet_name, []) if row.date >= start),
-                key=lambda row: row.date,
+            observed_candidates = sorted(
+                route_rows.get(sheet_name, []), key=lambda row: row.date
             )
+            candidates = [
+                row for row in observed_candidates if row.date >= start
+            ]
             reserved = _summary_reserved_row(sheet, layout, route, current)
             candidates, data_frequency, frequency_source = _select_data_rows(
                 sheet, layout, route, current, reserved, candidates
+            )
+            withheld_current_week_dates = _withheld_current_week_dates(
+                data_frequency, current, candidates, observed_candidates
             )
             reserved_date = reserved[0] if reserved else None
             reserved_row = reserved[1] if reserved else None
@@ -1485,8 +2107,23 @@ def build_preview(
                         max(current).isoformat() if current else None
                     ),
                     "email_latest_date": (
-                        max(row.date for row in candidates).isoformat()
-                        if candidates
+                        max(row.date for row in observed_candidates).isoformat()
+                        if observed_candidates
+                        else None
+                    ),
+                    "withheld_current_week_dates": [
+                        date.isoformat() for date in withheld_current_week_dates
+                    ],
+                    "verification_anchor_date": (
+                        max(
+                            (
+                                row.date
+                                for row in observed_candidates
+                                if row.date < start
+                            ),
+                            default=None,
+                        ).isoformat()
+                        if any(row.date < start for row in observed_candidates)
                         else None
                     ),
                     "pending_dates": len(additions)
@@ -1512,6 +2149,9 @@ def build_preview(
             count = len(additions)
             max_column = max([sheet.max_column, *layout.columns.values()])
             changed: set[tuple[int, int]] = set()
+            review_array_columns = _clear_review_summary_arrays(
+                sheet, layout, route
+            )
             filled_existing_rows: list[int] = []
             for column, label in (layout.headers_to_write or {}).items():
                 cell = sheet.cell(layout.header_row, column)
@@ -1552,6 +2192,9 @@ def build_preview(
                             target, layout.columns["cumulative"]
                         ).number_format = "0.000000"
             new_summary = old_summary + count
+            changed.update(
+                (new_summary, column) for column in review_array_columns
+            )
             new_rows = set(range(old_summary, new_summary))
             managed_rows = new_rows | set(filled_existing_rows)
             period_rows, affected_rows = _set_return_formulas(
@@ -1611,6 +2254,10 @@ def build_preview(
                             + additions
                         )
                     ],
+                    "review_array_formulas_cleared": [
+                        f"{get_column_letter(column)}{new_summary}"
+                        for column in review_array_columns
+                    ],
                     "return_columns": [
                         column
                         for column in (
@@ -1646,6 +2293,7 @@ def build_preview(
         "review_sha256": None,
         "warnings": list(warnings or []),
         "committable": not blocking_reviews,
+        "diagnostic_only": diagnostic_only,
         "blocking_reviews": blocking_reviews,
         "sheets": plan_sheets,
     }
@@ -1677,6 +2325,9 @@ def build_preview(
                     f"工作簿最新日期：{item['workbook_latest_date'] or '无'}",
                     f"邮箱最新日期：{item['email_latest_date'] or '无'}",
                     f"待写入日期数：{item['pending_dates']}",
+                    "未完成自然周暂缓日期数："
+                    f"{len(item['withheld_current_week_dates'])}",
+                    f"接管边界核验日期：{item['verification_anchor_date'] or '无'}",
                 ]
             )
         if warnings:
@@ -1688,6 +2339,8 @@ def build_preview(
                     "待 AI 解决后重新预览：",
                     *[
                         f"- {item['sheet']}：基准/超额来源尚未确认"
+                        if item["issue"] == "benchmark-source-unresolved"
+                        else f"- {item['sheet']}：这是局部诊断预览，必须完成一次完整预览"
                         for item in blocking_reviews
                     ],
                 ]

@@ -438,15 +438,15 @@ def commit(config: dict[str, Any]) -> dict[str, Any]:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError) as exc:
         raise CommitError("No valid plan.json. Run preview again.") from exc
-    if plan.get("schema_version") != 1 or plan.get("config_sha256") != payload_sha256(
-        config
-    ):
-        raise CommitError(
-            "The runtime configuration changed after preview; regenerate the preview"
-        )
+    if plan.get("schema_version") != 1:
+        raise CommitError("The preview plan schema is invalid")
     if plan.get("committable", True) is not True:
         raise CommitError(
             "This is a review-only preview. Resolve every blocking review and regenerate the preview before commit"
+        )
+    if plan.get("config_sha256") != payload_sha256(config):
+        raise CommitError(
+            "The runtime configuration changed after preview; regenerate the preview"
         )
     try:
         uuid.UUID(str(plan.get("plan_id") or ""))

@@ -219,6 +219,7 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     if (
         config["workbook_path"] != str(workbook_path.resolve())
         or config["workbook_mode"] != "existing"
+        or config["imap"]["lookback_days"] != 60
         or config["style"]["mode"] != "infer"
         or config["routes"]
     ):
@@ -232,6 +233,29 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
     )
     if not runtime_python.is_file():
         raise AssertionError("bootstrap did not create the isolated Python runtime")
+    for unsafe_command in (
+        ["propose"],
+        ["products", "sync"],
+    ):
+        guarded = subprocess.run(
+            [str(runtime_python), "-X", "utf8", "navctl.py", *unsafe_command],
+            cwd=app,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=environment,
+            timeout=10,
+        )
+        guarded_report = json.loads(guarded.stdout)
+        if (
+            guarded.returncode != 2
+            or guarded_report.get("passed") is not False
+            or "--sender" not in guarded_report.get("error", "")
+            or guarded.stderr
+        ):
+            raise AssertionError(
+                f"unscoped mailbox scan was not stopped before IMAP access: {unsafe_command}"
+            )
     for wrapper in (
         path
         for path in destination.rglob("*")
@@ -284,6 +308,22 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
                     f"Windows launcher failed from a special-character path: "
                     f"{launcher_name}: {output}"
                 )
+        update_logs = sorted((destination / "logs").glob("update-*.log"))
+        if not update_logs:
+            raise AssertionError(
+                "manual update failure did not create the promised local update log"
+            )
+        update_log = update_logs[-1].read_text(encoding="utf-8", errors="replace")
+        if (
+            '"passed": false' not in update_log
+            or '"exit_code": 2' not in update_log
+            or str(workbook_path) in update_log
+            or "user@example.invalid" in update_log
+            or "traceback" in update_log.casefold()
+        ):
+            raise AssertionError(
+                "manual update failure log is missing, unstructured, or not sanitized"
+            )
     doctor = subprocess.run(
         [str(runtime_python), "-X", "utf8", "navctl.py", "doctor"],
         cwd=app,
