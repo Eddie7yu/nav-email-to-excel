@@ -2061,6 +2061,7 @@ def route_state_tests(runtime: Path) -> None:
 
 def lock_tests(runtime: Path) -> None:
     sys.path.insert(0, str(runtime))
+    from navctl import deployment_status
     from nav_schedule import (
         _local_timezone,
         _task_time,
@@ -2148,6 +2149,38 @@ def lock_tests(runtime: Path) -> None:
     check(
         status().get("last_run") == scheduled,
         "schedule status did not expose the latest run result",
+    )
+    status_config = {
+        "runtime_id": "status-fixture",
+        "routes": [
+            {"sheet": "Active"},
+            {"sheet": "Paused", "paused": True},
+            {"sheet": "Source Review", "benchmark_review_only": True},
+            {
+                "sheet": "License Review",
+                "benchmark": {"review_only": True},
+            },
+        ],
+    }
+    delivery_status = deployment_status(
+        status_config,
+        {"tasks": [], "last_run": scheduled},
+        authorization_available=True,
+    )
+    check(
+        delivery_status["authorization"]["available"]
+        and delivery_status["routes"]
+        == {"configured": 4, "active": 3, "paused": 1}
+        and delivery_status["benchmark_reviews"]
+        == {
+            "blocking": 2,
+            "source_unresolved": 1,
+            "license_unresolved": 1,
+        }
+        and delivery_status["scheduled_tasks"] == 0
+        and delivery_status["last_update"]["finished_at"] == scheduled["finished"]
+        and delivery_status["last_update"]["passed"] is False,
+        "delivery status omitted authorization, route, benchmark, task, or update state",
     )
     check(
         "scheduled-update" in (runtime / "run-update.cmd").read_text(encoding="utf-8"),

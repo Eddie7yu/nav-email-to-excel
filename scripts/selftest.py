@@ -213,6 +213,14 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
         raise AssertionError(
             "bootstrap did not create a cmd-compatible visible secret prompt"
         )
+    manual_launcher = (destination / "手动更新.bat").read_text(encoding="ascii")
+    if (
+        'call "app\\run-update.cmd"' not in manual_launcher
+        or '"app\\navctl.py" scheduled-update' in manual_launcher
+    ):
+        raise AssertionError(
+            "manual update bypassed the shared scheduled-update logging wrapper"
+        )
     config_path = app / "config.json"
     original_config = config_path.read_bytes()
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -308,6 +316,20 @@ def bootstrap_test(temporary: Path, use_com: bool) -> None:
                     f"Windows launcher failed from a special-character path: "
                     f"{launcher_name}: {output}"
                 )
+            if launcher_name == "查看状态.bat":
+                for required_field in (
+                    '"authorization"',
+                    '"routes"',
+                    '"benchmark_reviews"',
+                    '"automatic_updates"',
+                    '"scheduled_tasks"',
+                    '"last_update"',
+                ):
+                    if required_field not in output:
+                        raise AssertionError(
+                            "status launcher omitted deployment summary field: "
+                            f"{required_field}"
+                        )
         update_logs = sorted((destination / "logs").glob("update-*.log"))
         if not update_logs:
             raise AssertionError(

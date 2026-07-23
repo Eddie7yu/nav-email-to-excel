@@ -17,7 +17,15 @@ from nav_automation import (
     status as automation_status,
 )
 from nav_commit import commit
-from nav_config import CONFIG_PATH, STATE_ROOT, ConfigError, ROOT, load_config
+from nav_config import (
+    CONFIG_PATH,
+    STATE_ROOT,
+    ConfigError,
+    ROOT,
+    active_routes,
+    benchmark_review_issue,
+    load_config,
+)
 from nav_demo import commit as commit_demo
 from nav_demo import list_runs as list_demo_runs
 from nav_demo import prepare as prepare_demo
@@ -132,6 +140,58 @@ def record_scheduled_run_safely(payload: dict[str, Any]) -> None:
         record_scheduled_run(payload)
     except OSError:
         pass
+
+
+def deployment_status(
+    config: dict[str, Any],
+    schedule_report: dict[str, Any],
+    *,
+    authorization_available: bool | None = None,
+) -> dict[str, Any]:
+    routes = [
+        route for route in config.get("routes") or [] if isinstance(route, dict)
+    ]
+    active = active_routes(config)
+    review_issues = [
+        issue
+        for route in active
+        if (issue := benchmark_review_issue(route)) is not None
+    ]
+    approval = automation_status(config)
+    last_run = schedule_report.get("last_run")
+    if not isinstance(last_run, dict):
+        last_run = {}
+    if authorization_available is None:
+        authorization_available = bool(read_password(str(config["runtime_id"])))
+    return {
+        "authorization": {"available": bool(authorization_available)},
+        "routes": {
+            "configured": len(routes),
+            "active": len(active),
+            "paused": len(routes) - len(active),
+        },
+        "benchmark_reviews": {
+            "blocking": len(review_issues),
+            "source_unresolved": review_issues.count(
+                "benchmark-source-unresolved"
+            ),
+            "license_unresolved": review_issues.count(
+                "benchmark-license-unresolved"
+            ),
+        },
+        "automatic_updates": {
+            "approved": bool(approval.get("approved")),
+            "approved_at": approval.get("approved_at"),
+        },
+        "scheduled_tasks": len(schedule_report.get("tasks") or []),
+        "last_update": {
+            "available": bool(last_run),
+            "finished_at": last_run.get("finished"),
+            "passed": last_run.get("passed"),
+            "changed": last_run.get("changed"),
+            "new_rows": int(last_run.get("new_rows") or 0),
+        },
+    }
 
 
 def prune_logs(config: dict[str, Any]) -> None:
@@ -453,6 +513,7 @@ def command_schedule(config: dict[str, Any], args: argparse.Namespace) -> int:
     else:
         report = schedule_status()
         report["automatic_updates"] = automation_status(config)
+        report["deployment"] = deployment_status(config, report)
         emit(report)
     return 0
 

@@ -305,7 +305,7 @@ read -rsp "IMAP authorization code: " NAV_EMAIL_PASSWORD && export NAV_EMAIL_PAS
 .\.venv\Scripts\python.exe navctl.py schedule remove
 ```
 
-使用 `navctl.py schedule status` 查看任务、上次/下次运行、最近一次写入结果和备份路径。普通用户也可双击根目录的 `查看状态.bat`；计划任务和 `手动更新.bat` 共用更新入口，写入前或写入中的失败详情都会保存在根目录 `logs/update-YYYYMMDD.log`，AI 排查即可。
+使用 `navctl.py schedule status` 查看授权是否可用、配置/活动/暂停路由数、基准来源与许可阻塞数、首次批准状态、任务、上次/下次运行、最近一次写入结果和备份路径。普通用户也可双击根目录的 `查看状态.bat`；只显示任务和批准状态不算完整交付。计划任务和 `手动更新.bat` 共用 `app/run-update.cmd`，写入前或写入中的失败详情都会保存在根目录 `logs/update-YYYYMMDD.log`，AI 排查即可；不得让手动入口直接调用 `navctl.py scheduled-update`。
 
 状态输出必须把 Windows 计划任务时间明确标为目标电脑本地墙钟时间，并同时显示系统时区；不得把 COM 返回的本地计划时间误标成 UTC。解析失败诊断只记录路由、解析阶段、附件数量/类型、稳定短指纹和受控异常类型等脱敏元数据；任意异常正文也可能含路径、产品或净值，因此不得写入诊断，更不得记录完整主题、附件名、正文或授权码。
 
